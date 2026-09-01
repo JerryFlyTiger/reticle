@@ -1,0 +1,10 @@
+[package]
+name = "frontend-gui"
+publish = false  # proprietary: never publish to crates.io
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+elisp = { path = "../elisp" }
+core = { path = "../core" }
+eframe = { version = "0.29", features = ["persistence"] }

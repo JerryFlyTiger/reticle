@@ -1,0 +1,7 @@
+[package]
+name = "module-abi"
+publish = false  # proprietary: never publish to crates.io
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

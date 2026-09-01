@@ -1,0 +1,31 @@
+# Lint rule waivers for the plain Verilog-2001 sources in this directory.
+#
+# Verible's default rule set encodes a SystemVerilog style guide, and it
+# applies that guide to `.v' files too -- IEEE 1364 was folded into IEEE
+# 1800 in 2009, so as far as the tool is concerned there is one language.
+# The three rules below ask for constructs that DO NOT EXIST in
+# Verilog-2001, so obeying them here would mean giving up the thing this
+# directory exists to show:
+#
+#   explicit-parameter-storage-type   wants `parameter int unsigned W'
+#                                     -- typed parameters are SV-only.
+#   explicit-task-lifetime            wants `task automatic' -- SV-only.
+#   unpacked-dimensions-range-ordering
+#                                     wants `reg mem [DEPTH]' -- the
+#                                     `[0:DEPTH-1]' form is the Verilog
+#                                     one, and still legal.
+#   parameter-name-style              wants CamelCase parameter names.
+#                                     That is a SystemVerilog style-guide
+#                                     preference; UPPER_SNAKE_CASE is the
+#                                     universal Verilog-2001 convention
+#                                     and renaming would misrepresent
+#                                     what this code is meant to show.
+#
+# Waiving per-directory rather than globally is deliberate: the
+# SystemVerilog design under demo/rtl/ passes the full default rule set
+# with no waivers at all, and should keep having to.
+
+-explicit-parameter-storage-type
+-explicit-task-lifetime
+-unpacked-dimensions-range-ordering
+-parameter-name-style

@@ -1,0 +1,31 @@
+# Synthetic simulator log, for trying demo/tools/simlog_report.pl:
+#
+#     ./simlog_report.pl sample_sim.log
+#     ./simlog_report.pl --errors-only --context sample_sim.log
+#
+# Shaped like a UVM run that went wrong in two distinct ways and then
+# repeated both a few hundred times, which is exactly the case the
+# report script exists to collapse.
+
+UVM_INFO @ 0 ns: reporter [RNTST] Running test axi_random_test...
+UVM_INFO @ 0 ns: uvm_test_top.env [BUILD] environment built, 4 agents
+UVM_INFO @ 125 ns: uvm_test_top.env.scb [SCB] scoreboard enabled
+UVM_WARNING @ 1250 ns: uvm_test_top.env.mst[0] [CFG] backpressure knob unset, defaulting to 0
+UVM_WARNING @ 1250 ns: uvm_test_top.env.mst[1] [CFG] backpressure knob unset, defaulting to 0
+UVM_WARNING @ 1250 ns: uvm_test_top.env.mst[2] [CFG] backpressure knob unset, defaulting to 0
+UVM_WARNING @ 1250 ns: uvm_test_top.env.mst[3] [CFG] backpressure knob unset, defaulting to 0
+UVM_INFO @ 2000 ns: uvm_test_top.env.mst[0] [DRV] sent write addr=0x00001000 data=0xdeadbeef
+UVM_ERROR @ 2140 ns: uvm_test_top.env.scb [MISMATCH] read data 0x00000000 != expected 0xdeadbeef at addr 0x00001000
+UVM_INFO @ 2500 ns: uvm_test_top.env.mst[1] [DRV] sent write addr=0x00001004 data=0xcafebabe
+UVM_ERROR @ 2640 ns: uvm_test_top.env.scb [MISMATCH] read data 0x00000000 != expected 0xcafebabe at addr 0x00001004
+UVM_INFO @ 3000 ns: uvm_test_top.env.mst[2] [DRV] sent write addr=0x00001008 data=0x12345678
+UVM_ERROR @ 3140 ns: uvm_test_top.env.scb [MISMATCH] read data 0x00000000 != expected 0x12345678 at addr 0x00001008
+Warning: /designs/soc/rtl/mem/sram_wrapper.sv:44: Timing violation on mem[0x040] setup window
+Warning: /designs/soc/rtl/mem/sram_wrapper.sv:44: Timing violation on mem[0x041] setup window
+Warning: /designs/soc/rtl/mem/sram_wrapper.sv:44: Timing violation on mem[0x042] setup window
+UVM_ERROR @ 4100 ns: uvm_test_top.env.scb [MISMATCH] read data 0x00000000 != expected 0x0000ffff at addr 0x0000100c
+Error: /designs/soc/rtl/bus/axi4_lite_arbiter.sv:58: grant asserted with no request pending
+Error: /designs/soc/rtl/bus/axi4_lite_arbiter.sv:58: grant asserted with no request pending
+UVM_INFO @ 5000 ns: uvm_test_top.env.scb [SCB] 4 of 128 transactions checked
+UVM_FATAL @ 5120 ns: uvm_test_top.env.scb [TOOMANY] error count 4 exceeded max_quit_count
+UVM_INFO @ 5120 ns: reporter [FINISH] simulation terminated early

@@ -1,0 +1,14 @@
+[package]
+name = "demo-module"
+publish = false  # proprietary: never publish to crates.io
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# Built as a real loadable dylib to prove the M13 module path end-to-end,
+# not just a paper API -- crates/elisp/tests loads the actual build
+# artifact via `(module-load ...)`.
+crate-type = ["cdylib"]
+
+[dependencies]
+module-abi = { path = "../module-abi" }

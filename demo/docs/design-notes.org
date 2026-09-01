@@ -1,0 +1,91 @@
+#+TITLE: demo SoC — design notes
+#+AUTHOR: reticle demo
+#+OPTIONS: toc:2
+
+* Why this document exists
+
+Org files are the tenth language in =demo/=, and design notes are what
+an RTL engineer actually keeps them for: block diagrams in text, decision
+records, and the list of things that are deliberately not done yet.
+
+Everything below describes the design under [[file:../rtl/][demo/rtl/]].
+
+* Block structure
+
+#+begin_example
+  host_req[3:0] ──▶ axi4_lite_arbiter ──▶ sram_wrapper ──▶ sram_rdata
+                     (round robin)          (1 cycle read)
+
+  alu_op ─────────▶ alu ──▶ alu_result
+                     ▲  │
+        rs1, rs2 ────┘  └──▶ regfile.we
+                     │
+                  regfile
+#+end_example
+
+| Module              | File                             | Role                                  |
+|---------------------+----------------------------------+---------------------------------------|
+| =soc_top=           | =rtl/top/soc_top.sv=             | integration only, no logic of its own |
+| =alu=               | =rtl/core/alu.sv=                | one pipeline stage, ready/valid       |
+| =regfile=           | =rtl/core/regfile.sv=            | 2R1W, x0 hardwired to zero            |
+| =sram_wrapper=      | =rtl/mem/sram_wrapper.sv=        | byte-enabled, swap for a vendor macro |
+| =axi4_lite_arbiter= | =rtl/bus/axi4_lite_arbiter.sv=   | rotating priority                     |
+| =soc_pkg=           | =rtl/pkg/soc_pkg.sv=             | shared params, enums, structs         |
+
+* Decisions worth recording
+
+** Rotating priority, not fixed
+
+A fixed-priority arbiter is smaller and simpler, and starves the last
+master under sustained load from the first. That failure mode does not
+appear in a directed test — only under random traffic, late — so the
+cheaper arbiter is a false economy. =rr_ptr_q= costs two flops at
+=NumMasters = 4=.
+
+** Parameters in a package, not in ~`define~
+
+Macros are invisible to every tool that reads one file at a time,
+including this editor's tree-sitter parser and any language server. A
+=parameter= in =soc_pkg= is a real declaration that tools can follow;
+=`define SOC_DATA_WIDTH 32= is a text substitution nobody can navigate
+to. The only things left in [[file:../rtl/include/soc_defs.svh][soc_defs.svh]] are the ones that genuinely
+cannot be expressed in the language.
+
+** Read-during-write is a parameter, not a convention
+
+=regfile= takes =WriteFirst= rather than picking one behaviour and
+documenting it. The two choices produce identical RTL until the exact
+cycle where they do not, and a downstream user who assumed the other one
+finds out in silicon.
+
+* Not done
+
+- No formal properties. The ~`SOC_ASSERT~ macro exists and expands to
+  nothing outside simulation; nothing uses it yet.
+- =sram_wrapper= has no error injection, so the =rsp_t.error= field is
+  always zero.
+- The arbiter grants combinationally from =req_valid_i=, which is fine
+  at four masters and a long path at sixteen.
+- No clock-domain crossing anywhere: one clock, one reset.
+
+* Trying it in the editor
+
+#+begin_src sh
+  # every check the sample design is claimed to pass
+  ./tools/lint_rtl.sh
+
+  # open the integration file
+  reticle rtl/top/soc_top.sv
+#+end_src
+
+Then, in the buffer:
+
+| Key       | What happens                                                |
+|-----------+-------------------------------------------------------------|
+| =M-.=     | cursor on =alu= jumps to =rtl/core/alu.sv=                   |
+| =M-,=     | jumps back                                                   |
+| =C-M-i=   | after a =.= in a port list, completes that module's ports    |
+| =C-c C-a= | expands the =/*AUTOINST*/= in =u_arbiter=                     |
+| =C-c C-k= | deletes the expansion again                                  |
+
+None of those need a language server running.

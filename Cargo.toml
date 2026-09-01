@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/elisp",
+    "crates/core",
+    "crates/frontend-tui",
+    "crates/frontend-gui",
+    "crates/module-abi",
+    "crates/demo-module",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[package]
+name = "reticle"
+publish = false  # proprietary: never publish to crates.io
+license-file = "LICENSE.md"
+description = "An Emacs-like editor for Verilog and SystemVerilog RTL development"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+elisp = { path = "crates/elisp" }
+core = { path = "crates/core" }
+frontend-tui = { path = "crates/frontend-tui" }
+frontend-gui = { path = "crates/frontend-gui" }

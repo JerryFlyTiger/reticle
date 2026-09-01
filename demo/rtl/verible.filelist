@@ -1,0 +1,14 @@
+# verible.filelist -- the file list verible-verilog-ls reads to learn
+# what this design consists of. Paths are relative to THIS directory
+# (the one the language server is told is the project root).
+#
+# reticle reads the same file for its own local module lookup, so
+# the editor and the language server agree on one list instead of each
+# guessing (see PLAN.md, M56).
+
+pkg/soc_pkg.sv
+core/alu.sv
+core/regfile.sv
+mem/sram_wrapper.sv
+bus/axi4_lite_arbiter.sv
+top/soc_top.sv

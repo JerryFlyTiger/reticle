@@ -1,0 +1,10 @@
+[package]
+name = "frontend-tui"
+publish = false  # proprietary: never publish to crates.io
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+elisp = { path = "../elisp" }
+core = { path = "../core" }
+crossterm = "0.28"

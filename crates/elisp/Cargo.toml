@@ -1,0 +1,19 @@
+[package]
+name = "elisp"
+publish = false  # proprietary: never publish to crates.io
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cranelift-codegen = "0.133"
+cranelift-frontend = "0.133"
+cranelift-jit = "0.133"
+cranelift-module = "0.133"
+cranelift-native = "0.133"
+num-bigint = "0.4"
+num-traits = "0.2"
+indexmap = "2"
+smallvec = "1"
+module-abi = { path = "../module-abi" }
+libloading = "0.8"
+serde_json = "1"

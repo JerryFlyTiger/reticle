@@ -1,0 +1,154 @@
+.TH RETICLE 1 "2026-08-27" "reticle 0.1.0" "User Commands"
+.SH NAME
+reticle \- an Emacs-class editor for Verilog and SystemVerilog RTL
+.SH SYNOPSIS
+.B reticle
+[\fIFILE\fR] [\fB\-nw\fR|\fB\-\-tui\fR|\fB\-\-gui\fR] [\fB\-q\fR]
+.br
+.B reticle
+\fB\-\-repl\fR
+.br
+.B reticle
+\fB\-\-eval\fR \fIEXPR\fR
+.br
+.B reticle
+\fB\-\-script\fR \fIFILE\fR
+.SH DESCRIPTION
+.B reticle
+is an Emacs-like editor implemented in Rust, with a self-contained Elisp
+interpreter (bytecode VM plus a native JIT for hot functions), both a
+terminal (TUI) and a graphical (GUI) front end, tree-sitter based syntax
+highlighting, an LSP client, and a C ABI mechanism for dynamically loaded
+modules. Its feature priorities are tuned for Verilog/SystemVerilog RTL
+development.
+.SH OPTIONS
+.TP
+.I FILE
+A file to open on startup. Only meaningful for a GUI or TUI session (i.e.
+when none of \fB\-\-repl\fR, \fB\-\-eval\fR, or \fB\-\-script\fR is given).
+.TP
+.B \-nw, \-\-tui
+Run in the terminal instead of opening a GUI window. This flag is
+recognized anywhere on the command line, and always wins over
+.B \-\-gui
+no matter which one appears first or last.
+.TP
+.B \-\-gui
+Run the GUI editor window. This is the default when neither
+.B \-nw
+nor
+.B \-\-tui
+is present; spelling it out explicitly does not override
+.BR \-nw / \-\-tui .
+.TP
+.B \-q
+Skip loading the user init file for this session.
+.TP
+.B \-\-repl
+Start an interactive Elisp REPL on stdin/stdout. Like
+.B \-\-eval
+and
+.BR \-\-script ,
+this only takes effect when it is the very first command-line argument.
+Elsewhere on the command line it has one of two fates depending on
+position: in a GUI/TUI flag position it is rejected as an unknown option
+(since it begins with a dash); in the value slot right after another
+.B \-\-eval
+or
+.B \-\-script
+(i.e. the second argument), or as a trailing argument after
+.BR \-\-repl / \-\-eval\ EXPR / \-\-script\ FILE ,
+it is silently ignored.
+.TP
+.B \-\-eval \fIEXPR\fR
+Evaluate the Elisp expression \fIEXPR\fR and print the result, then exit.
+Must be the first argument, immediately followed by \fIEXPR\fR as the
+next argument.
+.TP
+.B \-\-script \fIFILE\fR
+Load and evaluate the Elisp file \fIFILE\fR, then exit. Must be the
+first argument, immediately followed by \fIFILE\fR as the next argument.
+.TP
+.B \-\-worker
+Internal use only. Runs the process as a worker subprocess that reads
+framed s\-expressions from stdin, evaluates them, and writes framed
+results to stdout until the parent closes stdin. It is spawned
+automatically (re\-executing the same binary) by the editor's background
+worker facility \-\- it is not meant to be invoked by hand.
+.TP
+.B \-h, \-\-help
+Print a help summary and exit successfully. Takes priority over every
+other argument in a flag position \-\- including before \fB\-\-repl\fR,
+\fB\-\-eval\fR, or \fB\-\-script\fR, so it can never be shadowed by an editor
+session, REPL, or evaluation that would otherwise run first. The one
+position where it is not a flag is the value slot right after
+\fB\-\-eval\fR or \fB\-\-script\fR: \fBreticle \-\-eval \-\-help\fR
+evaluates \fB\-\-help\fR as elisp and fails, rather than printing this
+help. The same applies to \fB\-v\fR, \fB\-V\fR, and \fB\-\-version\fR.
+.TP
+.B \-v, \-V, \-\-version
+Print version information and exit successfully. Same priority rule as
+.BR \-h / \-\-help .
+.SH EXIT STATUS
+.TP
+.B 0
+Success: this includes
+.BR \-\-help / \-\-version ,
+a successful
+.B \-\-eval
+or
+.BR \-\-script ,
+and a REPL session that ends on normal end\-of\-file (Ctrl\-D).
+.TP
+.B 1
+A runtime error: a GUI error, a terminal error, a failed evaluation
+during
+.BR \-\-eval / \-\-script ,
+or a stdin I/O error while reading REPL input.
+.TP
+.B 2
+A usage error: an unrecognized option, or
+.B \-\-eval
+/
+.B \-\-script
+given with no following argument.
+.TP
+.B 101
+The process panicked (Rust's default panic exit status).
+.SH ENVIRONMENT
+.TP
+.B RETICLE_REMOTE_TIMEOUT
+Overrides how many seconds a remote command started over ssh is allowed
+to run before it is treated as timed out; accepts a floating\-point
+number of seconds. A value of zero or less disables the timeout
+entirely. A positive value is clamped to the range
+.RI [ 0.001 ", " 86400 ]
+seconds (i.e. anything above 86400 becomes 86400, and anything below
+0.001 but still positive becomes 0.001). Defaults to 30 seconds when
+unset, non\-finite, or unparsable.
+.TP
+.B RETICLE_SSH_BIN
+Overrides which \fBssh\fR binary is invoked for remote operations;
+defaults to \fBssh\fR on the \fBPATH\fR. Primarily useful for pointing
+tests at a local shim instead of a real ssh client.
+.TP
+.B RETICLE_WORKER_EXE
+Overrides the path to the \fBreticle\fR executable used to spawn
+.B \-\-worker
+background subprocesses; defaults to the currently running executable
+.RI ( "std::env::current_exe" ).
+Primarily useful for integration tests that build their own copy of the
+binary.
+.TP
+.B JIT_DEBUG
+When set to any value, enables diagnostic output from the native JIT
+compiler (compiled IR, per\-instruction traces, and reasons a function
+was rejected for compilation) on stderr. Unset by default.
+.SH FILES
+.TP
+.I ~/.reticle/init.el
+The user init file, loaded on startup unless
+.B \-q
+is given. If it does not exist, startup proceeds without error.
+.SH SEE ALSO
+.BR emacs (1)
