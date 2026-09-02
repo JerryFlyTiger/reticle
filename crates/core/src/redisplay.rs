@@ -1,12 +1,15 @@
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::Rc;
 
 use elisp::value::SymId;
 use elisp::{Interp, Value};
-use unicode_width::UnicodeWidthChar;
 
 use crate::buffer::Buffer;
 use crate::editor::Editor;
+
+pub mod display_width;
+use display_width::wide_char_width;
 
 pub type Color = (u8, u8, u8);
 
@@ -81,6 +84,225 @@ pub struct Grid {
     /// built from, not a change to any cell: the TUI reads `lines` only
     /// and ignores this field, so its rendering is unaffected.
     pub windows: Vec<WindowLayout>,
+    /// Mouse-support metadata (additive, same precedent as `windows`
+    /// above): every screen cell this frame painted, grouped into
+    /// contiguous same-style runs, each tagged with the buffer byte
+    /// range it came from (`None` for chrome -- see `PaintRun::src`).
+    /// Built alongside `lines`/`windows` by `render_window` (buffer
+    /// text, byte-accurate) and a post-pass over the finished grid
+    /// (everything else, `src: None`) -- see `PaintRun`'s own doc for
+    /// why those need different treatment. The TUI ignores this field
+    /// entirely, same as `windows`.
+    pub runs: Vec<PaintRun>,
+}
+
+/// One contiguous, same-style run of painted screen cells, published
+/// alongside the `Grid` (task 1 of the mouse-support milestone) so a
+/// frontend can map a click's `(row, col)` back to a buffer position
+/// without re-deriving the paint loop's own row/col bookkeeping --
+/// `Grid::buffer_pos_at` is that inverse mapping.
+///
+/// **Byte ranges, not char positions**: `src`, when `Some`, is a range
+/// of buffer *bytes* (`GapBuffer`'s `char_to_byte`/`byte_to_char`
+/// convert to/from the char positions `Buffer::point` etc. use). This
+/// is a deliberate departure from the char-offset convention every
+/// other buffer position in this codebase uses (see `gapbuffer.rs`'s
+/// module doc) -- picked because a future text-shaping consumer (the
+/// next milestone) wants byte spans into `text` directly, and asking it
+/// to re-derive byte offsets from char offsets on every shaped run
+/// would be exactly the kind of "second source of truth" this field
+/// exists to avoid. A GUI event handler that wants a char position (to
+/// assign `Buffer::point`) calls `byte_to_char` once, at the very end,
+/// on the single resolved position -- not per run.
+///
+/// **Tab and control-character expansion**: a `\t` or a C0/DEL control
+/// character occupies exactly one source byte but is rendered as
+/// several display columns (a tab's spaces, or a control char's `^X`
+/// escape) -- more rendered columns/bytes than source bytes, so there
+/// is no proportional column-to-byte mapping inside such a run. These
+/// runs are therefore never merged with anything else (`RunBuilder::
+/// push_atomic`, always exactly one run per escape) and are marked
+/// `atomic: true` by `push_atomic`: every column inside such a run maps
+/// to `src.start`. The invisible-region "..." indicator (`redisplay.rs`'s
+/// `invisible_end` handling) is the same shape -- three rendered bytes
+/// standing in for an arbitrarily large hidden byte span -- and is
+/// pushed the same way.
+///
+/// **Why `atomic` is an explicit field, not inferred**: an earlier
+/// version of this type had no such field and `Grid::map_col_in_run`
+/// instead guessed "atomic" from `r.text.len() != byte_len`. That broke
+/// for the "..." indicator specifically: it is always the 3-byte ASCII
+/// literal `"..."`, so whenever the hidden span it stands in for is
+/// *also* exactly 3 source bytes (one CJK character, which is 1 char but
+/// 3 UTF-8 bytes -- not exotic in Verilog identifiers or comments), the
+/// lengths coincide, the guess says "proportional", and the run gets
+/// walked character-by-character over `"..."`'s own three ASCII chars --
+/// returning `src.start + 1` and `src.start + 2` as byte offsets that
+/// land on UTF-8 continuation bytes, not character boundaries. That
+/// panics `GapBuffer::byte_to_char` in debug builds and silently
+/// misplaces point in release. A tab landing at `col % 8 == 7` triggers
+/// the same coincidence (renders as exactly one column and one byte) but
+/// is harmless there, because a one-column run has only one possible
+/// answer regardless of which branch runs. An explicit flag, set at the
+/// one place (`push_atomic`) that already knows a run is non-proportional,
+/// makes the coincidence irrelevant instead of merely rare.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintRun {
+    pub row: usize,
+    /// Starting display column.
+    pub col: usize,
+    /// Display columns this run occupies.
+    pub cols: usize,
+    pub text: String,
+    pub style: Style,
+    /// Buffer byte range this run came from. `None` for chrome that has
+    /// no buffer behind it: the mode line, the line-number gutter, the
+    /// echo area, panels and popups.
+    pub src: Option<Range<usize>>,
+    /// Set by `RunBuilder::push_atomic` for a tab, a C0/DEL control-char
+    /// escape, or the invisible-region "..." indicator -- see this
+    /// struct's doc for why `map_col_in_run` must read this flag rather
+    /// than infer it from a length comparison.
+    pub atomic: bool,
+}
+
+/// Incrementally builds `Grid::runs` for buffer text as `render_window`
+/// walks characters left to right. A run merges consecutive characters
+/// when three things all hold: same row, same style (an empty pending
+/// run -- see `start_marker` -- adopts the first character's style
+/// rather than gating on it), and byte-contiguous `src` (so a run's
+/// `src` stays one unbroken `Range`). The moment any of those breaks,
+/// the open run is flushed and a new one starts -- which also covers
+/// "window boundary": each `render_window` call owns its own
+/// `RunBuilder`, so nothing from one window's runs can merge into
+/// another's even when two windows abut with no separator column.
+///
+/// See `PaintRun`'s doc for why tab/control-char expansion and the
+/// invisible-region ellipsis must never merge into a `push`ed run --
+/// `push_atomic` is their dedicated, always-standalone path.
+struct RunBuilder {
+    open: Option<PaintRun>,
+}
+
+impl RunBuilder {
+    fn new() -> RunBuilder {
+        RunBuilder { open: None }
+    }
+
+    /// Seed (or re-seed) a zero-width pending run at the start of a row:
+    /// `col`/`src` mark where this row's buffer text begins, `text` is
+    /// empty and `style` is a placeholder the first real `push` adopts.
+    /// This is what lets `Grid::buffer_pos_at` answer a click on a
+    /// completely empty line (its only run stays zero-width, flushed
+    /// as-is) or before the first character of a non-empty one (the
+    /// marker gets absorbed into that character's run instead, leaving
+    /// no separate entry) -- either way, every row on screen has at
+    /// least one `Some`-`src` run recording where it starts.
+    fn start_marker(&mut self, grid: &mut Grid, row: usize, col: usize, byte_pos: usize) {
+        self.flush(grid);
+        self.open = Some(PaintRun {
+            row,
+            col,
+            cols: 0,
+            text: String::new(),
+            style: Style::default(),
+            src: Some(byte_pos..byte_pos),
+            atomic: false,
+        });
+    }
+
+    /// Append one plain (non-expanding) character: `text` grows by
+    /// exactly this one char and, when `src` is present, `src.end`
+    /// grows by exactly this char's UTF-8 length -- so summing
+    /// `len_utf8()` over a prefix of `text.chars()` reconstructs the
+    /// matching byte offset, which is exactly what `Grid::
+    /// buffer_pos_at`'s proportional-scan branch relies on.
+    fn push(
+        &mut self,
+        grid: &mut Grid,
+        at: RunPos,
+        ch: char,
+        style: Style,
+        src: Option<Range<usize>>,
+    ) {
+        let RunPos { row, col, cols } = at;
+        let mergeable = self.open.as_ref().is_some_and(|r| {
+            r.row == row
+                && r.col + r.cols == col
+                && (r.text.is_empty() || r.style == style)
+                && match (&r.src, &src) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.end == b.start,
+                    _ => false,
+                }
+        });
+        if mergeable {
+            let r = self.open.as_mut().unwrap();
+            r.text.push(ch);
+            r.cols += cols;
+            r.style = style;
+            if let Some(a) = &mut r.src {
+                a.end = src.expect("src.is_some() checked by `mergeable` above").end;
+            }
+        } else {
+            self.flush(grid);
+            self.open = Some(PaintRun {
+                row,
+                col,
+                cols,
+                text: ch.to_string(),
+                style,
+                src,
+                atomic: false,
+            });
+        }
+    }
+
+    /// One-off run for a tab, a C0/DEL control-char escape, or the
+    /// invisible-region "..." indicator: always flushes whatever was
+    /// open first and never merges in either direction (the *next*
+    /// `push`/`push_atomic` call always starts fresh, since this
+    /// doesn't leave anything in `self.open`). `text` is the full
+    /// rendered expansion, `cols` its full display width, `src` the
+    /// source byte range it stands in for.
+    fn push_atomic(
+        &mut self,
+        grid: &mut Grid,
+        at: RunPos,
+        text: String,
+        style: Style,
+        src: Option<Range<usize>>,
+    ) {
+        self.flush(grid);
+        let RunPos { row, col, cols } = at;
+        grid.runs.push(PaintRun {
+            row,
+            col,
+            cols,
+            text,
+            style,
+            src,
+            atomic: true,
+        });
+    }
+
+    fn flush(&mut self, grid: &mut Grid) {
+        if let Some(r) = self.open.take() {
+            grid.runs.push(r);
+        }
+    }
+}
+
+/// `(row, col, cols)` bundled into one value -- `RunBuilder::push`/
+/// `push_atomic` each need all three alongside a `ch`/`text`, `style`,
+/// and `src`; bundling keeps their arg count under clippy's
+/// `too_many_arguments` threshold instead of passing five-plus loose
+/// `usize`s.
+#[derive(Clone, Copy)]
+struct RunPos {
+    row: usize,
+    col: usize,
+    cols: usize,
 }
 
 /// One window pane's screen geometry, published alongside the `Grid` it
@@ -115,7 +337,75 @@ impl Grid {
             lines: vec![vec![Cell::default(); cols]; rows],
             cursor: (0, 0),
             windows: Vec::new(),
+            runs: Vec::new(),
         }
+    }
+
+    /// Inverse of the paint loop (task 1 of the mouse-support
+    /// milestone): the buffer byte offset that painted screen cell
+    /// `(row, col)`, or `None` when there is no buffer text behind that
+    /// cell at all -- outside every run's row, or the only runs on that
+    /// row have `src: None` (chrome: mode line, gutter, echo, panel,
+    /// popup). Self-contained -- everything it needs is already in
+    /// `self.runs`, no buffer access required, so a frontend can call it
+    /// straight from a resize/click handler holding only the `Grid`.
+    ///
+    /// Deliberate decisions on the two "which sub-position" cases:
+    /// - **Tab / control-char / invisible-ellipsis runs** (pushed via
+    ///   `RunBuilder::push_atomic`, identified here by `r.atomic` -- see
+    ///   `PaintRun`'s doc for why this is an explicit flag rather than a
+    ///   length comparison): every column inside the run maps to
+    ///   `src.start`, the one source byte/range it stands in for.
+    /// - **Wide (double-width) characters**: both display columns of a
+    ///   wide char map to the same byte, that character's own start --
+    ///   its continuation cell (`Cell::continuation`) has no byte of its
+    ///   own to map to.
+    /// - **Past the end of a row's text** (including a wholly empty
+    ///   line, whose only run is a zero-width `start_marker`): clamps to
+    ///   that row's last run's `src.end` -- landing at end-of-line,
+    ///   never spilling onto the next row's first character. This is
+    ///   also the fallback for any `col` that doesn't land inside a
+    ///   positive-width run for another reason.
+    pub fn buffer_pos_at(&self, row: usize, col: usize) -> Option<usize> {
+        let mut row_runs: Vec<&PaintRun> = self
+            .runs
+            .iter()
+            .filter(|r| r.row == row && r.src.is_some())
+            .collect();
+        if row_runs.is_empty() {
+            return None;
+        }
+        row_runs.sort_by_key(|r| r.col);
+        for r in &row_runs {
+            if r.cols > 0 && col >= r.col && col < r.col + r.cols {
+                return Some(Self::map_col_in_run(r, col));
+            }
+        }
+        let last = row_runs.last().unwrap();
+        Some(last.src.clone().unwrap().end)
+    }
+
+    /// `col`, known to fall inside `r`'s positive-width span, mapped to a
+    /// buffer byte offset. See `buffer_pos_at`'s doc for the two
+    /// deliberate sub-position decisions this implements.
+    fn map_col_in_run(r: &PaintRun, col: usize) -> usize {
+        let src = r.src.clone().expect("caller filters to src.is_some()");
+        if r.atomic {
+            // Non-proportional expansion (tab, C0/DEL escape, or the
+            // invisible-region "..." indicator) -- see `PaintRun`'s doc.
+            return src.start;
+        }
+        let mut c = r.col;
+        let mut byte = src.start;
+        for ch in r.text.chars() {
+            let w = wide_char_width(ch).max(1);
+            if col < c + w {
+                return byte;
+            }
+            c += w;
+            byte += ch.len_utf8();
+        }
+        src.end
     }
 
     fn put(&mut self, row: usize, col: usize, ch: char, style: Style) {
@@ -141,13 +431,36 @@ impl Grid {
 }
 
 /// Width of `c` when drawn at column `col` (tabs are column-dependent).
+/// See `display_width` for the shared five-way rule this wraps.
 fn char_width(c: char, col: usize) -> usize {
-    match c {
-        '\t' => 8 - (col % 8),
-        c if (c as u32) < 32 => 2, // shown as ^X
-        '\u{7f}' => 2,
-        _ => UnicodeWidthChar::width(c).unwrap_or(1).max(1),
-    }
+    display_width::char_width(c, col)
+}
+
+/// Whether a character of width `w`, drawn starting at column `col`,
+/// needs the current row to wrap before it — i.e. it would land on or
+/// past the last column, which is reserved for the `\` continuation
+/// marker rather than for text.
+///
+/// Both the wrap lookahead (`next_row_start`, used by scrolling) and
+/// the actual paint loop (`render_window`'s draw loop) must agree on
+/// this test, or scrolling and painting drift apart — exactly the
+/// failure `frame_layout` was extracted to prevent for `render` vs.
+/// `window_rects` (see its doc comment). This is the equivalent
+/// extraction for the wrap test.
+///
+/// Three other boundary checks in this file are deliberately *not*
+/// routed through here, and the reason is not the one you would guess.
+/// `render_panel` and `render_completion_popup` test `col + w >= cols`,
+/// which for any `cols >= 1` is the same arithmetic as this function —
+/// there is no integer between the two. What differs is the reaction:
+/// they `break` and truncate the row, never advancing to a new row and
+/// never drawing a continuation marker, so sharing a predicate named
+/// "wraps before" would misdescribe both call sites. Only
+/// `render_lsp_completion_popup`'s `col + w > width` is a genuinely
+/// different formula (no reserved last column). Merging any of the
+/// three would be a behaviour question, not a tidying one.
+fn wraps_before(col: usize, w: usize, cols: usize) -> bool {
+    col + w > cols.saturating_sub(1)
 }
 
 // M69: mode-line layout. The old code composed the left/right strings
@@ -247,12 +560,10 @@ fn ml_sanitize(s: &str) -> String {
 }
 
 /// Display columns of an already-sanitized string (no control chars
-/// left, so this is just a `UnicodeWidthChar` sum — the column-dependent
+/// left, so this is just a `wide_char_width` sum — the column-dependent
 /// tab case `char_width` has to handle doesn't apply here).
 fn ml_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1).max(1))
-        .sum()
+    s.chars().map(wide_char_width).sum()
 }
 
 /// Truncate an already-sanitized `s` to at most `budget` columns,
@@ -273,10 +584,7 @@ fn ml_truncate_head(s: &str, budget: usize) -> String {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
-    let widths: Vec<usize> = chars
-        .iter()
-        .map(|c| UnicodeWidthChar::width(*c).unwrap_or(1).max(1))
-        .collect();
+    let widths: Vec<usize> = chars.iter().map(|c| wide_char_width(*c)).collect();
     let mut tail_w: usize = widths.iter().sum();
     let mut start = 0;
     let keep = budget - 1; // one column reserved for ML_ELLIPSIS
@@ -472,7 +780,7 @@ fn draw_ml_segment(
     style_of: impl Fn(usize) -> Style,
 ) -> usize {
     for c in text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        let w = wide_char_width(c);
         if mcol + w > limit {
             break;
         }
@@ -823,7 +1131,7 @@ fn next_row_start(
             return Some(p + 1);
         }
         let w = char_width(c, col);
-        if col + w > cols.saturating_sub(1) {
+        if wraps_before(col, w, cols) {
             return Some(p);
         }
         col += w;
@@ -1128,6 +1436,81 @@ pub(crate) fn window_rects(editor: &Editor) -> Vec<(usize, Rect)> {
     rects
 }
 
+/// Task 3 (mouse support): scroll window `win_id`'s `window_start` by
+/// `delta_lines` *logical* lines -- positive scrolls forward (later text
+/// comes into view, matching wheel-down), negative scrolls backward --
+/// without touching `point`, the one thing every keyboard scroll path in
+/// this editor does NOT offer (`evil-scroll-down`/`evil-scroll-up` both
+/// move point; see `evil.el`'s own header comment: "no elisp-level
+/// window-start control is exposed"). No-op when `win_id` names no
+/// window.
+///
+/// **Logical lines, not visual rows**: unlike `ensure_point_visible`'s
+/// machinery above, this does not reproduce the wrap-aware `cols`/
+/// gutter-width computation `render_window` uses to find a window's real
+/// text width -- duplicating that just for wheel scrolling isn't worth
+/// it for a first cut, and a wheel event's "how many lines" is already
+/// an approximation on every platform. The practical effect: a window
+/// showing heavily-wrapped long lines scrolls somewhat more per wheel
+/// tick than a visual-row-accurate version would. Good enough for
+/// Verilog source, which is not typically wrapped at GUI widths.
+pub fn scroll_window_start(ed: &Rc<RefCell<Editor>>, win_id: usize, delta_lines: i64) {
+    let mut editor = ed.borrow_mut();
+    let Some(win) = editor.windows.get(&win_id) else {
+        return;
+    };
+    let buf = win.buffer.clone();
+    let start = win.window_start;
+    // Fix 3 (mouse-support milestone review): current point, read from
+    // `buf` when this is the selected window (its point lives there, not
+    // in `win.point`) and from `win.point` otherwise -- same split
+    // `render_window` already makes. Recorded as the scroll pin below.
+    let is_selected = win_id == editor.selected_window;
+    let point = if is_selected {
+        buf.borrow().point
+    } else {
+        win.point
+    };
+    let new_start = {
+        let b = buf.borrow();
+        if delta_lines >= 0 {
+            forward_n_lines(&b, start, delta_lines as usize)
+        } else {
+            backward_n_lines(&b, start, (-delta_lines) as usize)
+        }
+    };
+    if let Some(win) = editor.windows.get_mut(&win_id) {
+        win.window_start = new_start;
+        // Pin: as long as point stays exactly here, `render_window` won't
+        // recentre this window out from under the scroll -- see
+        // `Window::scroll_pin`'s doc.
+        win.scroll_pin = Some(point);
+    }
+}
+
+/// The start of the logical line `n` lines below the one containing
+/// `pos` (clamped at the end of the buffer) -- forward counterpart to
+/// `backward_n_lines`, used only by `scroll_window_start` (wheel
+/// scrolling has no other caller that needs to walk forward by a raw
+/// line count rather than a visual row).
+fn forward_n_lines(buffer: &Buffer, pos: usize, n: usize) -> usize {
+    let len = buffer.text.len();
+    let mut p = pos;
+    for _ in 0..n {
+        if p >= len {
+            break;
+        }
+        match buffer.text.chars_from(p).position(|c| c == '\n') {
+            Some(off) => p = (p + off + 1).min(len),
+            None => {
+                p = len;
+                break;
+            }
+        }
+    }
+    p
+}
+
 /// Truthy check on a global elisp variable, for render-time feature
 /// toggles (hl-line-mode, lsp--clients). Reads the raw global cell —
 /// wrong for a variable that may be buffer-local (see `buffer_var_on`),
@@ -1294,7 +1677,19 @@ fn render_window(
 
     let inv = invisible_ranges(interp, &buf.borrow());
     let mut window_start = editor.windows[&win_id].window_start;
-    {
+    // Fix 3 (mouse-support milestone review): an explicit scroll pins this
+    // window against `ensure_point_visible`'s recentre as long as point
+    // hasn't moved since the scroll -- see `Window::scroll_pin`'s doc.
+    // Otherwise the wheel-scroll flow was self-defeating: `render_window`
+    // runs every frame, so the very next frame after a wheel event would
+    // recentre right back to point, undoing the scroll a trackpad's burst
+    // of wheel events reaches in a single gesture.
+    let pinned = editor.windows[&win_id].scroll_pin == Some(point);
+    if pinned {
+        // Keep `window_start` exactly as the scroll left it; don't call
+        // `ensure_point_visible` at all this frame.
+    } else {
+        editor.windows.get_mut(&win_id).unwrap().scroll_pin = None;
         let b = buf.borrow();
         ensure_point_visible(&b, point, &mut window_start, cols, text_rows, &inv);
     }
@@ -1375,6 +1770,15 @@ fn render_window(
 
     let tx = rect.col + gutter_w; // text area origin column
     let mut chars = b.text.chars_from(pos);
+    // Task 1 (mouse support): accumulates `grid.runs` for the buffer
+    // text painted below -- see `RunBuilder`'s doc. Chrome (gutter, the
+    // wrap-continuation backslash, mode line, echo, panel, popup) is
+    // *not* built here; it's filled in afterward by a post-pass over the
+    // finished grid (see `render`'s call to `fill_chrome_runs`), which
+    // needs no byte-position bookkeeping since its runs are all `src:
+    // None`.
+    let mut run = RunBuilder::new();
+    run.start_marker(grid, rect.row + row, tx, b.text.char_to_byte(pos));
     while row < text_rows {
         if pos == point && cursor.is_none() {
             cursor = Some((rect.row + row, tx + col.min(cols.saturating_sub(1))));
@@ -1389,6 +1793,17 @@ fn render_window(
             for (i, ch) in "...".chars().enumerate() {
                 grid.put(rect.row + row, tx + col + i, ch, dim);
             }
+            run.push_atomic(
+                grid,
+                RunPos {
+                    row: rect.row + row,
+                    col: tx + col,
+                    cols: 3,
+                },
+                "...".to_string(),
+                dim,
+                Some(b.text.char_to_byte(pos)..b.text.char_to_byte(end)),
+            );
             col += 3;
             pos = end;
             chars = b.text.chars_from(pos);
@@ -1401,6 +1816,9 @@ fn render_window(
             pos += 1;
             line_no += 1;
             paint_gutter(grid, row, Some(line_no), gutter_w);
+            if row < text_rows {
+                run.start_marker(grid, rect.row + row, tx, b.text.char_to_byte(pos));
+            }
             continue;
         }
         let mut style = style_scan.at(pos);
@@ -1410,7 +1828,7 @@ fn render_window(
             }
         }
         let w = char_width(c, col);
-        if col + w > cols.saturating_sub(1) {
+        if wraps_before(col, w, cols) {
             grid.put(rect.row + row, tx + cols - 1, '\\', dim);
             row += 1;
             col = 0;
@@ -1418,42 +1836,86 @@ fn render_window(
             if row >= text_rows {
                 break;
             }
+            run.start_marker(grid, rect.row + row, tx, b.text.char_to_byte(pos));
         }
+        let byte_start = b.text.char_to_byte(pos);
+        let byte_end = byte_start + c.len_utf8();
         match c {
             '\t' => {
                 let w = char_width('\t', col);
                 for i in 0..w {
                     grid.put(rect.row + row, tx + col + i, ' ', style);
                 }
+                run.push_atomic(
+                    grid,
+                    RunPos {
+                        row: rect.row + row,
+                        col: tx + col,
+                        cols: w,
+                    },
+                    " ".repeat(w),
+                    style,
+                    Some(byte_start..byte_end),
+                );
                 col += w;
             }
             c if (c as u32) < 32 => {
                 grid.put(rect.row + row, tx + col, '^', style);
-                grid.put(
-                    rect.row + row,
-                    tx + col + 1,
-                    char::from_u32((c as u32) + 64).unwrap_or('?'),
+                let esc = char::from_u32((c as u32) + 64).unwrap_or('?');
+                grid.put(rect.row + row, tx + col + 1, esc, style);
+                run.push_atomic(
+                    grid,
+                    RunPos {
+                        row: rect.row + row,
+                        col: tx + col,
+                        cols: 2,
+                    },
+                    format!("^{}", esc),
                     style,
+                    Some(byte_start..byte_end),
                 );
                 col += 2;
             }
             '\u{7f}' => {
                 grid.put(rect.row + row, tx + col, '^', style);
                 grid.put(rect.row + row, tx + col + 1, '?', style);
+                run.push_atomic(
+                    grid,
+                    RunPos {
+                        row: rect.row + row,
+                        col: tx + col,
+                        cols: 2,
+                    },
+                    "^?".to_string(),
+                    style,
+                    Some(byte_start..byte_end),
+                );
                 col += 2;
             }
             c => {
-                if char_width(c, col) == 2 {
+                let w = char_width(c, col);
+                if w == 2 {
                     grid.put_wide(rect.row + row, tx + col, c, style);
-                    col += 2;
                 } else {
                     grid.put(rect.row + row, tx + col, c, style);
-                    col += 1;
                 }
+                run.push(
+                    grid,
+                    RunPos {
+                        row: rect.row + row,
+                        col: tx + col,
+                        cols: w,
+                    },
+                    c,
+                    style,
+                    Some(byte_start..byte_end),
+                );
+                col += w;
             }
         }
         pos += 1;
     }
+    run.flush(grid);
     if cursor.is_none() {
         cursor = Some((
             rect.row + row.min(text_rows.saturating_sub(1)),
@@ -1646,8 +2108,8 @@ struct EchoCell {
 }
 
 /// Expand the echo row's raw text into one `EchoCell` per display
-/// column, one column at a time, left to right. Same five-way rule
-/// set the old inline drawing loop used (M67): `\t`, C0 controls,
+/// column, one column at a time, left to right. Same `display_width`
+/// rule set the buffer-drawing loop uses (M67): `\t`, C0 controls,
 /// DEL, double-width chars, everything else -- deliberately kept
 /// identical so M70 only adds scrolling, not a second rendering of
 /// the same text.
@@ -1666,49 +2128,48 @@ fn echo_cells(text: &str) -> Vec<EchoCell> {
     let mut cells = Vec::new();
     let mut col = 0;
     for c in text.chars() {
-        match c {
-            '\t' => {
-                let w = 8 - (col % 8);
-                for _ in 0..w {
+        match display_width::Expansion::classify(c, col) {
+            display_width::Expansion::Tab { width } => {
+                for _ in 0..width {
                     cells.push(EchoCell {
                         ch: ' ',
                         cont: false,
                     });
                 }
-                col += w;
+                col += width;
             }
-            c if (c as u32) < 32 => {
+            display_width::Expansion::Control(ctrl) => {
                 cells.push(EchoCell {
                     ch: '^',
                     cont: false,
                 });
+                let second = if ctrl == '\u{7f}' {
+                    '?'
+                } else {
+                    char::from_u32((ctrl as u32) + 64).unwrap_or('?')
+                };
                 cells.push(EchoCell {
-                    ch: char::from_u32((c as u32) + 64).unwrap_or('?'),
+                    ch: second,
                     cont: false,
                 });
                 col += 2;
             }
-            '\u{7f}' => {
+            display_width::Expansion::Wide(wc) => {
                 cells.push(EchoCell {
-                    ch: '^',
+                    ch: wc,
                     cont: false,
                 });
-                cells.push(EchoCell {
-                    ch: '?',
-                    cont: false,
-                });
-                col += 2;
-            }
-            c if UnicodeWidthChar::width(c) == Some(2) => {
-                cells.push(EchoCell { ch: c, cont: false });
                 cells.push(EchoCell {
                     ch: ' ',
                     cont: true,
                 });
                 col += 2;
             }
-            c => {
-                cells.push(EchoCell { ch: c, cont: false });
+            display_width::Expansion::Plain(pc) => {
+                cells.push(EchoCell {
+                    ch: pc,
+                    cont: false,
+                });
                 col += 1;
             }
         }
@@ -1948,7 +2409,103 @@ pub fn render(interp: &Interp, ed: &Rc<RefCell<Editor>>) -> Grid {
             );
         }
     }
+    fill_chrome_runs(&mut grid);
     grid
+}
+
+/// Task 1 (mouse support), second half: `render_window` already built
+/// byte-accurate `PaintRun`s (`src: Some(...)`) for buffer text as it
+/// painted; this covers everything else the frame drew directly into
+/// `grid.lines` without going through a `RunBuilder` at all -- the
+/// wrap-continuation backslash, the line-number gutter, both mode-line
+/// segments, the echo area, the completion popup, and the selector
+/// panel. All of those are chrome (`src: None`), so rather than thread a
+/// `RunBuilder` through `draw_ml_segment`/`paint_gutter`/the echo loop/
+/// `render_panel`/the popups -- five call sites with their own closures
+/// and loops -- this walks the *finished* grid once, row by row, and
+/// turns every screen cell not already claimed by a buffer-text run
+/// into a same-style chrome run. Cheap (one pass over `cols * rows`
+/// cells, once per frame) and correct by construction: it can't
+/// possibly disagree with what `lines` actually shows, because it reads
+/// `lines` directly instead of re-deriving what should have been drawn.
+fn fill_chrome_runs(grid: &mut Grid) {
+    // Buffer-text runs already cover to some columns per row; chrome
+    // fills in whatever's left. `covered[row]` is that row's list of
+    // (start, end) buffer-run column ranges, used below to skip them.
+    let mut covered: Vec<Vec<(usize, usize)>> = vec![Vec::new(); grid.rows];
+    for r in &grid.runs {
+        if r.src.is_some() && r.row < grid.rows {
+            covered[r.row].push((r.col, r.col + r.cols));
+        }
+    }
+    for row in covered.iter_mut() {
+        row.sort_unstable();
+    }
+    let mut chrome: Vec<PaintRun> = Vec::new();
+    for (row_idx, line) in grid.lines.iter().enumerate() {
+        let is_covered = |col: usize| covered[row_idx].iter().any(|&(s, e)| col >= s && col < e);
+        let mut open: Option<PaintRun> = None;
+        for (col, cell) in line.iter().enumerate() {
+            if cell.continuation {
+                // Fix 2 (mouse-support milestone review): a double-width
+                // chrome character (a CJK buffer name in the mode line, a
+                // CJK message in the echo area, ...) is two grid cells --
+                // the glyph's own cell plus this continuation cell, which
+                // carries no character of its own (`Cell::put_wide`).
+                // `RunBuilder::push` keeps buffer-text runs' `cols`
+                // separate from their char count for exactly this reason
+                // (see its doc); do the same here instead of leaving the
+                // continuation cell claimed by no run at all, which used
+                // to make `grid.runs` a column short for that row.
+                if let Some(r) = open.as_mut() {
+                    if r.col + r.cols == col {
+                        r.cols += 1;
+                        continue;
+                    }
+                }
+                // No open run ends exactly here -- the lead cell must have
+                // been claimed by something else (unexpected shape; chrome
+                // painting never draws a continuation cell without its
+                // lead beside it). Don't guess: close whatever's open and
+                // leave this cell unclaimed, same as the old behavior.
+                if let Some(r) = open.take() {
+                    chrome.push(r);
+                }
+                continue;
+            }
+            if is_covered(col) {
+                if let Some(r) = open.take() {
+                    chrome.push(r);
+                }
+                continue;
+            }
+            let mergeable = open
+                .as_ref()
+                .is_some_and(|r| r.col + r.cols == col && r.style == cell.style);
+            if mergeable {
+                let r = open.as_mut().unwrap();
+                r.text.push(cell.ch);
+                r.cols += 1;
+            } else {
+                if let Some(r) = open.take() {
+                    chrome.push(r);
+                }
+                open = Some(PaintRun {
+                    row: row_idx,
+                    col,
+                    cols: 1,
+                    text: cell.ch.to_string(),
+                    style: cell.style,
+                    src: None,
+                    atomic: false,
+                });
+            }
+        }
+        if let Some(r) = open.take() {
+            chrome.push(r);
+        }
+    }
+    grid.runs.extend(chrome);
 }
 
 /// Draw the M21 selector panel into its reserved rows
@@ -2217,6 +2774,7 @@ pub fn define_face(ed: &Rc<RefCell<Editor>>, name: SymId, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthChar;
 
     // M69 T*: `compose_mode_line` is the pure half of mode-line layout —
     // same shape as `complete.rs`'s `abbreviate_home_with_cases` and

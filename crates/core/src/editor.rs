@@ -193,6 +193,22 @@ pub struct Window {
     pub buffer: Rc<RefCell<Buffer>>,
     pub point: usize,
     pub window_start: usize,
+    /// Fix 3 (mouse-support milestone review): the point value observed at
+    /// the moment this window was last scrolled explicitly (mouse wheel,
+    /// `scroll_window_start`), or `None` if it hasn't been / the pin has
+    /// been consumed. While `Some(p)` and the window's current point is
+    /// still exactly `p`, `render_window` skips `ensure_point_visible`'s
+    /// recentre for this window -- matching GNU Emacs: scrolling moves the
+    /// view without moving point, and point is allowed to sit outside the
+    /// visible region until a command that actually moves point runs. The
+    /// pin is per-window and self-clearing: it is read and compared at
+    /// render time (not written by every point-mutating call site), so
+    /// scrolling window A and then typing in window B leaves A's pin
+    /// intact (A's point hasn't changed), while typing in A itself changes
+    /// A's point away from the pinned value and the very next render sees
+    /// the mismatch, drops the pin, and lets `ensure_point_visible`
+    /// recentre A normally.
+    pub scroll_pin: Option<usize>,
 }
 
 /// Binary window layout tree; leaves index into `Editor::windows`.
@@ -429,6 +445,7 @@ impl Editor {
                 buffer: scratch.clone(),
                 point: 0,
                 window_start: 0,
+                scroll_pin: None,
             },
         );
         Editor {
@@ -779,6 +796,7 @@ pub fn split_selected(ed: &Rc<RefCell<Editor>>, horizontal: bool) {
         buffer: win.buffer.clone(),
         point: win.buffer.borrow().point,
         window_start: win.window_start,
+        scroll_pin: None,
     };
     let new_id = editor.next_window_id;
     editor.next_window_id += 1;

@@ -8,3 +8,8 @@ edition.workspace = true
 elisp = { path = "../elisp" }
 core = { path = "../core" }
 eframe = { version = "0.29", features = ["persistence"] }
+# MIT. Pulls ttf-parser (already in the tree at 0.25.1 via ab_glyph/epaint;
+# rustybuzz 0.20.1 requires ^0.25.0, so it resolves to the same 0.25.1
+# already pinned -- no second copy).
+rustybuzz = "0.20"
+ab_glyph = "0.2"

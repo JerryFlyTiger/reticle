@@ -880,14 +880,10 @@ pub fn register(interp: &mut Interp) {
     });
     defun(interp, "string-width", 1, Some(1), |i, a| {
         let s = need_str(i, &a[0])?;
-        let w: usize = s
-            .chars()
-            .map(|c| {
-                unicode_width::UnicodeWidthChar::width(c)
-                    .unwrap_or(1)
-                    .max(1)
-            })
-            .sum();
+        // See `redisplay::display_width::string_width_elisp` for why
+        // this deliberately does NOT expand tabs the way the buffer
+        // grid does.
+        let w = crate::redisplay::display_width::string_width_elisp(&s);
         Ok(Value::Int(w as i64))
     });
     defun(interp, "format-time-string", 1, Some(2), |i, a| {

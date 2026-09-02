@@ -152,6 +152,7 @@ mod tests {
             lines: vec![vec![Cell::default(); cols]; rows],
             cursor: (0, 0),
             windows: Vec::new(),
+            runs: Vec::new(),
         }
     }
 

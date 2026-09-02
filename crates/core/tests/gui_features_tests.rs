@@ -520,6 +520,52 @@ fn m69_dired_cjk_dir_right_segment_wide_and_column_exact() {
     );
 }
 
+/// Fix 2 (mouse-support milestone review): `fill_chrome_runs` used to
+/// `continue` straight past any `Cell::continuation` cell -- the second
+/// half of a double-width character -- without folding it into the
+/// still-open run's `cols`. For buffer text `RunBuilder::push` already
+/// keeps `cols` separate from char count (see its doc); chrome painting
+/// (the mode line here) drew a wide CJK glyph directly into `grid.lines`
+/// with no `RunBuilder` involved at all, so its continuation cell was
+/// claimed by *no* run -- a one-column gap in `grid.runs` for that row.
+/// Reuses the exact CJK-dired-mode-line scenario `m69_dired_cjk_dir_
+/// right_segment_wide_and_column_exact` above already exercises for
+/// `grid.lines`, but asserts the stronger, general invariant on
+/// `grid.runs` instead: runs on a row must tile every column from 0 to
+/// `grid.cols` exactly -- no gaps, no overlaps -- which is what the next
+/// milestone (reconstructing each row from `grid.runs` to shape/draw it)
+/// depends on.
+#[test]
+fn chrome_runs_cover_every_column_of_a_row_with_a_wide_char() {
+    let dir = Scratch::new("fix2_cjk");
+    let cjk = dir.join("專案");
+    std::fs::create_dir_all(&cjk).unwrap();
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (100, 8);
+    run(&mut i, &format!("(dired {:?})", cjk.to_str().unwrap()));
+    let grid = render(&i, &ed);
+    let row = find_row(&grid, "dired-mode");
+
+    let mut row_runs: Vec<&core::redisplay::PaintRun> =
+        grid.runs.iter().filter(|r| r.row == row).collect();
+    row_runs.sort_by_key(|r| r.col);
+    assert!(!row_runs.is_empty(), "mode line row must have chrome runs");
+
+    let mut next_col = 0usize;
+    for r in &row_runs {
+        assert_eq!(
+            r.col, next_col,
+            "gap or overlap in row {row}'s runs before col {next_col}: {row_runs:#?}"
+        );
+        next_col += r.cols;
+    }
+    assert_eq!(
+        next_col, grid.cols,
+        "runs on row {row} must tile all {} columns, covered only {next_col}: {row_runs:#?}",
+        grid.cols
+    );
+}
+
 /// M-visual-quality: `severity_color` must resolve the diagnostic dot's
 /// color from the `diagnostic-error` face rather than a hard-coded
 /// tuple. Diagnostics are set via `lsp--set-buffer-diagnostics`, the
@@ -782,5 +828,339 @@ fn published_window_layout_reports_the_real_gutter_width() {
     assert_eq!(
         bottom.gutter_cols, bottom_text_col,
         "gutter_cols must match where the bottom pane's text actually starts in the grid"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Mouse-support milestone, task 1: `Grid::runs` / `Grid::buffer_pos_at`.
+// ---------------------------------------------------------------------
+
+/// The selected (only) window's text-area origin in grid coordinates:
+/// `(row, col)` of that window's first text row/column, using
+/// `grid.windows` rather than assuming `(0, 0)` -- true for every test
+/// below since `setup()`'s frame is unsplit and line numbers are off by
+/// default, but stated explicitly so a future edit to this helper can't
+/// silently drift from what the layout actually is.
+fn text_origin(grid: &core::redisplay::Grid) -> (usize, usize) {
+    let w = &grid.windows[0];
+    (w.row, w.col + w.gutter_cols)
+}
+
+#[test]
+fn buffer_pos_at_maps_plain_text_click_to_byte() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"hello\\nworld\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // "hello\nworld\n": h=0 e=1 l=2 l=3 o=4 \n=5 w=6 o=7 r=8 l=9 d=10 \n=11
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 2), Some(2));
+    assert_eq!(grid.buffer_pos_at(row0 + 1, col0), Some(6));
+}
+
+#[test]
+fn buffer_pos_at_past_end_of_line_clamps_to_line_end() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"hi\\nworld\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // "hi" is 2 bytes (0..2); clicking well past it on the same row must
+    // land at 2 (right before the '\n'), not spill onto row 1's 'w'.
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 20), Some(2));
+}
+
+#[test]
+fn buffer_pos_at_empty_line_maps_to_its_own_start() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"a\\n\\nb\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // "a\n\nb\n": a=0 \n=1 (blank line starts at 2) \n=2 b=3 \n=4
+    assert_eq!(grid.buffer_pos_at(row0 + 1, col0), Some(2));
+}
+
+#[test]
+fn buffer_pos_at_tab_maps_every_column_to_the_tab_byte() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"\\tX\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // A tab at column 0 expands to display columns 0..8; 'X' follows at
+    // byte 1. Every column inside the tab's span must map to byte 0 --
+    // the naive proportional mapping the milestone spec warns about
+    // would instead walk off past the tab's single source byte.
+    assert_eq!(grid.buffer_pos_at(row0, col0), Some(0));
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 5), Some(0));
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 8), Some(1));
+}
+
+#[test]
+fn buffer_pos_at_wide_char_continuation_maps_to_char_start() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"\u{754c}X\\n\")"); // 界 (U+754C, 3 UTF-8 bytes, display width 2) then X
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // Both display columns of the wide char map to its own start byte
+    // (0), not to two different bytes -- the continuation cell has no
+    // byte of its own.
+    assert_eq!(grid.buffer_pos_at(row0, col0), Some(0));
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 1), Some(0));
+    // 'X' starts right after the wide char's 3 UTF-8 bytes.
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 2), Some(3));
+}
+
+#[test]
+fn buffer_pos_at_chrome_row_returns_none() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"hello\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let mode_row = grid.windows[0].mode_line_row;
+    // The mode line has no buffer behind any of its columns.
+    assert_eq!(grid.buffer_pos_at(mode_row, 0), None);
+}
+
+#[test]
+fn buffer_pos_at_outside_any_run_row_returns_none() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"hi\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    // A row well past everything painted (`rows` is only 8; this is
+    // deliberately out of range) has no runs at all.
+    assert_eq!(grid.buffer_pos_at(grid.rows + 5, 0), None);
+}
+
+#[test]
+fn paint_runs_cover_buffer_text_with_byte_accurate_src() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"hello\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    let hello_run = grid
+        .runs
+        .iter()
+        .find(|r| r.row == row0 && r.col == col0 && r.src.is_some())
+        .expect("a src-tagged run must cover the buffer text row");
+    assert_eq!(hello_run.text, "hello");
+    assert_eq!(hello_run.src, Some(0..5));
+    // Chrome on the same frame (e.g. the mode line) must carry no src.
+    assert!(grid
+        .runs
+        .iter()
+        .filter(|r| r.row == grid.windows[0].mode_line_row)
+        .all(|r| r.src.is_none()));
+}
+
+#[test]
+fn buffer_pos_at_invisible_cjk_ellipsis_maps_every_column_to_the_hidden_span_start() {
+    // Fix 1 (mouse-support milestone review): the invisible-region "..."
+    // indicator is always the 3-byte ASCII literal "...". When the
+    // overlay it stands in for hides exactly one CJK character -- also 3
+    // UTF-8 bytes, though only 1 char -- `r.text.len() == byte_len`
+    // coincides, and the old discriminator (`r.text.len() != byte_len`)
+    // misread that as "proportional expansion" and walked "..."'s own
+    // three ASCII characters, returning `src.start + 1` / `src.start + 2`
+    // -- byte offsets that land on UTF-8 continuation bytes of the hidden
+    // CJK character, not character boundaries. `PaintRun::atomic` fixes
+    // this by making the run's non-proportional-ness an explicit flag
+    // instead of an inferred coincidence.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"a\u{754c}b\")"); // a 界 b -- 界 is U+754C, 3 bytes, 1 char
+    run(
+        &mut i,
+        "(let ((ov (make-overlay 2 3))) (overlay-put ov 'invisible t))",
+    );
+    let grid = render(&i, &ed);
+    let (row0, col0) = text_origin(&grid);
+    // Row reads "a...b". The hidden span is the single CJK char, char
+    // index 1..2, i.e. buffer bytes 1..4 (byte 0 is 'a').
+    assert_eq!(grid.buffer_pos_at(row0, col0), Some(0)); // 'a'
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 1), Some(1)); // 1st '.' of "..."
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 2), Some(1)); // 2nd '.' -- must NOT be 2
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 3), Some(1)); // 3rd '.' -- must NOT be 3
+    assert_eq!(grid.buffer_pos_at(row0, col0 + 4), Some(4)); // 'b'
+}
+
+#[test]
+fn buffer_pos_at_result_is_always_a_char_boundary() {
+    // The invariant Fix 1 exists to guarantee. An earlier version of this
+    // test covered a 2-byte Latin-1 accented character, a 3-byte CJK
+    // character, a tab, and a control character -- and passed even with
+    // the pre-Fix-1 bug reinstated (`if r.atomic` forced to `if false`),
+    // because NONE of those cases can produce a non-boundary byte via the
+    // proportional branch:
+    //   - A tab run is N spaces over 1 source byte. Walking it
+    //     proportionally returns src.start, src.start+1, ... -- those run
+    //     past src.end, so the BYTE OFFSET is wrong, but every value it
+    //     produces still lands on a char boundary, because whatever comes
+    //     after a tab in this buffer is ordinary ASCII.
+    //   - A control-character run is "^A", two ASCII bytes over one
+    //     source byte -- same story: wrong, but still boundary-aligned.
+    //   - A CJK character painted directly (not hidden) is one run of 3
+    //     bytes / 2 columns, and the proportional walk steps by
+    //     `len_utf8()` per character in `r.text`, so for an un-merged
+    //     single-character run it is boundary-correct by construction.
+    // The ONLY construct that produces a genuine non-boundary byte is the
+    // one that first exposed this defect: an invisible-region ellipsis
+    // whose hidden span is multi-byte. `"..."` is three one-byte ASCII
+    // characters, so walking IT proportionally hands back src.start+1 and
+    // src.start+2 -- offsets into the middle of whatever multi-byte
+    // character the overlay is hiding. Anyone strengthening this test
+    // later needs to know that "covers tabs, control chars, and a CJK
+    // character" is exactly the set of cases that let this bug through
+    // once already -- the overlay-hidden span below is not optional
+    // padding, it is the one case that actually exercises the invariant.
+    let (mut i, ed) = setup();
+    // Precomposed é (U+00E9, 2 bytes). Built via `char-to-string`/`concat`
+    // rather than an elisp string escape for the control character: this
+    // reader's string syntax has no `\uXXXX`/`\xNN` escape (a bare `\u`
+    // is read as literal `u`), so a literal `"\u0001"` would silently
+    // insert the six characters `u`, `0`, `0`, `0`, `1` instead of one
+    // control byte. The trailing `a`, CJK char, `b` give the overlay
+    // below something multi-byte to hide.
+    run(
+        &mut i,
+        "(insert (concat (char-to-string ?\u{e9}) (char-to-string ?\u{754c}) \"\\tX\" (char-to-string 1) \"Ya\" (char-to-string ?\u{754c}) \"b\"))",
+    );
+    // 1-based points: 1=é 2=界 3=\t 4=X 5=^A 6=Y 7=a 8=界 9=b. Hide the
+    // second CJK character (point 8..9) so its run renders as "..." --
+    // the shape that reproduced Fix 1's panic.
+    run(
+        &mut i,
+        "(let ((ov (make-overlay 8 9))) (overlay-put ov 'invisible t))",
+    );
+    let grid = render(&i, &ed);
+    // Ground truth is the FULL underlying buffer text, including the
+    // bytes the overlay hides -- `buffer_pos_at` answers in buffer byte
+    // offsets, not in terms of what's currently visible on screen.
+    let text = ed.borrow().current.borrow().text.to_string();
+    // Sweep every row and every column in the grid, not just the ones
+    // this test's author expects to matter -- that is the point of an
+    // invariant test: it catches the case nobody thought of, the way the
+    // original narrower version of this test did not.
+    for row in 0..grid.rows {
+        for col in 0..grid.cols {
+            if let Some(byte) = grid.buffer_pos_at(row, col) {
+                assert!(
+                    byte <= text.len() && text.is_char_boundary(byte),
+                    "row {row} col {col} mapped to non-boundary byte {byte} in {text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn buffer_pos_at_gutter_column_falls_through_to_line_end_not_none() {
+    // Pinning test, not a design endorsement. `Grid::buffer_pos_at` has
+    // no concept of "gutter" -- it only knows about runs, and gutter
+    // columns carry `src: None` chrome runs (see `fill_chrome_runs`),
+    // never a `Some`-src buffer-text run. So a gutter column matches NO
+    // run's positive-width span, which sends `buffer_pos_at` down the
+    // exact same "past the end of this row's text" fallback that a
+    // genuine past-line-end click uses (see `buffer_pos_at_past_end_
+    // of_line_clamps_to_line_end` above) -- it does NOT return `None`.
+    //
+    // This is why `pixel_to_buffer_pos` in `frontend-gui/src/lib.rs`
+    // has its own explicit `col >= text_left` guard BEFORE ever calling
+    // `buffer_pos_at`: without that guard, a click on the line-number
+    // gutter would silently place point at the end of that line
+    // instead of doing nothing (the milestone's guard-rail requirement:
+    // "clicks outside any window's text area must do nothing"). The
+    // GUI's own gutter-click test is `pixel_to_buffer_pos_gutter_
+    // column_returns_none` in `frontend-gui/src/lib.rs`'s test module.
+    //
+    // This test pins today's fallback so a change to it doesn't slip
+    // past unnoticed -- it does not assert that "line end" is the
+    // *right* contract for a gutter click reaching `buffer_pos_at`
+    // directly; an alternative (`None` for any column before the row's
+    // first run) was considered and is not applied in this round.
+    let (mut i, ed) = setup();
+    run(&mut i, "(setq display-line-numbers t)");
+    run(&mut i, "(insert \"hello\\n\")");
+    let grid = core::redisplay::render(&i, &ed);
+    let win = &grid.windows[0];
+    assert!(win.gutter_cols > 0, "line numbers must be on for this pin");
+    // Leftmost gutter column, on the window's first (only) text row.
+    let gutter_col = win.col;
+    // "hello" is 5 bytes; the fallback lands on the row's last run's
+    // src.end, which is 5 -- right before the '\n', i.e. "end of line".
+    assert_eq!(grid.buffer_pos_at(win.row, gutter_col), Some(5));
+}
+
+// ---------------------------------------------------------------------
+// Fix 3 (mouse-support milestone review): wheel scroll must not
+// self-cancel. `scroll_window_start` moves `window_start` without
+// moving point; `render_window` calls `ensure_point_visible` on every
+// frame, which used to recentre unconditionally whenever point drifted
+// far enough from `window_start` -- undoing the scroll on the very next
+// render. `Window::scroll_pin` fixes this: see its doc comment for the
+// exact semantics.
+// ---------------------------------------------------------------------
+
+#[test]
+fn wheel_scroll_survives_the_next_render_when_point_does_not_move() {
+    let (mut i, ed) = setup();
+    // 60 short lines -- point stays at line 0 (char 0) throughout.
+    let lines: Vec<String> = (0..60).map(|n| format!("line{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    run(&mut i, "(goto-char (point-min))");
+    // Establish window_start at 0 with an initial render.
+    let _ = render(&i, &ed);
+    let win_id = ed.borrow().selected_window;
+    assert_eq!(ed.borrow().windows[&win_id].window_start, 0);
+
+    // Scroll forward 20 lines -- point (still 0) is now far enough from
+    // the new window_start that the OLD `ensure_point_visible` would
+    // recentre it right back toward 0 on the very next render.
+    core::redisplay::scroll_window_start(&ed, win_id, 20);
+    let scrolled_start = ed.borrow().windows[&win_id].window_start;
+    assert!(
+        scrolled_start > 0,
+        "scroll must have advanced window_start, got {scrolled_start}"
+    );
+
+    // Multiple renders in a row (simulating repeated frames with no
+    // intervening command) must NOT snap window_start back toward point.
+    for _ in 0..3 {
+        let _ = render(&i, &ed);
+        assert_eq!(
+            ed.borrow().windows[&win_id].window_start,
+            scrolled_start,
+            "an explicit scroll must survive repeated renders while point hasn't moved"
+        );
+    }
+}
+
+#[test]
+fn moving_point_after_a_wheel_scroll_resumes_normal_recentring() {
+    let (mut i, ed) = setup();
+    let lines: Vec<String> = (0..60).map(|n| format!("line{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    run(&mut i, "(goto-char (point-min))");
+    let _ = render(&i, &ed);
+    let win_id = ed.borrow().selected_window;
+
+    core::redisplay::scroll_window_start(&ed, win_id, 20);
+    let scrolled_start = ed.borrow().windows[&win_id].window_start;
+    let _ = render(&i, &ed); // pin holds -- point hasn't moved yet
+    assert_eq!(ed.borrow().windows[&win_id].window_start, scrolled_start);
+
+    // A real command moves point -- the pin must be dropped and
+    // `ensure_point_visible` must resume making the window follow point,
+    // same as any command that moves point off-screen.
+    run(&mut i, "(goto-char (point-max))");
+    let _ = render(&i, &ed);
+    let after_move_start = ed.borrow().windows[&win_id].window_start;
+    // point-max (near line 60) is far from `scrolled_start` (near line
+    // 20) -- with the pin correctly dropped, `ensure_point_visible` must
+    // have moved window_start again to bring point back on screen, so
+    // it must differ from the pinned value the scroll left behind.
+    assert_ne!(
+        after_move_start, scrolled_start,
+        "moving point must resume recentring, not keep the stale scrolled position"
+    );
+    let point = ed.borrow().current.borrow().point;
+    assert!(
+        point >= after_move_start,
+        "point ({point}) must be visible (>= window_start {after_move_start}) again"
     );
 }

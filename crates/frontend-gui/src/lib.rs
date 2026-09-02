@@ -13,8 +13,11 @@
 //! never calls elisp. Ground colors come from the theme's `default`
 //! face, so `(load-theme 'light)` relights the whole frame live.
 
+mod shaping;
+
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use eframe::egui;
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Vec2};
@@ -24,6 +27,7 @@ use core::editor::Editor;
 use core::keymap::{ctrl_encode, META};
 use core::redisplay::{frame_base_style, render, Underline};
 use elisp::Interp;
+use shaping::{FaceRole, GlyphAtlasCache, ShapeCache, ShapingFace};
 
 /// Fallbacks when no theme has set the `default` face (never in
 /// practice — themes.el loads at startup).
@@ -32,6 +36,52 @@ const FALLBACK_FG: Color32 = Color32::from_rgb(0xd4, 0xd4, 0xd4);
 
 const BOLD_FAMILY: &str = "mono-bold";
 const ITALIC_FAMILY: &str = "mono-italic";
+
+/// The shaping-ready faces `install_fonts` loaded, alongside (not instead
+/// of) the copies it handed to egui's `FontData` -- see `shaping`'s
+/// module doc for why the GUI must keep its own copy. `bold`/`italic` are
+/// `None` when neither a same-family variant nor Menlo.ttc was found on
+/// disk, in which case the paint loop's shaping attempt for a bold/italic
+/// run simply has nothing to shape with and falls back to `painter.text`,
+/// same as it always has.
+#[derive(Default)]
+struct FontSet {
+    regular: Option<ShapingFace>,
+    bold: Option<ShapingFace>,
+    italic: Option<ShapingFace>,
+}
+
+impl FontSet {
+    fn for_role(&self, role: FaceRole) -> Option<&ShapingFace> {
+        match role {
+            FaceRole::Regular => self.regular.as_ref(),
+            FaceRole::Bold => self.bold.as_ref(),
+            FaceRole::Italic => self.italic.as_ref(),
+        }
+    }
+}
+
+/// `JetBrainsMono-Regular.ttf` -> `JetBrainsMono-Bold.ttf` /
+/// `JetBrainsMono-Italic.ttf`: the same-family variant naming convention
+/// this milestone's bold/italic fix prefers over Menlo.ttc's face
+/// indices. `None` when `base` doesn't follow the `*-Regular.*` pattern
+/// (a font file named some other way, e.g. `Monaco.ttf`, which has no
+/// separate bold/italic file to look for).
+fn variant_file_name(base: &str, variant: &str) -> Option<String> {
+    // Fix 7 (cold review): `replacen(.., 1)` replaces the FIRST
+    // occurrence of "Regular". A family name that itself contains
+    // "Regular" before the variant marker (e.g. a hypothetical
+    // "RegularWidthMono-Regular.ttf") would then have the wrong
+    // occurrence replaced and silently fall back to Menlo. The variant
+    // marker is always the last "Regular" in the stem (immediately
+    // before the extension), so find and replace that one instead.
+    let idx = base.rfind("Regular")?;
+    let mut result = String::with_capacity(base.len() - "Regular".len() + variant.len());
+    result.push_str(&base[..idx]);
+    result.push_str(variant);
+    result.push_str(&base[idx + "Regular".len()..]);
+    Some(result)
+}
 
 /// Fix D (trailing review): the window after input during which the
 /// cursor is forced fully opaque (blink/fade suppressed) -- used by both
@@ -64,14 +114,19 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
         options,
         Box::new(move |cc| {
             let font_family = str_var(&interp, "gui-font-family");
-            let (have_bold, have_italic) = install_fonts(&cc.egui_ctx, font_family.as_deref());
+            let (have_bold, have_italic, fonts) =
+                install_fonts(&cc.egui_ctx, font_family.as_deref());
             Ok(Box::new(App {
                 interp,
                 ed,
                 last_input: std::time::Instant::now(),
                 have_bold,
                 have_italic,
+                fonts,
+                shape_cache: ShapeCache::default(),
+                glyph_cache: GlyphAtlasCache::default(),
                 last_frame_ms: 0.0,
+                drag: None,
             }))
         }),
     )
@@ -131,9 +186,10 @@ fn find_font(file_name: &str) -> Option<Vec<u8>> {
 /// or hard-coding assumptions about what's installed on the CI/dev
 /// machine, both of which this project has chosen not to do. This is an
 /// acknowledged, deliberate gap, not an oversight.
-fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool) {
+fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool, FontSet) {
     let mut fonts = FontDefinitions::default();
     let mut loaded: Vec<String> = Vec::new();
+    let mut font_set = FontSet::default();
     // The primary body font chain (fix 6b): gui-font-family first, then
     // EVERY built-in candidate actually present on disk, in search
     // order -- not just the first hit. A previous version of this
@@ -145,9 +201,23 @@ fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool)
         .into_iter()
         .chain(FONT_CANDIDATES.iter().copied())
         .collect();
+    // The very first hit is also the "regular" face for shaping (task:
+    // coding ligatures) -- its name is remembered so the bold/italic
+    // search below can look for a same-family variant of exactly this
+    // file, not of the search order's first *candidate* (which may not
+    // be what was actually found).
+    let mut regular_name: Option<String> = None;
     for name in search_order {
         if let Some(bytes) = find_font(name) {
             let key = format!("primary-{}", loaded.len());
+            if regular_name.is_none() {
+                regular_name = Some(name.to_string());
+                // Font-bytes trap: `FontData::from_owned` takes
+                // ownership of `bytes` below and does not give it back,
+                // so the shaping-side copy is taken from this same read
+                // before that happens -- see `shaping`'s module doc.
+                font_set.regular = ShapingFace::new(Arc::from(bytes.clone().into_boxed_slice()), 0);
+            }
             fonts
                 .font_data
                 .insert(key.clone(), FontData::from_owned(bytes));
@@ -181,31 +251,86 @@ fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool)
 
     let mut have_bold = false;
     let mut have_italic = false;
-    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
-        let mut bold = FontData::from_owned(bytes.clone());
-        bold.index = 1;
-        fonts.font_data.insert("menlo-bold".into(), bold);
-        let mut italic = FontData::from_owned(bytes);
-        italic.index = 2;
-        fonts.font_data.insert("menlo-italic".into(), italic);
-        // Each variant family keeps the CJK fallback chain behind it.
-        let mut bold_chain = vec!["menlo-bold".to_string()];
-        let mut italic_chain = vec!["menlo-italic".to_string()];
+
+    // Bold/italic (task: same-family variants). Prefer
+    // `<Family>-Bold.ttf`/`<Family>-Italic.ttf` next to the regular face
+    // actually found above -- with JetBrains Mono as the primary font,
+    // drawing its bold/italic runs in Menlo (a different family
+    // entirely) is a visible mismatch. Falls back to Menlo.ttc's face
+    // indices 1/2 exactly as before when no same-family variant exists.
+    let same_family_bold = regular_name
+        .as_deref()
+        .and_then(|n| variant_file_name(n, "Bold"))
+        .and_then(|n| find_font(&n).map(|b| (n, b)));
+    let same_family_italic = regular_name
+        .as_deref()
+        .and_then(|n| variant_file_name(n, "Italic"))
+        .and_then(|n| find_font(&n).map(|b| (n, b)));
+
+    if let Some((_, bytes)) = &same_family_bold {
+        font_set.bold = ShapingFace::new(Arc::from(bytes.clone().into_boxed_slice()), 0);
+        fonts
+            .font_data
+            .insert("family-bold".into(), FontData::from_owned(bytes.clone()));
+        let mut bold_chain = vec!["family-bold".to_string()];
         if loaded.contains(&"arial-unicode".to_string()) {
             bold_chain.push("arial-unicode".into());
-            italic_chain.push("arial-unicode".into());
         }
         fonts
             .families
             .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_chain);
+        have_bold = true;
+    }
+    if let Some((_, bytes)) = &same_family_italic {
+        font_set.italic = ShapingFace::new(Arc::from(bytes.clone().into_boxed_slice()), 0);
+        fonts
+            .font_data
+            .insert("family-italic".into(), FontData::from_owned(bytes.clone()));
+        let mut italic_chain = vec!["family-italic".to_string()];
+        if loaded.contains(&"arial-unicode".to_string()) {
+            italic_chain.push("arial-unicode".into());
+        }
         fonts
             .families
             .insert(FontFamily::Name(ITALIC_FAMILY.into()), italic_chain);
-        have_bold = true;
         have_italic = true;
     }
+
+    if !have_bold || !have_italic {
+        if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
+            if !have_bold {
+                let mut bold = FontData::from_owned(bytes.clone());
+                bold.index = 1;
+                fonts.font_data.insert("menlo-bold".into(), bold);
+                font_set.bold = ShapingFace::new(Arc::from(bytes.clone().into_boxed_slice()), 1);
+                let mut bold_chain = vec!["menlo-bold".to_string()];
+                if loaded.contains(&"arial-unicode".to_string()) {
+                    bold_chain.push("arial-unicode".into());
+                }
+                fonts
+                    .families
+                    .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_chain);
+                have_bold = true;
+            }
+            if !have_italic {
+                let mut italic = FontData::from_owned(bytes.clone());
+                italic.index = 2;
+                fonts.font_data.insert("menlo-italic".into(), italic);
+                font_set.italic = ShapingFace::new(Arc::from(bytes.into_boxed_slice()), 2);
+                let mut italic_chain = vec!["menlo-italic".to_string()];
+                if loaded.contains(&"arial-unicode".to_string()) {
+                    italic_chain.push("arial-unicode".into());
+                }
+                fonts
+                    .families
+                    .insert(FontFamily::Name(ITALIC_FAMILY.into()), italic_chain);
+                have_italic = true;
+            }
+        }
+    }
+
     ctx.set_fonts(fonts);
-    (have_bold, have_italic)
+    (have_bold, have_italic, font_set)
 }
 
 struct App {
@@ -214,7 +339,38 @@ struct App {
     last_input: std::time::Instant,
     have_bold: bool,
     have_italic: bool,
+    /// Shaping-ready faces (task: coding ligatures) -- see `shaping`'s
+    /// module doc. Populated once, at `install_fonts` time; the GUI never
+    /// changes fonts at runtime, so unlike `glyph_cache` these don't need
+    /// a per-frame invalidation check.
+    fonts: FontSet,
+    /// Shaping result cache, keyed on `(FaceRole, text)`. See `shaping`'s
+    /// module doc for what invalidates it (nothing, but capped).
+    shape_cache: ShapeCache,
+    /// Rasterized-glyph atlas-placement cache, keyed on `(FaceRole, glyph
+    /// id, pixel scale)`. See `shaping`'s module doc for the per-frame
+    /// atlas-identity check that invalidates it wholesale.
+    glyph_cache: GlyphAtlasCache,
     last_frame_ms: f32,
+    /// Mouse support (task 3): state carried between frames while the
+    /// primary button is held, `None` otherwise. Drag-to-select must
+    /// tell a plain click (no movement, no mark should be armed) apart
+    /// from an actual drag (arm the mark at the press position, then the
+    /// usual `PointerButton`-release just stops tracking -- the region
+    /// that resulted stays exactly as `mark`/`mark_active` left it, same
+    /// as every other region in this editor).
+    drag: Option<DragState>,
+}
+
+/// See `App::drag`.
+struct DragState {
+    win_id: usize,
+    /// Buffer byte offset under the press -- becomes the mark's position
+    /// the first time the drag actually moves to a different cell.
+    start_byte: usize,
+    /// Whether the drag has moved to a different buffer position since
+    /// the press (i.e. whether the mark has been armed yet).
+    dragged: bool,
 }
 
 /// An elisp integer variable, or `None` when unset / not an integer.
@@ -314,10 +470,19 @@ fn clamp_cursor_blinks(raw: i64) -> i64 {
 /// built from the same shared boundary always land on the identical
 /// device pixel: no gap, no overlap.
 fn snap_rect(rect: Rect, ppp: f32) -> Rect {
-    let snap = |v: f32| (v * ppp).round() / ppp;
+    // Fix 5 (cold review): shares the exact rounding formula with
+    // `shaping::build_shaped_mesh`'s glyph-position snap via
+    // `shaping::snap_to_pixel`, rather than each maintaining its own
+    // copy of `(v * ppp).round() / ppp`.
     Rect::from_min_max(
-        Pos2::new(snap(rect.min.x), snap(rect.min.y)),
-        Pos2::new(snap(rect.max.x), snap(rect.max.y)),
+        Pos2::new(
+            shaping::snap_to_pixel(rect.min.x, ppp),
+            shaping::snap_to_pixel(rect.min.y, ppp),
+        ),
+        Pos2::new(
+            shaping::snap_to_pixel(rect.max.x, ppp),
+            shaping::snap_to_pixel(rect.max.y, ppp),
+        ),
     )
 }
 
@@ -498,6 +663,212 @@ fn scrollbar_thumb(
     Some((top, len))
 }
 
+// --- Mouse support (M-mouse task 3) ---------------------------------
+//
+// Click-to-place-point, drag-to-select, wheel-to-scroll. All three need
+// the same pixel-to-cell geometry the paint loop already uses
+// (`origin`/`char_w`/`row_h`), plus the just-rendered `Grid`'s
+// `windows` (for which window a pixel lands in) and `buffer_pos_at`
+// (task 1's screen-to-buffer inverse mapping), so these run inside
+// `App::update`'s `CentralPanel` closure, after both exist -- not in
+// the keyboard event loop at the top of `update`, which runs before
+// either does.
+
+/// A screen pixel position mapped to `(win_id, buffer byte offset)`,
+/// clamped to the window whose *text area* (`WindowLayout::row..
+/// mode_line_row`, columns `col + gutter_cols..col + cols`) the pixel
+/// falls inside. `None` for anything outside every window's text area
+/// -- a mode line, the echo row, a gutter, or the padding margin around
+/// the grid -- so a click there does nothing rather than mis-placing
+/// point (guard rail from the milestone spec).
+fn pixel_to_buffer_pos(
+    grid: &core::redisplay::Grid,
+    origin: Pos2,
+    char_w: f32,
+    row_h: f32,
+    pixel: Pos2,
+) -> Option<(usize, usize)> {
+    if pixel.x < origin.x || pixel.y < origin.y || char_w <= 0.0 || row_h <= 0.0 {
+        return None;
+    }
+    let col = ((pixel.x - origin.x) / char_w).floor() as usize;
+    let row = ((pixel.y - origin.y) / row_h).floor() as usize;
+    for win in &grid.windows {
+        let text_left = win.col + win.gutter_cols;
+        let text_right = win.col + win.cols;
+        if row >= win.row && row < win.mode_line_row && col >= text_left && col < text_right {
+            let byte = grid.buffer_pos_at(row, col)?;
+            return Some((win.win_id, byte));
+        }
+    }
+    None
+}
+
+/// Which window (if any) a pixel position's *text area* falls inside --
+/// the wheel handler's own lookup, separate from `pixel_to_buffer_pos`
+/// because scrolling doesn't need a buffer byte offset at all (and
+/// `buffer_pos_at` can legitimately return `None` over a blank area of
+/// an otherwise-valid window row, which must not stop the wheel from
+/// scrolling that window).
+fn window_at_pixel(
+    grid: &core::redisplay::Grid,
+    origin: Pos2,
+    char_w: f32,
+    row_h: f32,
+    pixel: Pos2,
+) -> Option<usize> {
+    if pixel.x < origin.x || pixel.y < origin.y || char_w <= 0.0 || row_h <= 0.0 {
+        return None;
+    }
+    let col = ((pixel.x - origin.x) / char_w).floor() as usize;
+    let row = ((pixel.y - origin.y) / row_h).floor() as usize;
+    grid.windows
+        .iter()
+        .find(|win| {
+            row >= win.row
+                && row < win.mode_line_row
+                && col >= win.col + win.gutter_cols
+                && col < win.col + win.cols
+        })
+        .map(|win| win.win_id)
+}
+
+/// Move point to `byte_pos` in window `win_id`'s buffer, selecting that
+/// window first if it isn't already selected. Routed through
+/// `core::editor::select_window` (the same entry point `C-x o`/evil's
+/// `C-w w` use, `builtins/ui.rs`) for the window switch -- the one
+/// public API this codebase has for it -- and then a direct
+/// `Buffer::point` write for the point move itself: there is no
+/// dedicated Rust-level `goto-char` function to call instead (the
+/// `goto-char` *elisp* builtin is a closure registered on the
+/// interpreter, not a plain Rust fn), so this mirrors that builtin's
+/// own body exactly (`crates/core/src/builtins/editing.rs`: clamp, set
+/// `point`, clear `goal_column`) -- the same direct-field-write idiom
+/// `select_window`/`show_buffer_in_selected_window` themselves already
+/// use internally (`crates/core/src/editor.rs`).
+fn place_point(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, win_id: usize, byte_pos: usize) {
+    if ed.borrow().selected_window != win_id {
+        core::editor::select_window(interp, ed, win_id);
+    }
+    let buf = match ed.borrow().windows.get(&win_id) {
+        Some(w) => w.buffer.clone(),
+        None => return,
+    };
+    let char_pos = buf.borrow().text.byte_to_char(byte_pos);
+    let mut b = buf.borrow_mut();
+    let clamped = b.clamp(char_pos as i64);
+    b.point = clamped;
+    b.goal_column = None;
+}
+
+/// Arm the mark at `byte_pos` in window `win_id`'s buffer, the same
+/// effect the `set-mark` elisp builtin has (`mark = Some(pos);
+/// mark_active = true` -- `crates/core/src/builtins/editing.rs`). Only a
+/// hand-set fallback; see `arm_mouse_selection`, its only caller, for
+/// when this is used versus evil's own `evil-visual-char` path.
+fn arm_mark(ed: &Rc<RefCell<Editor>>, win_id: usize, byte_pos: usize) {
+    let buf = match ed.borrow().windows.get(&win_id) {
+        Some(w) => w.buffer.clone(),
+        None => return,
+    };
+    let char_pos = buf.borrow().text.byte_to_char(byte_pos);
+    let mut b = buf.borrow_mut();
+    b.mark = Some(char_pos);
+    b.mark_active = true;
+}
+
+/// Arm a mouse-drag selection at `byte_pos` (the drag's press
+/// position) in window `win_id`'s buffer, called once per drag -- right
+/// before point is first moved away from the press position (see the
+/// call site in `App::update`'s `PointerMoved` handling) -- and never
+/// again for the rest of that same drag.
+///
+/// evil-mode is on by default in this editor and keeps its own state
+/// machine on top of the plain mark: `evil--state` (a buffer-local
+/// elisp variable, `'normal`/`'visual`/`'insert`/`'emacs`) and
+/// `evil--visual-type` (`'char`/`'line`), both set by `evil-visual-char`
+/// (`crates/core/lisp/evil.el`, the command bound to `v`) alongside
+/// `set-mark`. A plain `set-mark`-equivalent write (`arm_mark`) leaves
+/// `evil--state` untouched, so a mouse-drawn region highlights
+/// correctly (`redisplay.rs`'s region painting reads `mark`/
+/// `mark_active` directly) but evil's visual-state operators (`d`/`y`/
+/// `c`/... while `evil--state` is `'visual`) do not recognize it as
+/// their selection -- in `'normal` state (evil's default, and the state
+/// a drag almost always starts a selection from) `y`/`d`/`c` are
+/// operators waiting for a motion, and a bare mouse-made region is not
+/// one.
+///
+/// So: when evil is on and the buffer is (at this exact moment) in
+/// `'normal` state, this calls `evil-visual-char` itself via
+/// `Interp::eval_source` -- the same public entry point
+/// `core::idle_tick`'s async-process pumps already use to invoke a
+/// named elisp function from Rust (`crates/core/src/lib.rs`) -- rather
+/// than hand-setting `evil--state`/`evil--visual-type`/`mark` from Rust:
+/// reusing evil's own transition keeps this in sync with whatever else
+/// `evil--set-state` does (cursor shape, `inhibit-self-insert`, the
+/// mode-line tag, ...) without duplicating that logic here. Point must
+/// still be at `byte_pos` (the press position, not yet moved) when this
+/// runs, because `evil-visual-char`'s own body is `(set-mark (point))`
+/// -- it reads the *current* point to decide where the mark goes; the
+/// caller is responsible for calling this before advancing point to the
+/// drag's current position.
+///
+/// Every other case falls back to `arm_mark` (the plain hand-set write):
+/// evil off; evil on but already in `'visual`/`'insert`/`'emacs` state
+/// (reasoned about above -- keyboard-driven selection is untouched
+/// either way, since this is only ever called from the mouse-drag path;
+/// a drag that starts already inside evil's visual state does not get a
+/// second, redundant `evil-visual-char` call, which would instead EXIT
+/// visual state -- see that function's own `(if (and (eq evil--state
+/// 'visual) ...` toggle; and a drag starting in insert/emacs state does
+/// not unexpectedly switch evil state at all); **and also `'operator-
+/// pending` and any other value `evil--state` can hold**, which this
+/// function does not reason about at all -- `sym_var(...) == Some("normal")`
+/// is false for those, so they take the same `else` branch as evil-off,
+/// giving a plain mark with `evil--state` left wherever it was. Whether
+/// a plain mark interacts sensibly with a *pending* operator (e.g. `d`
+/// waiting for a motion, then the user drags the mouse instead of typing
+/// one) has not been analysed or tested here -- flagged, not fixed, by
+/// the mouse-support milestone review.
+/// Fix 4 (mouse-support milestone review): whether a same-window
+/// `PointerMoved` event during an active drag should call
+/// `arm_mouse_selection` -- exactly once, the first time the drag
+/// differs from its own press position. Factored out of the inline
+/// `match` arm in `App::update` so this decision (previously entangled
+/// with "should `place_point` run at all", the actual bug -- see the
+/// call site's doc comment) has a unit test independent of a full
+/// `eframe`/`egui` event-loop harness.
+fn drag_should_arm(already_dragged: bool, byte_pos: usize, start_byte: usize) -> bool {
+    !already_dragged && byte_pos != start_byte
+}
+
+fn arm_mouse_selection(
+    interp: &mut Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    byte_pos: usize,
+) {
+    let evil_on = var_truthy(interp, "evil-mode");
+    let evil_normal = sym_var(interp, "evil--state") == Some("normal");
+    if evil_on && evil_normal {
+        // Fix 5 (mouse-support milestone review): every other branch of
+        // this function leaves `mark`/`mark_active` in a known state one
+        // way or another. Silently swallowing a signal here (the old
+        // `let _ = ...`) instead left neither `evil--state` transitioned
+        // NOR any mark set at all -- the drag would proceed with no
+        // selection and no diagnostic. Fall back to the plain hand-set
+        // mark so a selection exists either way; evil's own state stays
+        // whatever it was (unchanged by a failed `evil-visual-char`),
+        // same as the `else` branch below already accepts for the
+        // evil-off/non-normal cases.
+        if interp.eval_source("(evil-visual-char)").is_err() {
+            arm_mark(ed, win_id, byte_pos);
+        }
+    } else {
+        arm_mark(ed, win_id, byte_pos);
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = std::time::Instant::now();
@@ -641,6 +1012,133 @@ impl eframe::App for App {
                 let origin = ui.min_rect().min + Vec2::new(padding_x, padding_y);
                 let painter = ui.painter();
 
+                // Mouse (task 3): click-to-place-point, drag-to-select,
+                // wheel-to-scroll. Uses this frame's just-rendered `grid`
+                // for hit-testing, so a click's effect (point/mark move,
+                // window selection) is applied here but only becomes
+                // visible on the *next* frame's `render()` call, one
+                // frame later -- the same latency every wake-cadence-
+                // driven redraw in this app already has for anything
+                // that isn't a keyboard key (those are handled earlier,
+                // in `update`'s own event loop, before `render` runs).
+                for event in ctx.input(|i| i.events.clone()) {
+                    match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            ..
+                        } => {
+                            if pressed {
+                                if let Some((win_id, byte_pos)) =
+                                    pixel_to_buffer_pos(&grid, origin, char_w, row_h, pos)
+                                {
+                                    place_point(&mut self.interp, &self.ed, win_id, byte_pos);
+                                    self.drag = Some(DragState {
+                                        win_id,
+                                        start_byte: byte_pos,
+                                        dragged: false,
+                                    });
+                                }
+                            } else {
+                                self.drag = None;
+                            }
+                        }
+                        egui::Event::PointerMoved(pos) => {
+                            // Fix 4 (mouse-support milestone review): this
+                            // used to gate BOTH "arm the mark" and "move
+                            // point at all" on the same `byte_pos !=
+                            // drag.start_byte` condition. That's right for
+                            // arming (the mark must be set exactly once,
+                            // the first time the drag leaves the press
+                            // position) but wrong for point: a drag that
+                            // moves away and then comes back to exactly
+                            // the start position must still update point
+                            // TO the start position -- otherwise point is
+                            // left wherever the drag last differed, and
+                            // releasing there leaves a stale selection.
+                            // Two separate decisions now: `moved`
+                            // (confined to the originating window, same as
+                            // before -- a drag never crosses windows) gates
+                            // whether this event does anything at all;
+                            // `!already_dragged && byte_pos != start_byte`
+                            // gates arming, on its own; `place_point` runs
+                            // on every `moved` event, unconditionally.
+                            let moved = if let Some(drag) = &self.drag {
+                                pixel_to_buffer_pos(&grid, origin, char_w, row_h, pos)
+                                    .filter(|(win_id, _)| *win_id == drag.win_id)
+                                    .map(|(win_id, byte_pos)| {
+                                        (win_id, byte_pos, drag.dragged, drag.start_byte)
+                                    })
+                            } else {
+                                None
+                            };
+                            if let Some((win_id, byte_pos, already_dragged, start_byte)) = moved {
+                                let arm = drag_should_arm(already_dragged, byte_pos, start_byte);
+                                if arm {
+                                    if let Some(drag) = &mut self.drag {
+                                        drag.dragged = true;
+                                    }
+                                    arm_mouse_selection(
+                                        &mut self.interp,
+                                        &self.ed,
+                                        win_id,
+                                        start_byte,
+                                    );
+                                }
+                                place_point(&mut self.interp, &self.ed, win_id, byte_pos);
+                            }
+                        }
+                        egui::Event::MouseWheel { unit, delta, .. } => {
+                            if let Some(hover) = ctx.pointer_hover_pos() {
+                                if let Some(win_id) =
+                                    window_at_pixel(&grid, origin, char_w, row_h, hover)
+                                {
+                                    // `delta.y` follows egui's "content
+                                    // moves with the gesture" convention
+                                    // (positive = content moves down, see
+                                    // `Event::MouseWheel`'s own doc) --
+                                    // negated so scrolling down reveals
+                                    // LATER text (window_start advances),
+                                    // matching every other scrollable
+                                    // view. `Line` units map 1:1 to a
+                                    // scroll of that many lines; `Point`/
+                                    // `Page` (trackpad / rare backends)
+                                    // are converted via `row_h`/the
+                                    // window's own text-row count so the
+                                    // same physical gesture still moves a
+                                    // sane number of lines instead of 0
+                                    // (a fractional point delta below one
+                                    // `row_h` truncating to zero) or an
+                                    // entire screenful at once.
+                                    let lines = match unit {
+                                        egui::MouseWheelUnit::Line => -delta.y,
+                                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                                        egui::MouseWheelUnit::Page => {
+                                            let win_rows = grid
+                                                .windows
+                                                .iter()
+                                                .find(|w| w.win_id == win_id)
+                                                .map(|w| w.rows.saturating_sub(1))
+                                                .unwrap_or(1);
+                                            -delta.y * win_rows as f32
+                                        }
+                                    };
+                                    let delta_lines = lines.round() as i64;
+                                    if delta_lines != 0 {
+                                        core::redisplay::scroll_window_start(
+                                            &self.ed,
+                                            win_id,
+                                            delta_lines,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let pick_font = |style: &core::redisplay::Style| -> &FontId {
                     if style.bold && self.have_bold {
                         &bold_font
@@ -650,6 +1148,43 @@ impl eframe::App for App {
                         &font
                     }
                 };
+
+                // Shaping (task: coding ligatures): the shared font atlas
+                // handle and its glyph-cache-invalidation check, both
+                // fetched/run once per frame -- not once per row/run, see
+                // `GlyphAtlasCache::begin_frame`'s doc for why a fresh
+                // `Fonts::texture_atlas()` handle is the only available
+                // signal that the atlas was rebuilt underneath the cache.
+                let atlas = ctx.fonts(|f| f.texture_atlas());
+                self.glyph_cache.begin_frame(&atlas);
+                // Fix 1 (cold review, highest priority): every shaped
+                // glyph's UVs must be normalized against the atlas size
+                // as it stands after EVERY glyph this frame has been
+                // rasterized -- reading `atlas.lock().size()` here,
+                // before the row loop, and using that single value to
+                // normalize each run as it's shaped (the previous
+                // design) bakes stale UVs into any run shaped before a
+                // later run grows the atlas (`TextureAtlas::allocate`
+                // grows it in place, so `GlyphAtlasCache::begin_frame`'s
+                // `Arc`-identity rebuild check does not fire). So
+                // `build_shaped_mesh` below returns raw texel rects
+                // (see its doc), collected here, and normalization
+                // (`shaping::finish_shaped_mesh`) happens exactly once,
+                // after the row loop, against the size the atlas
+                // actually ends the frame at -- mirroring epaint's own
+                // text path, which keeps `UvRect` raw through layout and
+                // normalizes once at the very end.
+                //
+                // Deferring emission this way also means EVERY
+                // background (pass 1, all rows) is painted before ANY
+                // shaped text (pass 2, all rows) rather than
+                // interleaved row by row, which only strengthens "text
+                // must land on top of backgrounds" -- rows don't
+                // overlap vertically, and a ligature's backward-bleeding
+                // ink stays within its own run's Mesh, whose glyph
+                // triangles are still added and drawn in the same
+                // left-to-right order they always were.
+                let mut pending_text: Vec<(Vec<shaping::RawGlyphRect>, Color32)> = Vec::new();
 
                 for (row, line) in grid.lines.iter().enumerate() {
                     let y = origin.y + row as f32 * row_h;
@@ -741,62 +1276,22 @@ impl eframe::App for App {
                         }
                     }
 
-                    // Pass 2: text, batched into per-style ASCII runs. A run
-                    // breaks on style change, the cursor cell, or any
-                    // non-ASCII char (whose glyph advance may differ from
-                    // the cell width, so it is placed individually).
-                    let mut run = String::new();
-                    let mut run_start = 0usize;
-                    let mut run_style: Option<core::redisplay::Style> = None;
-                    let flush = |run: &mut String,
-                                 run_start: usize,
-                                 style: &Option<core::redisplay::Style>,
-                                 painter: &egui::Painter| {
-                        if run.trim().is_empty() {
-                            run.clear();
-                            return;
-                        }
-                        if let Some(st) = style {
-                            let eff = st.or_default(&base);
-                            let (mut cfg, cbg) = (
-                                eff.fg.map(to_color).unwrap_or(fg),
-                                eff.bg.map(to_color).unwrap_or(bg),
-                            );
-                            if eff.reverse {
-                                cfg = cbg;
-                            }
-                            let x = origin.x + run_start as f32 * char_w;
-                            let pos = Pos2::new(x, y);
-                            let f = pick_font(&eff);
-                            painter.text(pos, egui::Align2::LEFT_TOP, run.as_str(), f.clone(), cfg);
-                            if eff.bold && !self.have_bold {
-                                // Fake bold: re-draw with a fractional offset.
-                                painter.text(
-                                    Pos2::new(x + 0.4, y),
-                                    egui::Align2::LEFT_TOP,
-                                    run.as_str(),
-                                    f.clone(),
-                                    cfg,
-                                );
-                            }
-                        }
-                        run.clear();
-                    };
-                    for (col, cell) in line.iter().enumerate() {
-                        if cell.continuation {
-                            continue;
-                        }
-                        let is_cursor = grid.cursor == (row, col);
-                        let cursor_boxed = is_cursor && cursor_type == "box";
-                        let breaks_run = !cell.ch.is_ascii()
-                            || cursor_boxed
-                            || run_style.map(|s| s != cell.style).unwrap_or(false);
-                        if breaks_run {
-                            flush(&mut run, run_start, &run_style, painter);
-                            run_style = None;
-                        }
-                        if !cell.ch.is_ascii() || cursor_boxed {
-                            // Individually placed: exact cell position.
+                    // Pass 2: text (task: coding-ligature shaping). Drawn
+                    // from `grid.runs` (core's own same-style run
+                    // grouping -- `PaintRun`, chrome included) instead of
+                    // re-batching cells here: each run is tried through
+                    // the shaper first, and only falls back to the
+                    // pre-shaping per-cell path (`draw_cell_fallback`
+                    // below, byte-for-byte the old per-glyph logic) when
+                    // the run contains the box cursor, isn't
+                    // column-uniform (a wide CJK char's cell width
+                    // differs from its char count -- see `PaintRun`'s own
+                    // doc), or shaping's result fails
+                    // `shaping::validate_shaped_run`.
+                    let draw_cell_fallback =
+                        |col: usize, cell: &core::redisplay::Cell, painter: &egui::Painter| {
+                            let is_cursor = grid.cursor == (row, col);
+                            let cursor_boxed = is_cursor && cursor_type == "box";
                             let x = origin.x + col as f32 * char_w;
                             let eff = cell.style.or_default(&base);
                             let (mut cfg, mut cbg) = (
@@ -838,14 +1333,7 @@ impl eframe::App for App {
                                     cfg,
                                 );
                                 if eff.bold && !self.have_bold {
-                                    // Task 8: the same fake-bold
-                                    // double-draw the batched ASCII path
-                                    // uses -- this per-glyph path (every
-                                    // non-ASCII char, and the char under a
-                                    // box cursor) previously had no bold
-                                    // handling at all, so bold CJK text
-                                    // and a bold character under the
-                                    // cursor silently lost their emphasis
+                                    // Task 8: fake-bold double-draw for
                                     // when the real bold font wasn't
                                     // available.
                                     painter.text(
@@ -857,15 +1345,154 @@ impl eframe::App for App {
                                     );
                                 }
                             }
+                        };
+
+                    for r in grid.runs.iter().filter(|r| r.row == row) {
+                        if r.cols == 0 || r.text.trim().is_empty() {
                             continue;
                         }
-                        if run_style.is_none() {
-                            run_style = Some(cell.style);
-                            run_start = col;
+                        let cursor_in_run = grid.cursor.0 == row
+                            && cursor_type == "box"
+                            && grid.cursor.1 >= r.col
+                            && grid.cursor.1 < r.col + r.cols;
+                        // Column-uniform: every char in this run occupies
+                        // exactly one display column. A wide (CJK) char
+                        // contributes 2 to `r.cols` but 1 to
+                        // `text.chars().count()`, so this also rules out
+                        // any run shaping could not map cell-for-cell even
+                        // before asking the shaper.
+                        let column_uniform = r.text.chars().count() == r.cols;
+                        let eff = r.style.or_default(&base);
+                        let role = face_role(&eff, self.have_bold, self.have_italic);
+
+                        // Fix 6 (cold review): the box cursor used to
+                        // disable shaping for the WHOLE run -- and a
+                        // `PaintRun` is grouped by style and
+                        // byte-contiguity with no cursor awareness, so
+                        // that's usually the entire line. The
+                        // pre-shaping code broke its batch only at the
+                        // cursor's own cell and resumed immediately
+                        // after; restore that granularity by splitting a
+                        // column-uniform run into the segment(s) either
+                        // side of the cursor's cell (in absolute display
+                        // columns) and shaping each independently. A
+                        // non-column-uniform run (e.g. containing a wide
+                        // CJK char) still always falls back below,
+                        // exactly as before.
+                        let mut segments: Vec<(usize, usize, &str)> = Vec::new();
+                        if column_uniform {
+                            if cursor_in_run {
+                                let split_col = grid.cursor.1;
+                                let split_idx = split_col - r.col;
+                                let before_end = r
+                                    .text
+                                    .char_indices()
+                                    .nth(split_idx)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(r.text.len());
+                                let after_start = r
+                                    .text
+                                    .char_indices()
+                                    .nth(split_idx + 1)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(r.text.len());
+                                let before_text = &r.text[..before_end];
+                                let after_text = &r.text[after_start..];
+                                if !before_text.trim().is_empty() {
+                                    segments.push((r.col, split_col, before_text));
+                                }
+                                if !after_text.trim().is_empty() {
+                                    segments.push((split_col + 1, r.col + r.cols, after_text));
+                                }
+                            } else {
+                                segments.push((r.col, r.col + r.cols, r.text.as_str()));
+                            }
                         }
-                        run.push(cell.ch);
+
+                        let (mut cfg, cbg) = (
+                            eff.fg.map(to_color).unwrap_or(fg),
+                            eff.bg.map(to_color).unwrap_or(bg),
+                        );
+                        if eff.reverse {
+                            cfg = cbg;
+                        }
+
+                        // Marks, relative to `r.col`, which columns of
+                        // this run a successfully shaped segment already
+                        // covers -- any column left `false` (the
+                        // cursor's own cell, a segment whose shaping
+                        // failed `validate_shaped_run`, or every column
+                        // when the run wasn't column-uniform at all)
+                        // falls through to `draw_cell_fallback` below.
+                        let mut shaped_cols = vec![false; r.cols];
+                        if let Some(face) = self.fonts.for_role(role) {
+                            let scale = shaping::scale_in_pixels(&face.ab, font_size, ppp);
+                            let ascent = shaping::ascent_in_points(&face.ab, scale, ppp);
+                            let baseline_y = y + ascent;
+                            for (seg_start, seg_end, seg_text) in &segments {
+                                let Some(glyphs) =
+                                    self.shape_cache.get_or_shape(role, &face.loaded, seg_text)
+                                else {
+                                    continue;
+                                };
+                                let row_x = origin.x + *seg_start as f32 * char_w;
+                                let items = shaping::build_shaped_mesh(
+                                    &atlas,
+                                    &mut self.glyph_cache,
+                                    role,
+                                    &face.ab,
+                                    &glyphs,
+                                    row_x,
+                                    baseline_y,
+                                    char_w,
+                                    scale,
+                                    ppp,
+                                );
+                                pending_text.push((items, cfg));
+                                if eff.bold && !self.have_bold {
+                                    // Fake bold: re-draw with a
+                                    // fractional offset, same as the
+                                    // pre-shaping path.
+                                    let items2 = shaping::build_shaped_mesh(
+                                        &atlas,
+                                        &mut self.glyph_cache,
+                                        role,
+                                        &face.ab,
+                                        &glyphs,
+                                        row_x + 0.4,
+                                        baseline_y,
+                                        char_w,
+                                        scale,
+                                        ppp,
+                                    );
+                                    pending_text.push((items2, cfg));
+                                }
+                                for col in *seg_start..*seg_end {
+                                    shaped_cols[col - r.col] = true;
+                                }
+                            }
+                        }
+
+                        // Fallback: exactly the pre-shaping per-cell
+                        // path, scoped to the columns of this run no
+                        // shaped segment covered.
+                        for (col, cell) in line.iter().enumerate().skip(r.col).take(r.cols) {
+                            if cell.continuation || shaped_cols[col - r.col] {
+                                continue;
+                            }
+                            draw_cell_fallback(col, cell, painter);
+                        }
                     }
-                    flush(&mut run, run_start, &run_style, painter);
+                }
+
+                // Fix 1: normalize and paint every shaped run collected
+                // above, now that rasterization for the whole frame is
+                // done -- see the comment above `pending_text`'s
+                // declaration.
+                let atlas_size = atlas.lock().size();
+                for (items, color) in &pending_text {
+                    let mesh = shaping::finish_shaped_mesh(items, atlas_size, *color);
+                    painter.add(egui::Shape::mesh(mesh));
                 }
 
                 // Indent guides (task 3): a 1-device-px vertical line at
@@ -1087,6 +1714,22 @@ fn to_color(c: core::redisplay::Color) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
 }
 
+/// Mirrors `pick_font`'s bold-before-italic selection (`lib.rs`'s paint
+/// loop), as a plain function so it can be evaluated before `self.fonts`
+/// is borrowed for the shaping lookup itself -- `pick_font` is a closure
+/// over `self.have_bold`/`self.have_italic` and returns a `&FontId`,
+/// which isn't what the shaping path (indexing `FontSet` by `FaceRole`)
+/// needs.
+fn face_role(style: &core::redisplay::Style, have_bold: bool, have_italic: bool) -> FaceRole {
+    if style.bold && have_bold {
+        FaceRole::Bold
+    } else if style.italic && have_italic {
+        FaceRole::Italic
+    } else {
+        FaceRole::Regular
+    }
+}
+
 fn convert_key(key: egui::Key, m: egui::Modifiers) -> Option<Key> {
     let meta = m.alt || m.mac_cmd;
     let ctrl = m.ctrl;
@@ -1189,6 +1832,33 @@ mod tests {
             "cell 3's right edge must equal cell 4's left edge"
         );
         assert_eq!(a.max.y, b.max.y);
+    }
+
+    // --- Fix 7: variant_file_name last-occurrence replacement --------
+
+    #[test]
+    fn variant_file_name_replaces_the_final_occurrence() {
+        assert_eq!(
+            variant_file_name("JetBrainsMono-Regular.ttf", "Bold").as_deref(),
+            Some("JetBrainsMono-Bold.ttf")
+        );
+    }
+
+    #[test]
+    fn variant_file_name_ignores_an_earlier_regular_in_the_family_name() {
+        // Fix 7 (cold review): a family name that itself contains
+        // "Regular" before the variant marker used to have the wrong
+        // occurrence replaced by `replacen(.., 1)`. The marker is
+        // always the LAST "Regular" in the stem.
+        assert_eq!(
+            variant_file_name("RegularWidthMono-Regular.ttf", "Bold").as_deref(),
+            Some("RegularWidthMono-Bold.ttf")
+        );
+    }
+
+    #[test]
+    fn variant_file_name_none_without_regular_marker() {
+        assert_eq!(variant_file_name("Monaco.ttf", "Bold"), None);
     }
 
     // --- Task 3: indent guide columns --------------------------------
@@ -1544,5 +2214,444 @@ mod tests {
             animating_after_input,
             "fresh input (elapsed reset to 0) must resume animating"
         );
+    }
+
+    // --- Mouse support (M-mouse task 3): pixel_to_buffer_pos /
+    // window_at_pixel, the pure hit-testing functions. Built by hand
+    // rather than through a live editor -- exactly the "pure mapping
+    // functions" the task called for coverage by unit test rather than
+    // by screenshot (the screenshot script cannot send mouse events at
+    // all). ---------------------------------------------------------
+
+    fn test_win(
+        win_id: usize,
+        row: usize,
+        col: usize,
+        rows: usize,
+        cols: usize,
+        gutter_cols: usize,
+    ) -> core::redisplay::WindowLayout {
+        core::redisplay::WindowLayout {
+            win_id,
+            row,
+            col,
+            rows,
+            cols,
+            gutter_cols,
+            // Same convention `render_window` uses: the mode line is the
+            // window's own last row.
+            mode_line_row: row + rows - 1,
+        }
+    }
+
+    fn test_run(
+        row: usize,
+        col: usize,
+        text: &str,
+        byte_start: usize,
+    ) -> core::redisplay::PaintRun {
+        core::redisplay::PaintRun {
+            row,
+            col,
+            cols: text.chars().count(),
+            text: text.to_string(),
+            style: core::redisplay::Style::default(),
+            src: Some(byte_start..byte_start + text.len()),
+            atomic: false,
+        }
+    }
+
+    fn test_grid(
+        windows: Vec<core::redisplay::WindowLayout>,
+        runs: Vec<core::redisplay::PaintRun>,
+    ) -> core::redisplay::Grid {
+        core::redisplay::Grid {
+            cols: 0,
+            rows: 0,
+            lines: Vec::new(),
+            cursor: (0, 0),
+            windows,
+            runs,
+        }
+    }
+
+    /// One window: rows 0..6 are text, row 6 is the mode line;
+    /// gutter_cols=3 (columns 0..3), text columns 3..50, with "hello"
+    /// (bytes 0..5) painted on row 0 starting at column 3.
+    fn one_window_grid() -> core::redisplay::Grid {
+        test_grid(
+            vec![test_win(1, 0, 0, 7, 50, 3)],
+            vec![test_run(0, 3, "hello", 0)],
+        )
+    }
+
+    const CHAR_W: f32 = 10.0;
+    const ROW_H: f32 = 20.0;
+    const ORIGIN: Pos2 = Pos2::new(0.0, 0.0);
+
+    #[test]
+    fn pixel_to_buffer_pos_gutter_column_returns_none() {
+        // Column 1 is inside the 0..3 gutter -- must do nothing rather
+        // than mis-position point (the guard rail this whole function
+        // exists to provide; see `buffer_pos_at_gutter_column_falls_
+        // through_to_line_end_not_none` in `gui_features_tests.rs` for
+        // what `Grid::buffer_pos_at` alone would do without this guard).
+        let grid = one_window_grid();
+        let pixel = Pos2::new(1.5 * CHAR_W, 0.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_mode_line_row_returns_none() {
+        // Row 6 is this window's mode line (mode_line_row = 0 + 7 - 1).
+        let grid = one_window_grid();
+        let pixel = Pos2::new(10.0 * CHAR_W, 6.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_echo_area_row_returns_none() {
+        // Row 10 is well past the window entirely (its own rows only
+        // span 0..7) -- the shared echo row in a real frame.
+        let grid = one_window_grid();
+        let pixel = Pos2::new(10.0 * CHAR_W, 10.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_plain_text_click_resolves_inside_the_window() {
+        let grid = one_window_grid();
+        // Column 5 (inside "hello", 2 columns into the text area at
+        // column 3) on row 0.
+        let pixel = Pos2::new(5.5 * CHAR_W, 0.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            Some((1, 2))
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_resolves_the_right_window_in_a_split() {
+        // Two windows side by side: 1 spans columns 0..25 (no gutter),
+        // 2 spans columns 25..50 (no gutter), both rows 0..6 text + row
+        // 6 mode line.
+        let grid = test_grid(
+            vec![test_win(1, 0, 0, 7, 25, 0), test_win(2, 0, 25, 7, 25, 0)],
+            vec![test_run(0, 0, "AAAA", 100), test_run(0, 25, "BBBB", 200)],
+        );
+        let left = Pos2::new(2.5 * CHAR_W, 0.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, left),
+            Some((1, 102))
+        );
+        let right = Pos2::new(27.5 * CHAR_W, 0.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, right),
+            Some((2, 202))
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_outside_every_window_returns_none() {
+        let grid = test_grid(
+            vec![test_win(1, 0, 0, 7, 25, 0), test_win(2, 0, 25, 7, 25, 0)],
+            vec![test_run(0, 0, "AAAA", 100), test_run(0, 25, "BBBB", 200)],
+        );
+        // Column 60 is past both windows (0..25 and 25..50).
+        let pixel = Pos2::new(60.0 * CHAR_W, 0.5 * ROW_H);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_above_and_left_of_origin_does_not_panic() {
+        let grid = one_window_grid();
+        let origin = Pos2::new(50.0, 50.0);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, origin, CHAR_W, ROW_H, Pos2::new(10.0, 10.0)),
+            None,
+            "pixel above/left of origin (negative-ish cell coordinates)"
+        );
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, origin, CHAR_W, ROW_H, Pos2::new(-100.0, -100.0)),
+            None,
+            "far above/left must also not panic or wrap"
+        );
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_non_positive_char_metrics_do_not_panic() {
+        let grid = one_window_grid();
+        for (cw, rh) in [
+            (0.0_f32, ROW_H),
+            (-5.0, ROW_H),
+            (CHAR_W, 0.0),
+            (CHAR_W, -5.0),
+        ] {
+            assert_eq!(
+                pixel_to_buffer_pos(&grid, ORIGIN, cw, rh, Pos2::new(50.0, 50.0)),
+                None,
+                "char_w={cw} row_h={rh} must not panic and must report no hit"
+            );
+        }
+    }
+
+    #[test]
+    fn window_at_pixel_gutter_and_mode_line_and_echo_return_none() {
+        let grid = one_window_grid();
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(1.5 * CHAR_W, 0.5 * ROW_H)
+            ),
+            None,
+            "gutter column"
+        );
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(10.0 * CHAR_W, 6.5 * ROW_H)
+            ),
+            None,
+            "mode line row"
+        );
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(10.0 * CHAR_W, 10.5 * ROW_H)
+            ),
+            None,
+            "echo-area row, well past the window"
+        );
+    }
+
+    #[test]
+    fn window_at_pixel_resolves_the_right_window_in_a_split() {
+        let grid = test_grid(
+            vec![test_win(1, 0, 0, 7, 25, 0), test_win(2, 0, 25, 7, 25, 0)],
+            Vec::new(),
+        );
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(2.5 * CHAR_W, 0.5 * ROW_H)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(27.5 * CHAR_W, 0.5 * ROW_H)
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            window_at_pixel(
+                &grid,
+                ORIGIN,
+                CHAR_W,
+                ROW_H,
+                Pos2::new(60.0 * CHAR_W, 0.5 * ROW_H)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn window_at_pixel_non_positive_char_metrics_do_not_panic() {
+        let grid = one_window_grid();
+        for (cw, rh) in [
+            (0.0_f32, ROW_H),
+            (-5.0, ROW_H),
+            (CHAR_W, 0.0),
+            (CHAR_W, -5.0),
+        ] {
+            assert_eq!(
+                window_at_pixel(&grid, ORIGIN, cw, rh, Pos2::new(50.0, 50.0)),
+                None,
+                "char_w={cw} row_h={rh} must not panic and must report no hit"
+            );
+        }
+    }
+
+    // --- Mouse support: evil-visual-state entry on drag (`arm_mouse_
+    // selection`) -- uses a REAL `Interp`/`Editor` (same construction
+    // `core`'s own evil_tests.rs uses), not a hand-built `Grid`, since
+    // this exercises `evil-mode`/`evil--state`, which only exist once
+    // `evil.el` is actually loaded and running. -----------------------
+
+    fn evil_test_editor(text: &str) -> (Interp, Rc<RefCell<Editor>>) {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        ed.borrow_mut().frame = (50, 8);
+        interp
+            .eval_source(&format!("(insert {:?})", text))
+            .unwrap_or_else(|e| panic!("insert failed: {}", interp.describe_flow(&e)));
+        interp
+            .eval_source("(goto-char (point-min))")
+            .unwrap_or_else(|e| panic!("goto-char failed: {}", interp.describe_flow(&e)));
+        // Mirrors `core`'s `evil_tests.rs`'s `setup_evil`: `init_editor`
+        // loads evil.el but does not auto-enable it (that's
+        // `src/main.rs`'s `start_session`, gated on `evil-auto-enable`,
+        // which a headless test never runs) -- so this call is what
+        // actually turns evil-mode on and puts a fresh buffer into
+        // `'normal` state.
+        interp
+            .eval_source("(evil-mode 1)")
+            .unwrap_or_else(|e| panic!("evil-mode 1 failed: {}", interp.describe_flow(&e)));
+        (interp, ed)
+    }
+
+    // --- Fix 4: `drag_should_arm` -----------------------------------
+
+    #[test]
+    fn drag_should_arm_first_move_away_from_start() {
+        assert!(drag_should_arm(false, 5, 3));
+    }
+
+    #[test]
+    fn drag_should_arm_not_rearmed_once_already_dragged() {
+        assert!(!drag_should_arm(true, 5, 3));
+    }
+
+    #[test]
+    fn drag_should_arm_no_movement_yet_does_not_arm() {
+        assert!(!drag_should_arm(false, 3, 3));
+    }
+
+    /// The bug this fix is for: before it, the SAME condition this
+    /// function expresses also gated whether `place_point` ran at all
+    /// (see the `PointerMoved` handler's doc comment in `App::update`).
+    /// A drag that moves away and then returns to exactly its start
+    /// position must not re-arm (already dragged) -- but, unlike before
+    /// the fix, that no longer suppresses `place_point`, which the call
+    /// site now runs unconditionally on every same-window `moved` event.
+    /// This test only pins the arm half; there is no unit-level way to
+    /// pin the `place_point` half without a full `egui`/`eframe` event
+    /// harness, which is out of scope here -- it's covered by reading
+    /// the call site, where `place_point` sits outside the `if arm`
+    /// block entirely.
+    #[test]
+    fn drag_should_arm_returning_to_start_after_already_dragged_does_not_rearm() {
+        assert!(!drag_should_arm(true, 3, 3));
+    }
+
+    #[test]
+    fn arm_mouse_selection_enters_evil_visual_state_from_normal() {
+        let (mut interp, ed) = evil_test_editor("hello world");
+        assert_eq!(
+            sym_var(&interp, "evil--state"),
+            Some("normal"),
+            "evil-mode 1 must leave a fresh buffer in normal state"
+        );
+        let win_id = ed.borrow().selected_window;
+        arm_mouse_selection(&mut interp, &ed, win_id, 0);
+        assert_eq!(
+            sym_var(&interp, "evil--state"),
+            Some("visual"),
+            "a drag starting in normal state must enter evil's visual              state, the same as pressing 'v'"
+        );
+        let buf = ed.borrow().windows.get(&win_id).unwrap().buffer.clone();
+        let b = buf.borrow();
+        assert_eq!(
+            b.mark,
+            Some(0),
+            "mark must land at the drag's press position"
+        );
+        assert!(b.mark_active);
+    }
+
+    #[test]
+    fn arm_mouse_selection_does_not_change_evil_insert_state() {
+        let (mut interp, ed) = evil_test_editor("hello world");
+        interp
+            .eval_source("(evil-insert)")
+            .unwrap_or_else(|e| panic!("evil-insert failed: {}", interp.describe_flow(&e)));
+        assert_eq!(
+            sym_var(&interp, "evil--state"),
+            Some("insert"),
+            "setup must actually reach insert state before the drag"
+        );
+        let win_id = ed.borrow().selected_window;
+        arm_mouse_selection(&mut interp, &ed, win_id, 0);
+        assert_eq!(
+            sym_var(&interp, "evil--state"),
+            Some("insert"),
+            "a drag while already in insert state must not change evil state"
+        );
+        // The fallback plain mark-set still runs -- this is the same
+        // pre-existing behavior every non-'normal' state already had
+        // (a drag always armed `mark`/`mark_active` before this
+        // milestone's evil integration); only the STATE transition is
+        // gated on being in 'normal' state.
+        let buf = ed.borrow().windows.get(&win_id).unwrap().buffer.clone();
+        let b = buf.borrow();
+        assert_eq!(b.mark, Some(0));
+        assert!(b.mark_active);
+    }
+
+    /// Fix 5 (mouse-support milestone review): `arm_mouse_selection`'s
+    /// `'normal`-state branch used to be `let _ = interp.eval_source(
+    /// "(evil-visual-char)")`, discarding any error. Reproduced here by
+    /// redefining `evil-visual-char` (in elisp, from the test) to signal
+    /// instead of doing its real job -- before the fix this left `mark`/
+    /// `mark_active` at their initial (unset) values with no fallback and
+    /// no diagnostic; after the fix, the plain hand-set `arm_mark` path
+    /// still runs.
+    #[test]
+    fn arm_mouse_selection_falls_back_to_plain_mark_when_evil_visual_char_errors() {
+        let (mut interp, ed) = evil_test_editor("hello world");
+        interp
+            .eval_source("(defun evil-visual-char () (error \"boom\"))")
+            .unwrap_or_else(|e| panic!("redefine failed: {}", interp.describe_flow(&e)));
+        assert_eq!(
+            sym_var(&interp, "evil--state"),
+            Some("normal"),
+            "setup must still be in normal state so the 'normal' branch runs"
+        );
+        let win_id = ed.borrow().selected_window;
+        arm_mouse_selection(&mut interp, &ed, win_id, 0);
+        // The error must not have propagated out of `arm_mouse_selection`
+        // (no panic reaching this line is itself part of what's being
+        // checked), and the fallback plain mark must be set.
+        let buf = ed.borrow().windows.get(&win_id).unwrap().buffer.clone();
+        let b = buf.borrow();
+        assert_eq!(
+            b.mark,
+            Some(0),
+            "a failed evil-visual-char must still leave a usable mark"
+        );
+        assert!(b.mark_active);
+        // evil--state is left wherever the failed call left it -- since
+        // the redefined function errors before doing anything, that's
+        // still 'normal'; this pins that the fallback doesn't try to
+        // force a state transition of its own.
+        assert_eq!(sym_var(&interp, "evil--state"), Some("normal"));
     }
 }

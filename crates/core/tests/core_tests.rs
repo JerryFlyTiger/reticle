@@ -1312,3 +1312,27 @@ fn window_point_unaffected_by_edits_in_a_different_buffer() {
     assert_eq!(w.point, 14);
     assert_eq!(w.window_start, 8);
 }
+
+/// `string-width` through the real, registered builtin -- not
+/// `display_width::string_width_elisp` directly.
+///
+/// This is the only thing standing between a future "unify the width
+/// functions" refactor and a silent elisp-visible behaviour change:
+/// `string-width` deliberately does NOT expand tabs the way the buffer
+/// grid's `char_width` does (`(string-width "a\tb")` is 3, not 9), and
+/// nothing in `layout_golden_tests.rs` can see that divergence because
+/// the golden master never calls `string-width` -- it only exercises
+/// `core::redisplay::render()`. `org.el` (`org.el:234`, `:276-277`) is
+/// the real consumer, using `string-width` for table column alignment;
+/// if this builtin silently started expanding tabs, org-mode tables
+/// with a tab inside a cell would misalign with no test in this suite
+/// noticing (confirmed by mutation: rewiring the builtin to an inline
+/// `char_width` loop survived `org_tests` outright, because none of
+/// its tests put a tab inside a table cell).
+#[test]
+fn string_width_builtin_does_not_expand_tabs() {
+    let (mut i, _ed) = setup();
+    assert_eq!(run(&mut i, "(string-width \"a\\tb\")"), "3");
+    assert_eq!(run(&mut i, "(string-width \"中文\")"), "4");
+    assert_eq!(run(&mut i, "(string-width \"abc\")"), "3");
+}
