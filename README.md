@@ -468,6 +468,17 @@ Requested, recorded, not yet scoped:
 - **Code formatting with a selectable style.**
 - **Multiple cursors**, in the shape of Magnar Sveen's `multiple-cursors.el`.
 - **`expand-region`**, in the shape of Magnar Sveen's package of that name.
+- **A new app icon** -- a handwritten capital **R**, in GNU Emacs's colours.
+- **Visual design of the GUI**, promoted to second only to Verilog and
+  SystemVerilog in priority.
+- **User-selectable font and theme**; a transparent window with a background
+  image that can be faded and scaled, as iTerm2, VS Code and the JetBrains
+  IDEs offer.
+- **Dracula Official as the default theme**, with Xcode and VS Code themes
+  offered alongside it.
+- **JetBrains Mono as the default font**, with Fira Code and SF Mono offered
+  alongside it.
+- **GNU Emacs's window-splitting behaviour.**
 
 ---
 
