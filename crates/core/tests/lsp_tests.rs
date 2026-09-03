@@ -733,3 +733,277 @@ fn hover_and_definition_against_real_rust_analyzer() {
 
     run(&mut i, "(lsp-shutdown client)");
 }
+
+// --- M99: `lsp-start`'s third (CWD) argument -----------------------------
+
+/// Writes a script that prints its own working directory into
+/// OUTPUT_FILE (an absolute path baked into the script body at write
+/// time, not passed as an argv entry), then behaves like `DEAF_SCRIPT`
+/// (reads stdin to EOF, never exits on its own) so the connection stays
+/// alive long enough for the test to poll for the file and then
+/// `lsp-kill' it explicitly.
+fn write_pwd_script(dir: &std::path::Path, name: &str, output_file: &std::path::Path) -> String {
+    let body = format!(
+        "#!/bin/sh\npwd > '{}'\ncat >/dev/null\n",
+        output_file.to_str().unwrap()
+    );
+    write_script(dir, name, &body)
+}
+
+/// Polls PATH for up to ~2s (matching `wait_until_pid_dead`'s own
+/// budget) and returns its trimmed contents, or an empty string if it
+/// never appeared -- the caller asserts non-empty itself so a timeout
+/// produces a readable failure message instead of a panic here.
+fn wait_for_file_contents(path: &std::path::Path) -> String {
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            return s.trim().to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    String::new()
+}
+
+#[test]
+fn lsp_start_with_cwd_arg_sets_the_server_processs_working_directory() {
+    let dir = Scratch::new("lsp_cwd_basic");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let target_cwd = Scratch::new("lsp_cwd_basic_target");
+    std::fs::create_dir_all(&*target_cwd).unwrap();
+    let out_file = dir.join("pwd.txt");
+    let script = write_pwd_script(&dir, "pwd.sh", &out_file);
+
+    let mut i = setup();
+    let r = run(
+        &mut i,
+        &format!(
+            "(setq conn (lsp-start {:?} nil {:?}))",
+            script,
+            target_cwd.to_str().unwrap()
+        ),
+    );
+    assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
+    let content = wait_for_file_contents(&out_file);
+    run(&mut i, "(lsp-kill conn)");
+    assert!(!content.is_empty(), "server never wrote its pwd");
+    // macOS: /tmp is a symlink to /private/tmp -- canonicalize both sides
+    // before comparing, or this is a guaranteed false negative there.
+    let got = std::fs::canonicalize(&content)
+        .unwrap_or_else(|e| panic!("canonicalize({:?}) failed: {}", content, e));
+    let want = std::fs::canonicalize(&*target_cwd).unwrap();
+    assert_eq!(got, want, "server cwd did not match the CWD argument");
+}
+
+#[test]
+fn lsp_start_without_cwd_arg_inherits_the_editor_process_cwd() {
+    let dir = Scratch::new("lsp_cwd_default");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let out_file = dir.join("pwd.txt");
+    let script = write_pwd_script(&dir, "pwd.sh", &out_file);
+
+    let mut i = setup();
+    // Two-arg call, exactly as every pre-M99 caller in this file makes
+    // it -- CWD must default to "inherit", not "some arbitrary
+    // directory", for every one of those callers to keep behaving as
+    // before.
+    let r = run(&mut i, &format!("(setq conn (lsp-start {:?}))", script));
+    assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
+    let content = wait_for_file_contents(&out_file);
+    run(&mut i, "(lsp-kill conn)");
+    assert!(!content.is_empty(), "server never wrote its pwd");
+    let got = std::fs::canonicalize(&content)
+        .unwrap_or_else(|e| panic!("canonicalize({:?}) failed: {}", content, e));
+    let want = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    assert_eq!(
+        got, want,
+        "server cwd should default to the editor process's own cwd"
+    );
+}
+
+#[test]
+fn lsp_start_relative_cmd_containing_a_slash_still_resolves_against_the_editor_cwd_not_the_new_server_cwd(
+) {
+    // `Command::new` resolves a bare (no '/') name via PATH search,
+    // unaffected by `current_dir` -- only a relative path CONTAINING a
+    // separator is at risk of being resolved against the wrong
+    // directory once `current_dir` is set (POSIX chdir-then-exec
+    // ordering). This test's script path deliberately contains one
+    // ("./DIRNAME/pwd.sh").
+    let real_cwd = std::env::current_dir().unwrap();
+    let rel_dir_name = format!(
+        "reticle_lsp_relcmd_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
+    let script_dir = real_cwd.join(&rel_dir_name);
+    std::fs::create_dir_all(&script_dir).unwrap();
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let _cleanup = Cleanup(script_dir.clone());
+
+    let target_cwd = Scratch::new("lsp_cwd_relcmd_target");
+    std::fs::create_dir_all(&*target_cwd).unwrap();
+    let out_file = script_dir.join("pwd.txt");
+    write_pwd_script(&script_dir, "pwd.sh", &out_file);
+    let rel_cmd = format!("./{}/pwd.sh", rel_dir_name);
+
+    let mut i = setup();
+    let r = run(
+        &mut i,
+        &format!(
+            "(setq conn (lsp-start {:?} nil {:?}))",
+            rel_cmd,
+            target_cwd.to_str().unwrap()
+        ),
+    );
+    assert!(
+        !r.starts_with("ERROR"),
+        "lsp-start failed (the relative cmd must still resolve against the \
+         editor's own cwd, {:?}, not the new server cwd, {:?}): {}",
+        real_cwd,
+        target_cwd.to_str().unwrap(),
+        r
+    );
+    let content = wait_for_file_contents(&out_file);
+    run(&mut i, "(lsp-kill conn)");
+    assert!(!content.is_empty(), "server never wrote its pwd");
+    let got = std::fs::canonicalize(&content)
+        .unwrap_or_else(|e| panic!("canonicalize({:?}) failed: {}", content, e));
+    let want = std::fs::canonicalize(&*target_cwd).unwrap();
+    assert_eq!(
+        got, want,
+        "the spawned server's own cwd should still be the CWD argument, \
+         even though its own executable path was relative"
+    );
+}
+
+/// A pwd-recording server that also completes `lsp-connect''s
+/// `initialize' handshake, so this can be driven through the elisp-level
+/// `lsp-connect' (not just the Rust-level `lsp-start') -- writes its own
+/// cwd to OUTPUT_FILE, then answers `initialize' (id 1) with an empty
+/// result exactly like `ECHO_ONE_SCRIPT' (ignoring the request's actual
+/// bytes, same as that script already does), then reads stdin to EOF
+/// forever so the connection survives long enough for the test to poll
+/// the file and `lsp-kill' explicitly.
+fn write_pwd_and_handshake_script(
+    dir: &std::path::Path,
+    name: &str,
+    output_file: &std::path::Path,
+) -> String {
+    let body = format!(
+        "#!/bin/sh\n\
+         pwd > '{}'\n\
+         msg='{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n\
+         len=$(printf '%s' \"$msg\" | wc -c)\n\
+         printf 'Content-Length: %d\\r\\n\\r\\n%s' \"$len\" \"$msg\"\n\
+         cat >/dev/null\n",
+        output_file.to_str().unwrap()
+    );
+    write_script(dir, name, &body)
+}
+
+#[test]
+fn lsp_connect_passes_its_root_path_argument_through_as_the_servers_cwd() {
+    // F6 (M99 review): the whole reason M99's `lsp-start' grew a CWD
+    // argument is so `lsp-connect'/`lsp--autostart-begin' could pass
+    // their project ROOT down to it -- but the three lsp-start-level
+    // tests above only ever exercise `lsp-start' itself. This drives
+    // the actual `lsp-connect' entry point end to end (real handshake,
+    // real subprocess) and checks the spawned server's OWN cwd, not
+    // just that `lsp-connect' succeeded.
+    let dir = Scratch::new("lsp_connect_cwd_script");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let target_cwd = Scratch::new("lsp_connect_cwd_root");
+    std::fs::create_dir_all(&*target_cwd).unwrap();
+    let out_file = dir.join("pwd.txt");
+    let script = write_pwd_and_handshake_script(&dir, "pwd_handshake.sh", &out_file);
+
+    let mut i = setup();
+    let r = run(
+        &mut i,
+        &format!(
+            "(setq client (lsp-connect {:?} nil {:?}))",
+            script,
+            target_cwd.to_str().unwrap()
+        ),
+    );
+    assert!(!r.starts_with("ERROR"), "lsp-connect failed: {}", r);
+
+    let content = wait_for_file_contents(&out_file);
+    run(&mut i, "(lsp-kill (lsp--client-conn client))");
+    assert!(!content.is_empty(), "server never wrote its pwd");
+    // macOS: /tmp is a symlink to /private/tmp -- canonicalize both
+    // sides before comparing, or this is a guaranteed false negative.
+    let got = std::fs::canonicalize(&content)
+        .unwrap_or_else(|e| panic!("canonicalize({:?}) failed: {}", content, e));
+    let want = std::fs::canonicalize(&*target_cwd).unwrap();
+    assert_eq!(
+        got, want,
+        "lsp-connect's ROOT-PATH argument must reach lsp-start as the \
+         spawned server's own cwd"
+    );
+}
+
+#[test]
+fn lsp_autostart_begin_passes_its_root_argument_through_as_the_servers_cwd() {
+    // F6 (M99 review), "best effort" half: `lsp--autostart-begin' is
+    // the OTHER call site that passes ROOT down to `lsp-start' as CWD
+    // (`lsp-connect', above, is the first). Called directly here --
+    // this function is a plain 4-arg function with no dependency on the
+    // heavier `lsp-server-alist'/`find-file' autostart wiring that
+    // lives in `lsp_autostart_tests.rs' -- so this does not need that
+    // file's fixtures. The `initialize' reply is handled asynchronously
+    // by the idle pump and is NOT awaited here; the cwd effect under
+    // test happens synchronously inside `lsp-start' the moment the
+    // process is spawned, before any reply could even arrive, so
+    // there's nothing to drive or wait on beyond the spawned script
+    // writing its own pwd.
+    let dir = Scratch::new("lsp_autostart_cwd_script");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let target_root = Scratch::new("lsp_autostart_cwd_root");
+    std::fs::create_dir_all(&*target_root).unwrap();
+    let out_file = dir.join("pwd.txt");
+    let script = write_pwd_and_handshake_script(&dir, "pwd_handshake.sh", &out_file);
+
+    let mut i = setup();
+    let r = run(
+        &mut i,
+        &format!(
+            "(lsp--autostart-begin {:?} nil {:?} 'fundamental-mode)",
+            script,
+            target_root.to_str().unwrap()
+        ),
+    );
+    assert!(
+        !r.starts_with("ERROR"),
+        "lsp--autostart-begin failed: {}",
+        r
+    );
+
+    let content = wait_for_file_contents(&out_file);
+    // Clean up via the client this call pushed onto `lsp--clients' --
+    // `lsp--autostart-begin' itself returns nil (it fires-and-forgets),
+    // so the connection is reached through the global client list
+    // rather than a returned handle.
+    run(
+        &mut i,
+        "(dolist (c lsp--clients) (lsp-kill (lsp--client-conn c)))",
+    );
+    assert!(!content.is_empty(), "server never wrote its pwd");
+    let got = std::fs::canonicalize(&content)
+        .unwrap_or_else(|e| panic!("canonicalize({:?}) failed: {}", content, e));
+    let want = std::fs::canonicalize(&*target_root).unwrap();
+    assert_eq!(
+        got, want,
+        "lsp--autostart-begin's ROOT argument must reach lsp-start as \
+         the spawned server's own cwd"
+    );
+}

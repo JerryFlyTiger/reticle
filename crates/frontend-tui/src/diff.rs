@@ -153,6 +153,13 @@ mod tests {
             cursor: (0, 0),
             windows: Vec::new(),
             runs: Vec::new(),
+            // M87 stage 3: `Grid` gained these two fields; this test
+            // helper is purely mechanical struct-literal upkeep (every
+            // field of `Grid` is `pub`, so this cross-crate literal must
+            // list all of them to compile) -- not a TUI behavior change.
+            // Values match `Grid::new`'s own defaults.
+            row_scale: vec![100; rows],
+            row_kind: vec![core::redisplay::RowKind::Text; rows],
         }
     }
 

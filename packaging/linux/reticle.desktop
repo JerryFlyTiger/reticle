@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Reticle
+Comment=An Emacs-like editor for Verilog and SystemVerilog RTL development
+# %f, not %F: parse_session in src/main.rs keeps only the first bare
+# argument and silently drops the rest, so a launcher that hands reticle
+# more than one file (which %F invites) would lose every file after the
+# first with no error shown to the user.
+Exec=reticle %f
+Icon=reticle
+Terminal=false
+Categories=Development;TextEditor;
+# text/x-verilog and text/x-systemverilog are not in a stock
+# shared-mime-info database; no registration XML is shipped alongside this
+# entry, so on a system that has never seen these MIME types before, file
+# managers may not associate Reticle with .v/.sv files by content type.
+MimeType=text/plain;text/x-verilog;text/x-systemverilog;

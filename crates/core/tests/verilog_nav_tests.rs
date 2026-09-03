@@ -203,6 +203,46 @@ fn jumps_within_the_same_buffer_when_module_is_declared_there() {
 }
 
 // ============================================================
+// 2a. M97: `M-.' onto an INTERFACE declaration, no LSP client attached --
+//     before this milestone, `verilog-auto--top-level-modules' only ever
+//     matched `module_declaration', so an instantiated interface's type
+//     name resolved to nothing here and this function returned nil
+//     (falling through to LSP, which per this file's own header is a
+//     silent no-op with no client attached at all).
+// ============================================================
+
+#[test]
+fn jumps_to_an_interface_declared_in_the_same_buffer() {
+    let mut i = setup();
+    let dir = scratch_dir("interface_same_buffer");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("top.sv");
+    std::fs::write(
+        &path,
+        "module top;\n  axi_if u_if ();\nendmodule\n\ninterface axi_if (input clk);\nendinterface\n",
+    )
+    .unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", path.to_str().unwrap()),
+    );
+    goto_mid(&mut i, "axi_if");
+    let r = run(&mut i, "(verilog-goto-module-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    assert_eq!(
+        run(&mut i, "(buffer-file-name)"),
+        format!("{:?}", path.to_str().unwrap())
+    );
+    let point = run(&mut i, "(point)");
+    let name_start: usize = point.parse().unwrap();
+    let name = ok(
+        &mut i,
+        &format!("(buffer-substring {} {})", name_start, name_start + 6),
+    );
+    assert_eq!(name, "\"axi_if\"");
+}
+
+// ============================================================
 // 3. M-, returns to the origin buffer and point
 // ============================================================
 

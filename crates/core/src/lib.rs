@@ -315,6 +315,14 @@ pub fn idle_tick(interp: &mut Interp, quiet_for: std::time::Duration) {
     // compile's/shell-command's (see search.el's header comment for why
     // the three don't share a list or a pump function).
     let _ = interp.eval_source("(search-process-pending-all)");
+    // M88: autostart's own idle-tick step -- reaps a pending autostart
+    // handshake that died or timed out, then considers starting one for
+    // the current buffer. A no-op until `frontend_started` below has run
+    // at least once (see `lsp--frontend-started`'s docstring in
+    // lsp.el), so a test harness that only ever calls `eval_source`/
+    // `find-file-internal` directly, never going through this function
+    // via a real frontend loop, can never trigger a spawn.
+    let _ = interp.eval_source("(lsp--autostart-tick)");
     let ed = editor::editor(interp);
     highlight::tick(interp, &ed);
     drain_background_output(interp, &ed);
@@ -332,6 +340,25 @@ pub fn idle_tick(interp: &mut Interp, quiet_for: std::time::Duration) {
     // consequence of setting the threshold above this ceiling.
     let quiet_ms = quiet_for.as_millis().min(u32::MAX as u128) as u64;
     let _ = interp.eval_source(&format!("(lsp--idle-highlight-tick {quiet_ms})"));
+}
+
+/// M88: tell the elisp autostart machinery that a real frontend event
+/// loop is now pumping the idle tick, by setting `lsp--frontend-started'
+/// non-nil. `lsp--autostart-tick' (called every `idle_tick', above)
+/// refuses to spawn anything until this has run at least once -- see
+/// that variable's own docstring for why: it's what keeps a test
+/// harness that only ever calls `eval_source'/`find-file-internal'
+/// directly, with no real `run_tui'/`run_gui' loop behind it, from ever
+/// triggering an autostart spawn.
+///
+/// The TUI calls this once, after its very first `draw`. The GUI calls
+/// it at the END of `App::update`, deliberately AFTER `core::idle_tick'
+/// has already run for that frame (`idle_tick' is called partway
+/// through `update`, before the frame is actually painted) -- so the
+/// earliest an autostart can fire is the NEXT frame, once something has
+/// actually been shown on screen.
+pub fn frontend_started(interp: &mut Interp) {
+    let _ = interp.eval_source("(setq lsp--frontend-started t)");
 }
 
 /// Cap on `*background-output*`'s own line count, independent of

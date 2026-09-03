@@ -1127,3 +1127,364 @@ fn idle_highlight_last_point_is_buffer_local() {
         "lsp--idle-highlight-last-point must be buffer-local"
     );
 }
+
+// ============================================================
+// M99: `lsp-merge-diagnostics-from-all-clients` -- merged decoration
+// and navigation across two attached clients.
+// ============================================================
+
+/// Same helper as `lsp_mode_tests.rs`'s `install_test_publish_helper`,
+/// copied rather than shared (this project's tests bring their own
+/// helpers; see CLAUDE.md's testing conventions). Dispatches a
+/// `textDocument/publishDiagnostics` notification for CLIENT with a
+/// single diagnostic at 0-based LINE, so `lsp--merge-diagnostics' stores
+/// it exactly as it would from a real server.
+fn install_test_publish_helper(interp: &mut Interp) {
+    ok(
+        interp,
+        r#"(defun test--publish (client uri msg line)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         (format "[{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":1}},\"message\":\"%s\"}]"
+                                 line line msg))
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+}
+
+/// Count of `'lsp-diag'-tagged overlays in the current buffer -- the
+/// diagnostics analogue of this file's own `highlight_overlay_spans'/
+/// `highlight_count', for `'lsp-highlight'.
+fn diag_overlay_count(interp: &mut Interp) -> String {
+    run(
+        interp,
+        "(length (let (out)
+                    (dolist (ov (overlays-in (point-min) (point-max)))
+                      (when (overlay-get ov 'lsp-diag)
+                        (push ov out)))
+                    out))",
+    )
+}
+
+fn write_three_line_scratch(tag: &str) -> (Scratch, std::path::PathBuf) {
+    let dir = scratch_dir(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, "line0\nline1\nline2\n").unwrap();
+    (dir, file)
+}
+
+#[test]
+fn merge_diagnostics_default_paints_the_union_of_two_attached_clients() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_union");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+
+    ok(&mut i, "(setq primary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq secondary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list primary secondary))",
+    );
+
+    ok(
+        &mut i,
+        "(test--publish primary (lsp--path-to-uri (buffer-file-name)) \"from primary\" 0)",
+    );
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "1",
+        "the primary's own publish must decorate the buffer"
+    );
+
+    ok(
+        &mut i,
+        "(test--publish secondary (lsp--path-to-uri (buffer-file-name)) \"from secondary\" 1)",
+    );
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "2",
+        "lsp-merge-diagnostics-from-all-clients defaults to t: the \
+         secondary's publish must ADD to the buffer's decoration, not \
+         replace or be rejected by it"
+    );
+}
+
+#[test]
+fn merge_diagnostics_set_to_nil_restores_authoritative_only_painting() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_nil");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+    ok(&mut i, "(setq lsp-merge-diagnostics-from-all-clients nil)");
+
+    ok(&mut i, "(setq primary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq secondary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list primary secondary))",
+    );
+
+    ok(
+        &mut i,
+        "(test--publish primary (lsp--path-to-uri (buffer-file-name)) \"from primary\" 0)",
+    );
+    assert_eq!(diag_overlay_count(&mut i), "1");
+
+    ok(
+        &mut i,
+        "(test--publish secondary (lsp--path-to-uri (buffer-file-name)) \"from secondary\" 1)",
+    );
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "1",
+        "with the merge variable nil, a non-primary publish must not \
+         repaint the buffer's decoration at all -- the exact pre-M99 \
+         (M94) behavior"
+    );
+}
+
+#[test]
+fn single_client_painting_is_identical_regardless_of_the_merge_setting() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_single_client");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+
+    ok(
+        &mut i,
+        "(test--publish only (lsp--path-to-uri (buffer-file-name)) \"solo\" 0)",
+    );
+    assert_eq!(diag_overlay_count(&mut i), "1");
+
+    ok(&mut i, "(setq lsp-merge-diagnostics-from-all-clients nil)");
+    ok(
+        &mut i,
+        "(test--publish only (lsp--path-to-uri (buffer-file-name)) \"solo again\" 1)",
+    );
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "1",
+        "a single attached client's own decoration must not depend on \
+         lsp-merge-diagnostics-from-all-clients either way"
+    );
+}
+
+#[test]
+fn next_diagnostic_reaches_a_secondary_clients_diagnostic_when_merged() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_navigation");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+
+    ok(&mut i, "(setq primary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq secondary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list primary secondary))",
+    );
+    // Only the SECONDARY ever publishes -- if `next-diagnostic' only
+    // ever looked at the primary's own stored diagnostics (pre-M99), it
+    // would report "No diagnostics" even though a squiggle is on
+    // screen.
+    ok(
+        &mut i,
+        "(test--publish secondary (lsp--path-to-uri (buffer-file-name)) \"secondary only\" 1)",
+    );
+
+    ok(&mut i, "(goto-char (point-min))");
+    assert_eq!(run(&mut i, "(next-diagnostic)"), "\"secondary only\"");
+    assert_eq!(run(&mut i, "(line-number-at-pos)"), "2");
+}
+
+#[test]
+fn same_client_two_diagnostics_sharing_start_severity_and_message_are_both_painted() {
+    // F1/F2 regression guard: the dedup key used to be a (start line,
+    // start character, severity, message) 4-tuple, which does NOT
+    // include `range.end' -- two genuinely distinct diagnostics that
+    // happen to start at the same place, with the same severity and
+    // the same message text, but different END positions, must both
+    // still be painted. Content-level dedup can't tell that case apart
+    // from the same diagnostic being walked twice, so dedup must
+    // operate on the CLIENT list, not on diagnostic content.
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_same_key_diff_end");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+    ok(
+        &mut i,
+        r#"(defun test--publish-two (client uri msg line end1 end2)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         (format "[{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":%d}},\"severity\":1,\"message\":\"%s\"},{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":%d}},\"severity\":1,\"message\":\"%s\"}]"
+                                 line line end1 msg line line end2 msg))
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+
+    // Two diagnostics, identical start/severity/message, differing only
+    // in `range.end.character' (1 vs 2), published in a single
+    // publishDiagnostics notification -- exactly what a real server
+    // could legitimately send for two distinct overlapping-start issues.
+    ok(
+        &mut i,
+        "(test--publish-two only (lsp--path-to-uri (buffer-file-name)) \"same\" 0 1 2)",
+    );
+
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "2",
+        "two diagnostics with the same start/severity/message but \
+         different range.end must both be painted, not deduped away"
+    );
+}
+
+#[test]
+fn merge_diagnostics_does_not_double_paint_a_client_listed_twice() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("merge_dedup");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+    // The SAME client object appears twice in `lsp--buffer-clients' --
+    // this must not be painted twice.
+    ok(&mut i, "(setq-local lsp--buffer-clients (list only only))");
+
+    ok(
+        &mut i,
+        "(test--publish only (lsp--path-to-uri (buffer-file-name)) \"dup\" 0)",
+    );
+    assert_eq!(
+        diag_overlay_count(&mut i),
+        "1",
+        "the same client appearing twice in lsp--buffer-clients must not \
+         produce a duplicate overlay for the same diagnostic"
+    );
+}
+
+// ============================================================
+// M99 review round 2: `lsp--diagnostics-for-uri`'s RETURN ORDER.
+// Every test above only ever asserts overlay COUNT; none of them
+// observes order, and `next-diagnostic' re-sorts by buffer position
+// before a caller ever sees it -- so a reversed return list was never
+// caught. Order matters for real users: M87 stage 3's inline-row cap
+// keeps whichever diagnostics come FIRST on a line, so which ones
+// survive truncation depends on this function's return order.
+// ============================================================
+
+/// Publishes one `textDocument/publishDiagnostics' notification for
+/// CLIENT carrying one diagnostic per (LINE . MESSAGE) pair in MSGS, in
+/// MSGS's own order -- so a test can pin down the ORDER
+/// `lsp--diagnostics-for-uri' returns, not just how many it returns.
+fn install_test_publish_n_helper(interp: &mut Interp) {
+    ok(
+        interp,
+        r#"(defun test--publish-n (client uri msgs)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         (concat "["
+                                 (mapconcat
+                                  (lambda (pair)
+                                    (format "{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":1}},\"severity\":1,\"message\":\"%s\"}"
+                                            (car pair) (car pair) (cdr pair)))
+                                  msgs ",")
+                                 "]"))
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+}
+
+/// The `"message"' field of every diagnostic `lsp--diagnostics-for-uri'
+/// returns for CLIENT/URI, joined with `,' in the order returned --
+/// order-observing counterpart to `diag_overlay_count' (which only
+/// counts).
+fn diagnostics_for_uri_message_order(interp: &mut Interp, client_expr: &str) -> String {
+    run(
+        interp,
+        &format!(
+            "(mapconcat (lambda (d) (gethash \"message\" d)) \
+             (lsp--diagnostics-for-uri {} (lsp--path-to-uri (buffer-file-name))) \
+             \",\")",
+            client_expr
+        ),
+    )
+}
+
+#[test]
+fn diagnostics_for_uri_nil_branch_preserves_publish_order() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("order_nil_branch");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_n_helper(&mut i);
+    ok(&mut i, "(setq lsp-merge-diagnostics-from-all-clients nil)");
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+
+    ok(
+        &mut i,
+        "(test--publish-n only (lsp--path-to-uri (buffer-file-name)) \
+         (list (cons 0 \"first\") (cons 1 \"second\") (cons 2 \"third\")))",
+    );
+
+    assert_eq!(
+        diagnostics_for_uri_message_order(&mut i, "only"),
+        "\"first,second,third\"",
+        "lsp-merge-diagnostics-from-all-clients nil: return order must \
+         match publish order"
+    );
+}
+
+#[test]
+fn diagnostics_for_uri_merge_branch_orders_by_client_then_publish_order() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("order_merge_branch");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_n_helper(&mut i);
+
+    ok(&mut i, "(setq primary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq secondary (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list primary secondary))",
+    );
+
+    ok(
+        &mut i,
+        "(test--publish-n primary (lsp--path-to-uri (buffer-file-name)) \
+         (list (cons 0 \"p1\") (cons 1 \"p2\")))",
+    );
+    ok(
+        &mut i,
+        "(test--publish-n secondary (lsp--path-to-uri (buffer-file-name)) \
+         (list (cons 2 \"s1\")))",
+    );
+
+    assert_eq!(
+        diagnostics_for_uri_message_order(&mut i, "primary"),
+        "\"p1,p2,s1\"",
+        "merged order must be: primary's own diagnostics in their \
+         publish order, then secondary's in its publish order"
+    );
+}

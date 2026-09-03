@@ -113,22 +113,45 @@ pub fn register(interp: &mut Interp) {
             .map(|b| crate::editor::Editor::buffer_value(&b))
             .unwrap_or(Value::Nil))
     });
-    // (lsp--set-buffer-diagnostics BUFFER ((LINE . SEVERITY) ...)) —
-    // M16: feeds the gutter dots and modeline count (the renderer reads
-    // Editor.diagnostics); the squiggle overlays are separate, made by
-    // lsp.el directly.
+    // (lsp--set-buffer-diagnostics BUFFER ((LINE . (SEVERITY . MESSAGE)) ...))
+    // — M16, extended by M87 stage 3 to carry the message text: feeds the
+    // gutter dots, modeline count, AND (as of stage 3) the inline
+    // diagnostic block rows the renderer draws under the offending line;
+    // the squiggle overlays are separate, made by lsp.el directly.
+    //
+    // Accepts the pre-stage-3 `(LINE . SEVERITY)` shape too (`cdr` is a
+    // bare int, not a cons) -- several tests call this builtin directly
+    // as a gutter-data injection shortcut, bypassing `lsp--decorate-
+    // buffer` (the one real caller, which always sends the new shape).
+    // Those old calls keep working, just with no message (no block rows
+    // for them, which is exactly what they're testing anyway).
     defun(interp, "lsp--set-buffer-diagnostics", 2, Some(2), |i, a| {
         let b = buffer_arg(i, &a[0])?;
         let items = a[1].list_to_vec().unwrap_or_default();
         let mut lines = Vec::new();
         for item in items {
             if let Value::Cons(c) = &item {
-                let (line, sev) = {
+                let (line, rest) = {
                     let cell = c.borrow();
                     (cell.car.clone(), cell.cdr.clone())
                 };
+                let (sev, message) = match &rest {
+                    Value::Cons(c2) => {
+                        let (sev, msg) = {
+                            let cell2 = c2.borrow();
+                            (cell2.car.clone(), cell2.cdr.clone())
+                        };
+                        let message = match msg {
+                            Value::Str(s) => (*s).clone(),
+                            _ => String::new(),
+                        };
+                        (sev, message)
+                    }
+                    // Pre-stage-3 shape: `cdr` IS the severity.
+                    _ => (rest.clone(), String::new()),
+                };
                 if let (Value::Int(l), Value::Int(s)) = (line, sev) {
-                    lines.push((l.max(0) as usize, s.clamp(1, 4) as u8));
+                    lines.push((l.max(0) as usize, s.clamp(1, 4) as u8, message));
                 }
             }
         }
@@ -229,6 +252,16 @@ pub fn register(interp: &mut Interp) {
             }
         }
         ed.borrow_mut().buffers.retain(|b| !Rc::ptr_eq(b, &target));
+        // M87 stage 3 (D12): `diagnostics` is keyed by `Rc::as_ptr` and was
+        // never invalidated anywhere -- after TARGET is freed, an unrelated
+        // later `Rc` allocation can land on the same address and inherit
+        // its dead diagnostics (wrong gutter dot today, a wrong inline
+        // message once stage 3 lands). This is the buffer's one true death
+        // point (the hook may have already removed it above, in which case
+        // this is a harmless no-op).
+        ed.borrow_mut()
+            .diagnostics
+            .remove(&(Rc::as_ptr(&target) as usize));
         Ok(Value::Sym(i.syms.t))
     });
     defun(interp, "buffer-substring", 2, Some(2), |i, a| {

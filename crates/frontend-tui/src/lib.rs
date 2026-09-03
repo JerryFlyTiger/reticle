@@ -65,9 +65,18 @@ pub fn run_tui(interp: &mut Interp, ed: &Rc<RefCell<Editor>>) -> std::io::Result
     // unless something changed" discipline `prev_grid` gives cell
     // content).
     let mut prev_cursor_shape: Option<&'static str> = None;
+    // M88: true once the first real frame has been drawn -- gates
+    // `core::frontend_started`, called exactly once below, which in turn
+    // is what lets `lsp--autostart-tick` (part of the idle tick just
+    // below) actually spawn anything. See `frontend_started`'s own doc.
+    let mut frontend_started = false;
 
     loop {
         draw(interp, ed, &mut out, &mut prev_grid, &mut prev_cursor_shape)?;
+        if !frontend_started {
+            core::frontend_started(interp);
+            frontend_started = true;
+        }
         if ed.borrow().quit {
             break;
         }

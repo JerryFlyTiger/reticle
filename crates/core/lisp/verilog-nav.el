@@ -151,8 +151,17 @@
 ;;   verbatim for the candidate-file list. See that function's own doc
 ;;   string (verilog-auto.el) for the exact ordering contract this
 ;;   file's "first match wins" note above depends on.
-;; - Only `module' declarations are jump targets. `interface'/`package'/
-;;   `program'/`class' declarations are not searched for or landed on.
+;; - `module' AND `interface' declarations are jump targets (M97: this
+;;   file reuses `verilog-auto--top-level-modules'/`--find-module-in-
+;;   buffer'/`--header-node'/`--module-name' verbatim, and M97 widened
+;;   all four to resolve `interface_declaration' alongside `module_
+;;   declaration' -- so an instantiated interface's TYPE name, e.g.
+;;   `axi_if' in `axi_if u_if();', now jumps the same way a module type
+;;   name does, with no changes needed in this file itself). `package'/
+;;   `program'/`class' declarations are still not searched for or landed
+;;   on -- out of M97's scope; neither is a MODPORT name or a member
+;;   reached THROUGH an interface port (out of scope even with an LSP
+;;   client attached -- see PLAN.md's M97 record).
 ;; - Does not jump to the INSTANCE's own declaration, and has no notion
 ;;   of `import pkg::*' at all.
 ;; - Multiple library files declaring the SAME module name: the first

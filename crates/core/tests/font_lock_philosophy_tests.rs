@@ -174,6 +174,21 @@ fn not_colored_at(interp: &mut Interp, src: &str, needle: &str, occurrence: usiz
     !exact_hl(interp, s, e, None)
 }
 
+/// NEEDLE's `occurrence`-th whole-token appearance in SRC must not carry
+/// `font-lock-type-face` specifically -- unlike `not_colored_at`, this
+/// allows some OTHER face (e.g. a declared variable's own
+/// `font-lock-variable-name-face`) to still be present. M89's fix round
+/// needs this: several of its structural type-reference rules share a
+/// grammar position with an existing declaration-name rule (both are a
+/// bare `simple_identifier` as some node's first/only positional child),
+/// so `not_colored_at` can never usefully guard against the type rule
+/// over-matching there -- the declared name is SUPPOSED to carry a face
+/// already; the guard rail is "not THIS one."
+fn not_type_at(interp: &mut Interp, src: &str, needle: &str, occurrence: usize) -> bool {
+    let (s, e) = nth_token(src, needle, occurrence);
+    !exact_hl(interp, s, e, Some("font-lock-type-face"))
+}
+
 // --- Rust ---------------------------------------------------------------
 
 const RUST_SRC: &str = "const MAX_RETRY: i32 = 3;
@@ -1260,6 +1275,64 @@ module counter #(parameter WIDTH = 8, localparam DEPTH = 4) (
 endmodule
 
 // trailing comment
+
+package soc_pkg;
+  typedef struct packed {
+    logic [7:0] payload;
+  } req_t;
+
+  typedef enum logic [1:0] {
+    OP_ADD,
+    OP_SUB
+  } alu_op_e;
+endpackage
+
+class my_class;
+endclass
+
+interface my_if;
+endinterface
+
+interface bus_if (clk, rst_n);
+  input clk;
+  input rst_n;
+endinterface
+
+covergroup my_cg;
+  coverpoint cover_sig;
+endgroup
+
+import soc_pkg::*;
+
+module uses_pkg (
+  input  soc_pkg::req_t     req_in,
+  output alu_op_e           op_out
+);
+  soc_pkg::req_t local_req;
+  alu_op_e        local_op;
+  wire            net_flag;
+  interconnect    ic_net;
+  real_net        real_sig;
+  a::b::c         chain_var;
+  soc_pkg::req_t #(8) req_param;
+  a::b::c #(8)         chain_param;
+  req_t #(8)           bare_param;
+  sub_mod         u2 (.data(net_flag));
+endmodule
+
+module port_nettype_m (p);
+  inout real_net p;
+endmodule
+
+module bare_param_m;
+  req_t #(8) bare_param2;
+endmodule
+
+module uses_if (
+  my_if.mst_view if_bus,
+  input logic if_clk
+);
+endmodule
 ";
 
 #[test]
@@ -1583,5 +1656,457 @@ fn verilog_font_lock_philosophy() {
     assert!(
         not_colored_at(&mut i, VERILOG_PHIL_SRC, "8", 0),
         "verilog: numeric literal must not be colored"
+    );
+
+    // --- M89: SystemVerilog OOP declaration names -> type -----------------
+
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "soc_pkg",
+            0,
+            "font-lock-type-face"
+        ),
+        "verilog: `package soc_pkg` name must get type face"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 0, "font-lock-type-face"),
+        "verilog: `typedef struct packed {{...}} req_t` name must get type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "alu_op_e",
+            0,
+            "font-lock-type-face"
+        ),
+        "verilog: `typedef enum {{...}} alu_op_e` name must get type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "my_class",
+            0,
+            "font-lock-type-face"
+        ),
+        "verilog: `class my_class` name must get type face"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "my_if", 0, "font-lock-type-face"),
+        "verilog: `interface my_if` name must get type face"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "bus_if", 0, "font-lock-type-face"),
+        "verilog: `interface bus_if (clk, rst_n)` (non-ANSI header, H4) \
+         name must get type face"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "my_cg", 0, "font-lock-type-face"),
+        "verilog: `covergroup my_cg` (H3) name must get type face"
+    );
+
+    // --- M89: enum member names -> constant --------------------------------
+
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "OP_ADD",
+            0,
+            "font-lock-constant-face"
+        ),
+        "verilog: enum member `OP_ADD` must get constant face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "OP_SUB",
+            0,
+            "font-lock-constant-face"
+        ),
+        "verilog: enum member `OP_SUB` must get constant face"
+    );
+
+    // --- M89: type REFERENCES -> type (the largest part of the visible ----
+    // win: names declared in a package get used all over the rest of a
+    // real design)
+
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 1, "font-lock-type-face"),
+        "verilog: package-qualified `soc_pkg::req_t` port type must get type \
+         face AT THE TYPE NAME"
+    );
+    // M89 second fix round, Q2: this `soc_pkg` check (and its H5 siblings
+    // on "a"/"b" below) IS mutation-observable for the `class_type` rules
+    // -- reverting the last-child/adjacent-parameter-value-assignment
+    // anchors really does turn this red (dump-verified while iterating the
+    // fix). Contrast the `not_type_at` assertions in the H1/H2 blocks
+    // further down, which are NOT mutation-observable by construction (see
+    // the comment there).
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "soc_pkg", 2),
+        "verilog: the PACKAGE half of `soc_pkg::req_t` must stay plain -- \
+         only the type name is captured"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 2, "font-lock-type-face"),
+        "verilog: `soc_pkg::req_t local_req;` local declaration's \
+         package-qualified type must get type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "alu_op_e",
+            1,
+            "font-lock-type-face"
+        ),
+        "verilog: bare `alu_op_e op_out` port type (post-import) must get \
+         type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "alu_op_e",
+            2,
+            "font-lock-type-face"
+        ),
+        "verilog: bare `alu_op_e local_op;` declaration type (post-import) \
+         must get type face"
+    );
+
+    // --- M89 fix round: H1 -- `interconnect`'s bare name must NOT become a
+    // type, even though it sits in the exact same "bare `simple_identifier`
+    // directly under `net_declaration`" position a user-defined-nettype
+    // TYPE reference uses. This is the real over-match the cold read found;
+    // `interconnect net_flag;`/`interconnect w1, w2;` structurally has no
+    // `list_of_net_decl_assignments` sibling at all, which is what the
+    // fixed query rule now requires.
+
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "ic_net", 0),
+        "verilog: H1 -- `interconnect ic_net;`'s declared NET name must not \
+         be colored as a type"
+    );
+
+    // --- M89 fix round: H1's positive case -- a real user-defined-nettype
+    // TYPE reference (`real_net my_signal;`-shaped) must still get type
+    // face on the type, and must NOT leak onto the declared net name next
+    // to it (the two sit one AST level apart: `real_net` is the bare
+    // `net_declaration` child the fixed rule anchors on; `real_sig` is
+    // wrapped inside that declaration's `list_of_net_decl_assignments`,
+    // which is exactly the sibling the fixed rule requires to exist).
+
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "real_net",
+            0,
+            "font-lock-type-face"
+        ),
+        "verilog: H1 positive case -- `real_net my_signal;`-shaped \
+         user-defined-nettype TYPE reference must still get type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "real_sig",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: the declared NET name next to a user-defined nettype \
+         type reference must get variable face"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "real_sig", 0),
+        "verilog: H1 guard -- the declared net name `real_sig` must not \
+         ALSO pick up type face from the adjacent type rule"
+    );
+
+    // --- M89 fix round: H2 -- guard rails positioned where the new rules
+    // can actually reach, replacing the three from the first round (all
+    // three sat inside `module_instantiation`, a subtree none of M89's new
+    // rules ever anchors on, so they could never have caught an
+    // over-match).
+    //
+    // M89 SECOND fix round, Q2: a trailing cold read found that three of
+    // these four replacement guard rails are STILL structurally incapable
+    // of failing, for the same underlying reason as the ones they
+    // replaced -- just one container level shallower. The `not_type_at`
+    // assertions below on `real_sig`, `net_flag`, and `local_op` all sit
+    // on a DECLARED NAME, and in every declaration shape this grammar
+    // produces, the declared name is one container level deeper than the
+    // type reference sitting next to it (inside `net_decl_assignment` /
+    // `variable_decl_assignment`, itself inside a `list_of_*` wrapper).
+    // Every rule in `verilog-highlights.scm` requires a direct
+    // parent-child relationship (this file has no descendant/recursive
+    // patterns anywhere), so no mutation of any type-reference rule can
+    // ever reach one container level deeper than its own anchor -- these
+    // three assertions document the INTENDED invariant and cost nothing
+    // to keep, but they cannot turn red no matter how badly a rule
+    // over-matches. Do not read "four guard rails" as "four ways this is
+    // covered": only `not_colored_at(..., "ic_net", 0)` above is genuinely
+    // mutation-observable for the `net_declaration` rule (reverting the
+    // `(list_of_net_decl_assignments)` sibling constraint turns it red);
+    // the equivalent for the `class_type` rules is the `soc_pkg`/`a`/`b`
+    // qualifier checks (reverting the anchor/adjacency constraints there
+    // turns THOSE red).
+
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "net_flag",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: `wire net_flag;`'s declared name must get variable face"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "net_flag", 0),
+        "verilog: H2 -- `wire net_flag;`'s declared net name must not get \
+         type face (H1's exact bug class: `net_type` `wire` and a bare \
+         nettype-identifier type both sit in `net_declaration`'s leading \
+         position)"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "local_op",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: `alu_op_e local_op;`'s declared name must get variable \
+         face"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "local_op", 0),
+        "verilog: H2 -- in a bare-type declaration (`alu_op_e local_op;`), \
+         the declared VARIABLE name `local_op` must not get type face -- \
+         only `alu_op_e` (asserted above) may"
+    );
+
+    // --- M89 fix round: H5 -- a 3+-segment package/class-qualified chain
+    // (`a::b::c local_var;`) captures ONLY the final segment as the type;
+    // every segment before it (including a middle one) is a scope
+    // qualifier and stays uncolored, matching the existing 2-segment
+    // precedent (`soc_pkg::req_t` colors only `req_t`, asserted above via
+    // `not_colored_at(..., "soc_pkg", 2)`).
+
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "a", 0),
+        "verilog: H5 -- in `a::b::c chain_var;`, the FIRST scope segment \
+         `a` must stay uncolored"
+    );
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "b", 0),
+        "verilog: H5 -- in `a::b::c chain_var;`, the MIDDLE scope segment \
+         `b` must stay uncolored (this is the exact bug: without the \
+         last-child anchor, the naive two-identifier pattern captured \
+         every adjacent pair, coloring `b` too)"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "c", 0, "font-lock-type-face"),
+        "verilog: H5 -- in `a::b::c chain_var;`, only the FINAL segment \
+         `c` is the type name and must get type face"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "chain_var",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: `a::b::c chain_var;`'s declared name must get variable \
+         face"
+    );
+
+    // --- M89 second fix round: Q1 -- the trailing-`.` anchor from the
+    // first fix round fixed H5's middle-segment over-capture but broke a
+    // real case in the process: `parameter_value_assignment` is its own
+    // named node, attached after EVERY segment including the final one, so
+    // for a parameterized package-qualified type (`soc_pkg::req_t #(8)
+    // req_param;`) the true last child of `class_type` was the param node,
+    // not the identifier, and the old anchored rule silently stopped
+    // capturing it. `req_param` in the fixture is exactly this shape;
+    // `chain_param` is the same regression on a 3-segment chain
+    // (`a::b::c #(8) chain_param;`), checked to confirm the middle segment
+    // still doesn't get swept up now that a second rule is back to
+    // covering the trailing-parameter case.
+
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 3, "font-lock-type-face"),
+        "verilog: Q1 -- `soc_pkg::req_t #(8) req_param;`'s parameterized          package-qualified type name must get type face"
+    );
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "soc_pkg", 4),
+        "verilog: Q1 -- the PACKAGE half of a parameterized qualified type          (`soc_pkg::req_t #(8)`) must still stay plain"
+    );
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "a", 1),
+        "verilog: Q1 -- in `a::b::c #(8) chain_param;`, the FIRST scope          segment `a` must stay uncolored even with a trailing param on the          final segment"
+    );
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "b", 1),
+        "verilog: Q1 -- in `a::b::c #(8) chain_param;`, the MIDDLE scope          segment `b` must stay uncolored even with a trailing param on the          final segment"
+    );
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "c", 1, "font-lock-type-face"),
+        "verilog: Q1 -- in `a::b::c #(8) chain_param;`, the FINAL segment          `c` must get type face even with its own trailing param"
+    );
+
+    // --- M89 THIRD fix round: a mutation run found `bare_param` above does
+    // NOT exercise the finding-4 rule at all -- dump-verified in the actual
+    // fixture context (not isolation): once at least one other declaration
+    // already precedes it in the same module scope, `req_t #(8)
+    // bare_param;` resolves as `net_declaration`'s bare-type-plus-
+    // `delay_control` shape (`req_t` the net type, `#(8)` a net delay, NOT
+    // a `parameter_value_assignment`), the exact same H1 rule that already
+    // covers `real_net`/`local_op` above -- one more instance of the same
+    // context-dependent ambiguity H6 documents for the plain bare-type
+    // case, now confirmed for the parameterized case too. So this
+    // assertion is real (H1 rule coverage), just mislabeled: it does NOT
+    // prove finding-4's rule does anything, and deleting that rule leaves
+    // it green.
+
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 4, "font-lock-type-face"),
+        "verilog: `req_t #(8) bare_param;` (net_declaration+delay_control \
+         shape, H1 rule) must get type face on the type name"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "bare_param",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: `req_t #(8) bare_param;`'s declared name must get \
+         variable face"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "bare_param", 0),
+        "verilog: the declared name `bare_param` must not ALSO pick up \
+         type face from the adjacent type rule"
+    );
+
+    // --- M89 second fix round: finding 4, exercised for real this time --
+    // a BARE parameterized type reference (a single-identifier `class_type`
+    // with its own `parameter_value_assignment`, no package/class qualifier
+    // at all) needs a FRESH module with no preceding declaration in scope
+    // to actually take the `data_declaration`/`class_type` shape this rule
+    // targets (dump-verified: as the module's first statement it parses
+    // that way; preceded by ANY other declaration -- data or net -- it
+    // flips to the `net_declaration`+`delay_control` shape above instead).
+    // `bare_param_m` is that fresh module. This rule is anchored on
+    // `data_type` specifically, which a `class ... extends bar #(...);`
+    // superclass reference (also a single-identifier, possibly-
+    // parameterized `class_type`) can never reach, since ITS `class_type`
+    // parent is `class_declaration`, not `data_type` (dump-verified,
+    // confirmed with a temporary harness, deleted before this round
+    // finished -- see the wrap-up note). `demo/rtl/` has no `class` at
+    // all, so there is no in-fixture negative case for the extends-clause
+    // shape.
+
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "req_t", 5, "font-lock-type-face"),
+        "verilog: finding 4 -- bare parameterized `req_t #(8) bare_param2;` \
+         as a module's FIRST statement must get type face on the type name"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "bare_param2",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: `req_t #(8) bare_param2;`'s declared name must get \
+         variable face"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "bare_param2", 0),
+        "verilog: the declared name `bare_param2` must not ALSO pick up \
+         type face from the adjacent bare-parameterized-type rule"
+    );
+
+    // --- M89 second fix round: Q3 -- a user-defined nettype used as a
+    // PORT type (`net_port_type`'s own `nettype_identifier` alternative,
+    // reachable through the older non-ANSI `inout <type> <name>;` port-
+    // declaration form -- see the query file's own comment for why `input`/
+    // `output` and the ANSI form all resolve through `data_type` instead,
+    // already covered above).
+
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "real_net",
+            1,
+            "font-lock-type-face"
+        ),
+        "verilog: Q3 -- `inout real_net p;`'s nettype PORT type must get          type face"
+    );
+
+    // --- identifiers that must NOT become types (module instantiation) ----
+
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "data", 1),
+        "verilog: `u2`'s `.data` named-port-connection reference must not be \
+         colored (it is a port name, not a type)"
+    );
+    assert!(
+        not_colored_at(&mut i, VERILOG_PHIL_SRC, "u2", 0),
+        "verilog: instance name `u2` must not be colored (it is a \
+         module-instance name, not a type)"
+    );
+
+    // --- M97: interface port header (`my_if.mst_view if_bus`) -------------
+
+    assert!(
+        face_at(&mut i, VERILOG_PHIL_SRC, "my_if", 1, "font-lock-type-face"),
+        "verilog: `interface_port_header`'s `interface_name:` reference \
+         (`my_if` in `my_if.mst_view if_bus`) must get type face, same as \
+         every other type reference"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "mst_view",
+            0,
+            "font-lock-constant-face"
+        ),
+        "verilog: `interface_port_header`'s `modport_name:` reference \
+         (`mst_view`) must get constant face -- a named VIEW selection, \
+         not a type reference"
+    );
+    assert!(
+        face_at(
+            &mut i,
+            VERILOG_PHIL_SRC,
+            "if_bus",
+            0,
+            "font-lock-variable-name-face"
+        ),
+        "verilog: the port's own name (`if_bus`) must still get variable \
+         face regardless of which header kind (net/variable/interface) \
+         sits next to it in `ansi_port_declaration`"
+    );
+    assert!(
+        not_type_at(&mut i, VERILOG_PHIL_SRC, "if_bus", 0),
+        "verilog: `not_colored_at`-style guard -- the interface port header \
+         rules above must not widen to also swallow the sibling `port_name:` \
+         field (`if_bus` must never get type face)"
     );
 }

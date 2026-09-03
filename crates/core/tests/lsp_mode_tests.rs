@@ -87,6 +87,71 @@ fn scratch_dir(tag: &str) -> Scratch {
     Scratch::new(tag)
 }
 
+/// M93 third fix round (W3): `$HOME` is process-global, not
+/// thread-local, and `cargo test` runs this file's tests on multiple
+/// threads by default. `HomeGuard' below overrides it; separately,
+/// ANY `project_root_*' test that resolves a Verilog-suffixed file
+/// (`.v'/`.vh'/`.sv'/`.svh') reads it too, transitively, through
+/// `lsp--home-directory' (called from `lsp--nearest-filelist-root',
+/// which only Verilog buffers reach). Both are real races against a
+/// `HomeGuard' override running on another thread at the same moment
+/// -- this project has twice shipped a race that only surfaced under
+/// default thread counts (M65, M84; see this repo's own delegation
+/// notes), so this is not treated as acceptable on "no path collision"
+/// grounds alone the way the previous round's docstring argued.
+///
+/// This mutex is the fix: every test that either installs a
+/// `HomeGuard' or reads `$HOME' via a Verilog-suffixed
+/// `lsp--project-root' call takes `home_env_lock' for its own
+/// duration, so an override window and a read window can never
+/// overlap, regardless of thread count or scheduling.
+static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the shared lock guarding `$HOME` for the life of the
+/// returned guard. Poison-tolerant (`unwrap_or_else(PoisonError::
+/// into_inner)`): one test panicking while holding this must not
+/// permanently wedge every later test that also needs the lock.
+fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    HOME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Overrides `$HOME` for the duration of one test and restores it on
+/// drop (even on panic/assertion failure), the same discipline as
+/// `ssh_tests.rs`'s `TmpdirGuard`. `lsp--home-directory' (lsp.el) reads
+/// `$HOME' fresh via `expand-file-name' on every call rather than
+/// caching it, specifically so this override takes effect immediately
+/// -- see that function's own docstring.
+///
+/// Holds `home_env_lock' for its entire lifetime (acquired in `set',
+/// released when the guard drops) -- see that function's own doc for
+/// why a lock is needed at all, on top of the fact that the directory
+/// this override points AT is always a scratch path no other test's
+/// OWN file layout can ever collide with.
+struct HomeGuard {
+    prev: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeGuard {
+    fn set(dir: &std::path::Path) -> HomeGuard {
+        let lock = home_env_lock();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir);
+        HomeGuard { prev, _lock: lock }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
 // ============================================================
 // lsp-server-alist
 // ============================================================
@@ -202,6 +267,12 @@ fn project_root_finds_a_slang_config_directory_from_a_nested_source_file() {
     // -- measured 2026-08-11, see `lsp--project-root-markers''s own doc
     // string for the probe output.
     let mut i = setup();
+    // M93 third fix round (W3): this test resolves a `.sv`/`.vh`/
+    // `.v`/`.svh` file, so `lsp--project-root` reads `$HOME` via
+    // `lsp--home-directory` even though this test never overrides it
+    // -- see `home_env_lock`'s own doc for why that still needs the
+    // shared lock.
+    let _lock = home_env_lock();
     let root = scratch_dir("slang_root");
     std::fs::create_dir_all(root.join(".slang")).unwrap();
     std::fs::write(root.join(".slang/config.json"), "{}\n").unwrap();
@@ -242,6 +313,205 @@ fn project_root_prefers_the_nearer_marker_over_an_outer_one() {
     assert_eq!(
         run(&mut i, &src),
         format!("{:?}", root.join("sub").to_str().unwrap())
+    );
+}
+
+#[test]
+fn project_root_verilog_filelist_outranks_a_nearer_dot_git() {
+    // M93: proj/verible.filelist plus proj/sub/.git/ -- a Verilog buffer
+    // at proj/sub/buf.sv must resolve to `proj', not `proj/sub', because
+    // the nearer `.git' would otherwise shadow the filelist that
+    // actually defines the project (and this value becomes the LSP
+    // server's own rootUri, so a wrong answer here misroots the server
+    // too, not just this editor's local navigation).
+    let mut i = setup();
+    // M93 third fix round (W3): this test resolves a `.sv`/`.vh`/
+    // `.v`/`.svh` file, so `lsp--project-root` reads `$HOME` via
+    // `lsp--home-directory` even though this test never overrides it
+    // -- see `home_env_lock`'s own doc for why that still needs the
+    // shared lock.
+    let _lock = home_env_lock();
+    let root = scratch_dir("sv_filelist_outranks_git");
+    std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+    std::fs::write(root.join("verible.filelist"), "sub/buf.sv\n").unwrap();
+    let file = root.join("sub/buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(run(&mut i, &src), format!("{:?}", root.to_str().unwrap()));
+}
+
+#[test]
+fn project_root_verilog_filelist_walk_is_bounded_at_home_and_does_not_shadow_a_nearer_dot_git() {
+    // M93 fix round (R1): a stray `verible.filelist' living ABOVE
+    // `$HOME' (a NAS mount point, a directory shared by several
+    // unrelated checkouts, ...) must not outrank the buffer's own
+    // much nearer `.git' -- reviewer traced this statically (not
+    // reproduced) as "the filelist walk is unbounded and can leave the
+    // project entirely."
+    //
+    // Layout: fake_home/proj/.git (the buffer's own project marker)
+    // and fake_root/verible.filelist, where fake_root is fake_home's
+    // OWN PARENT -- i.e. strictly above `$HOME' once `$HOME' is
+    // overridden to fake_home. Before the R1 bound, the filelist walk
+    // ignores `.git' entirely and climbs straight past `fake_home' to
+    // `fake_root', finding the stray filelist and returning it --
+    // reproduced by hand before this fix (see the M93 fix-round
+    // report). After the bound, the walk stops climbing at
+    // `fake_home' itself (never returning `fake_home', and never
+    // looking above it), finds no filelist, and falls back to the
+    // ordinary marker walk, landing on `proj' (the `.git' directory).
+    let mut i = setup();
+    let fake_root = scratch_dir("home_bound");
+    let fake_home = fake_root.join("home");
+    let proj = fake_home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::write(fake_root.join("verible.filelist"), "home/proj/buf.sv\n").unwrap();
+    let file = proj.join("buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let _home_guard = HomeGuard::set(&fake_home);
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(run(&mut i, &src), format!("{:?}", proj.to_str().unwrap()));
+}
+
+#[test]
+fn project_root_verilog_filelist_at_home_itself_is_not_honoured() {
+    // M93 third fix round (W1): pins DELIBERATE behaviour, not a bug --
+    // a `verible.filelist' sitting EXACTLY AT `$HOME', with the
+    // buffer's own nearer `.git' below it, must resolve to the `.git'
+    // directory, never to `$HOME'. Accepting `$HOME' as an answer here
+    // would hand `lsp-connect' the user's entire home directory as a
+    // `rootUri' -- the same class of danger R1 bounded the walk to
+    // prevent for a filelist ABOVE `$HOME'; a filelist AT `$HOME' is
+    // excluded by the very same check
+    // (`lsp--nearest-filelist-root''s own docstring covers the
+    // mechanism; this test is the behavioral pin so a future reader
+    // does not "fix" it back to honouring a home-level filelist).
+    //
+    // Layout: fake_home/verible.filelist (at home itself) and
+    // fake_home/proj/.git (nearer, below home). Expected: `proj', via
+    // the ordinary marker walk -- the filelist search finds nothing
+    // usable (home itself is excluded from ever being accepted) and
+    // falls through.
+    let mut i = setup();
+    let fake_root = scratch_dir("home_filelist_not_honoured");
+    let fake_home = fake_root.join("home");
+    let proj = fake_home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(&fake_home).unwrap();
+    std::fs::write(
+        fake_home.join("verible.filelist"),
+        "proj/buf.sv
+",
+    )
+    .unwrap();
+    let file = proj.join("buf.sv");
+    std::fs::write(
+        &file,
+        "module buf; endmodule
+",
+    )
+    .unwrap();
+
+    let _home_guard = HomeGuard::set(&fake_home);
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(run(&mut i, &src), format!("{:?}", proj.to_str().unwrap()));
+}
+
+#[test]
+fn project_root_non_verilog_buffer_still_prefers_the_nearer_marker() {
+    // Same layout as the test above, but the buffer is a `.rs' file --
+    // this milestone must not change resolution for any non-Verilog
+    // language. `.git' at `sub' wins, exactly as
+    // `project_root_prefers_the_nearer_marker_over_an_outer_one' pins
+    // for the general case.
+    let mut i = setup();
+    let root = scratch_dir("non_sv_prefers_nearer");
+    std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+    std::fs::write(root.join("verible.filelist"), "sub/main.rs\n").unwrap();
+    let file = root.join("sub/main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(
+        run(&mut i, &src),
+        format!("{:?}", root.join("sub").to_str().unwrap())
+    );
+}
+
+#[test]
+fn project_root_verilog_buffer_with_no_filelist_anywhere_behaves_as_today() {
+    // No `verible.filelist' at all above the buffer -- the new filelist
+    // search finds nothing, and this must fall back to the ordinary
+    // nearest-marker walk exactly as before M93.
+    let mut i = setup();
+    // M93 third fix round (W3): this test resolves a `.sv`/`.vh`/
+    // `.v`/`.svh` file, so `lsp--project-root` reads `$HOME` via
+    // `lsp--home-directory` even though this test never overrides it
+    // -- see `home_env_lock`'s own doc for why that still needs the
+    // shared lock.
+    let _lock = home_env_lock();
+    let root = scratch_dir("sv_no_filelist_unaffected");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let file = root.join("sub/buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(run(&mut i, &src), format!("{:?}", root.to_str().unwrap()));
+}
+
+// M93 fix round (R3): `project_root_verilog_filelist_at_nearest_marker_
+// directory_is_unaffected' was deleted here. Its layout put the
+// `verible.filelist' in the SAME directory as the nearest generic
+// marker, but `verible.filelist' is itself one of the eight entries in
+// `lsp--project-root-markers' -- so the OLD, unmodified nearest-marker
+// walk already stopped at that exact directory too, for the same
+// reason (it's the nearest ancestor holding ANY marker, filelist
+// included). Reverting this entire milestone leaves that test green,
+// so it was not discriminating between old and new behavior; no
+// layout with "filelist co-located with the nearest marker" can ever
+// discriminate them, since that's precisely the case where both
+// algorithms trivially agree. Deleted per the reviewer's instruction
+// rather than kept as something that only looks like coverage.
+
+#[test]
+fn project_root_nested_filelists_resolve_to_the_nearest_one() {
+    // M93 fix round (R3): the original version of this test put
+    // `verible.filelist' at both `proj' and `proj/sub', with no other
+    // marker anywhere -- but `verible.filelist' is itself a member of
+    // `lsp--project-root-markers', so the OLD nearest-marker walk
+    // already stopped at `proj/sub' too (its own filelist counts as
+    // "any marker"), making that layout non-discriminating between old
+    // and new behavior (same failure family as the deleted test
+    // above). This version adds `proj/mid/sub/.git' as the nearest
+    // GENERIC marker, nearer than either filelist: the OLD algorithm
+    // stops there and returns `sub', ignoring both filelists entirely.
+    // The NEW, Verilog-specific filelist walk ignores `.git' and finds
+    // `proj/mid/verible.filelist' (nearer than `proj/verible.filelist')
+    // -- so the correct M93 answer is `mid', not `sub' (what the old
+    // algorithm gives) and not `proj' (the outermost filelist).
+    let mut i = setup();
+    // M93 third fix round (W3): this test resolves a `.sv`/`.vh`/
+    // `.v`/`.svh` file, so `lsp--project-root` reads `$HOME` via
+    // `lsp--home-directory` even though this test never overrides it
+    // -- see `home_env_lock`'s own doc for why that still needs the
+    // shared lock.
+    let _lock = home_env_lock();
+    let root = scratch_dir("sv_nested_filelists");
+    std::fs::create_dir_all(root.join("mid/sub/.git")).unwrap();
+    std::fs::write(root.join("verible.filelist"), "mid/sub/buf.sv\n").unwrap();
+    std::fs::write(root.join("mid/verible.filelist"), "sub/buf.sv\n").unwrap();
+    let file = root.join("mid/sub/buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
+    assert_eq!(
+        run(&mut i, &src),
+        format!("{:?}", root.join("mid").to_str().unwrap())
     );
 }
 
@@ -2318,4 +2588,1432 @@ fn repeated_lsp_command_does_not_disturb_the_pending_did_change() {
     );
 
     ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
+}
+
+// ============================================================
+// M94: a second attached client per buffer, routed by capability.
+// Attach/sync/save/close use two real "cat" subprocesses (same
+// technique the rest of this file already uses) so the actual
+// `textDocument/*' framing on each connection can be inspected;
+// capability ROUTING itself uses lightweight `:conn nil' stub clients
+// (same convention `verilog_complete_tests.rs`'s
+// `stub_client_with_capabilities' already established), since routing
+// only reads `lsp--client-capabilities'/`lsp--client-command', not a
+// real transport.
+// ============================================================
+
+/// `H' with KEY present (an empty nested hash-table value -- the exact
+/// value never matters to `lsp--capability-supported-p', only presence
+/// does) -- an elisp expression string for `make-lsp--client'
+/// `:capabilities'.
+fn caps_with(key: &str) -> String {
+    format!(
+        "(let ((h (make-hash-table))) (puthash {:?} (make-hash-table) h) h)",
+        key
+    )
+}
+
+#[test]
+fn attaching_a_second_client_adds_it_without_disturbing_the_primary() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_attach_two");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    // Z2 (M94 review): the primary slot is only for a client whose own
+    // `command' matches the PRIMARY table for the buffer's mode -- so
+    // "cat" must actually be registered as rust-mode's primary here for
+    // test--a to be eligible to occupy it.
+    ok(
+        &mut i,
+        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"cat\")))",
+    );
+
+    ok(&mut i, "(setq test--a (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--a 'rust-mode)");
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--a)"), "t");
+    assert_eq!(run(&mut i, "(length lsp--buffer-clients)"), "1");
+
+    ok(&mut i, "(setq test--b (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--b 'rust-mode)");
+
+    // Primary is unchanged by the second attach.
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--a)"), "t");
+    // Both are attached.
+    assert_eq!(run(&mut i, "(length lsp--buffer-clients)"), "2");
+    assert_eq!(
+        run(&mut i, "(and (memq test--a lsp--buffer-clients) t)"),
+        "t"
+    );
+    assert_eq!(
+        run(&mut i, "(and (memq test--b lsp--buffer-clients) t)"),
+        "t"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--a))");
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--b))");
+}
+
+#[test]
+fn a_secondary_attach_that_fails_did_open_does_not_clobber_the_primary() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_secondary_fails");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"cat\")))",
+    );
+
+    ok(&mut i, "(setq test--a (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--a 'rust-mode)");
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--a)"), "t");
+
+    ok(
+        &mut i,
+        "(setq test--orig-did-open (symbol-function 'lsp-did-open))",
+    );
+    ok(
+        &mut i,
+        "(fset 'lsp-did-open (lambda (&rest _) (error \"boom\")))",
+    );
+    ok(
+        &mut i,
+        "(setq test--b (make-lsp--client :conn nil :command \"other\"))",
+    );
+    let r = run(&mut i, "(lsp--attach-current-buffer test--b 'rust-mode)");
+    assert!(r.starts_with("ERROR"), "expected a signal: {}", r);
+    ok(&mut i, "(fset 'lsp-did-open test--orig-did-open)");
+
+    // The primary must be untouched, and B must never have joined
+    // `lsp--buffer-clients'.
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--a)"), "t");
+    assert_eq!(run(&mut i, "(length lsp--buffer-clients)"), "1");
+    assert_eq!(
+        run(&mut i, "(and (memq test--b lsp--buffer-clients) t)"),
+        "nil"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--a))");
+}
+
+#[test]
+fn idle_pump_syncs_every_attached_client_with_independent_watermarks() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_multi_sync");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--a (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--a 'rust-mode)");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drain_frames(&mut i, "(lsp--client-conn test--a)", "textDocument/didOpen");
+
+    // Edit BEFORE B ever attaches.
+    ok(&mut i, "(goto-char (point-max))");
+    ok(&mut i, "(insert \"fn b() {}\\n\")");
+
+    // B attaches AFTER the edit -- its own didOpen already carries the
+    // post-edit text, so no didChange is owed to it for this edit.
+    ok(&mut i, "(setq test--b (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--b 'rust-mode)");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drain_frames(&mut i, "(lsp--client-conn test--b)", "textDocument/didOpen");
+
+    let r = run(&mut i, "(lsp-process-pending-all)");
+    assert!(!r.starts_with("ERROR"), "idle pump signaled: {}", r);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    assert_eq!(
+        drain_frames(
+            &mut i,
+            "(lsp--client-conn test--a)",
+            "textDocument/didChange"
+        ),
+        1,
+        "A must get the didChange for the edit it missed while B hadn't attached yet"
+    );
+    assert_eq!(
+        drain_frames(
+            &mut i,
+            "(lsp--client-conn test--b)",
+            "textDocument/didChange"
+        ),
+        0,
+        "B attached AFTER the edit -- its own didOpen already covered it, so it must \
+         not be treated as needing a didChange for text it never actually missed"
+    );
+
+    // A second edit, made after both are attached: both must now get
+    // exactly one didChange each.
+    ok(&mut i, "(insert \"fn c() {}\\n\")");
+    let r = run(&mut i, "(lsp-process-pending-all)");
+    assert!(!r.starts_with("ERROR"), "idle pump signaled: {}", r);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        drain_frames(
+            &mut i,
+            "(lsp--client-conn test--a)",
+            "textDocument/didChange"
+        ),
+        1
+    );
+    assert_eq!(
+        drain_frames(
+            &mut i,
+            "(lsp--client-conn test--b)",
+            "textDocument/didChange"
+        ),
+        1
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--a))");
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--b))");
+}
+
+#[test]
+fn save_and_kill_reach_every_attached_client() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_save_close");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--a (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--a 'rust-mode)");
+    ok(&mut i, "(setq test--b (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--b 'rust-mode)");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drain_frames(&mut i, "(lsp--client-conn test--a)", "textDocument/didOpen");
+    drain_frames(&mut i, "(lsp--client-conn test--b)", "textDocument/didOpen");
+
+    ok(&mut i, "(insert \"more\")");
+    let r = run(&mut i, "(save-buffer)");
+    assert!(!r.starts_with("ERROR"), "save-buffer signaled: {}", r);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    drain_methods(&mut i, "(lsp--client-conn test--a)");
+    assert_eq!(
+        run(&mut i, "test--methods"),
+        "(\"textDocument/didChange\" \"textDocument/didSave\")",
+        "A must get both the sync didChange and the didSave"
+    );
+    drain_methods(&mut i, "(lsp--client-conn test--b)");
+    assert_eq!(
+        run(&mut i, "test--methods"),
+        "(\"textDocument/didChange\" \"textDocument/didSave\")",
+        "B must get both the sync didChange and the didSave too"
+    );
+
+    ok(&mut i, "(kill-buffer)");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // test--a/test--b are plain globals (not buffer-local), so they
+    // still reach both connections after the buffer that held them
+    // buffer-locally is gone.
+    drain_methods(&mut i, "(lsp--client-conn test--a)");
+    assert_eq!(run(&mut i, "test--methods"), "(\"textDocument/didClose\")");
+    drain_methods(&mut i, "(lsp--client-conn test--b)");
+    assert_eq!(run(&mut i, "test--methods"), "(\"textDocument/didClose\")");
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--a))");
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--b))");
+}
+
+#[test]
+fn completion_routes_to_a_capable_secondary_even_though_it_is_not_the_primary() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_completion_route");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    // PRIMARY (first in the list -- proves this is genuinely a
+    // capability filter, not just "whichever client is first") does
+    // NOT advertise completion; the SECONDARY does.
+    ok(
+        &mut i,
+        "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+           :capabilities (make-hash-table)))",
+    );
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--secondary (make-lsp--client :conn nil :command \"slang\" \
+               :capabilities {}))",
+            caps_with("completionProvider")
+        ),
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (lsp--capable-client \"completionProvider\") test--secondary)"
+        ),
+        "t"
+    );
+
+    ok(&mut i, "(setq test--captured-client nil)");
+    ok(
+        &mut i,
+        "(fset 'lsp-request-async (lambda (client method params callback) \
+           (setq test--captured-client client) 1))",
+    );
+    ok(&mut i, "(completion-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "the LSP tier must have sent the request to the SECONDARY, not the primary"
+    );
+
+    // With no attached client advertising completion at all, behavior
+    // is exactly today's: the LSP tier is never reached.
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary))",
+    );
+    ok(&mut i, "(setq test--captured-client nil)");
+    ok(&mut i, "(completion-at-point)");
+    assert_eq!(
+        run(&mut i, "test--captured-client"),
+        "nil",
+        "no capable client -- lsp-completion-at-point must never have been invoked"
+    );
+}
+
+#[test]
+fn hover_routes_to_a_capable_secondary_even_though_it_is_not_the_primary() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_hover_route");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    // PRIMARY (first in the list) has capabilities recorded but NO
+    // "hoverProvider" key at all; the SECONDARY does.
+    ok(
+        &mut i,
+        "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+           :capabilities (make-hash-table)))",
+    );
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--secondary (make-lsp--client :conn nil :command \"slang\" \
+               :capabilities {}))",
+            caps_with("hoverProvider")
+        ),
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (lsp--capable-client \"hoverProvider\") test--secondary)"
+        ),
+        "t"
+    );
+
+    ok(&mut i, "(setq test--captured-client nil)");
+    ok(
+        &mut i,
+        "(fset 'lsp-request-async (lambda (client method params callback) \
+           (setq test--captured-client client) 1))",
+    );
+    ok(&mut i, "(lsp-hover-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "hover must have gone to the SECONDARY, not the primary"
+    );
+}
+
+#[test]
+fn formatting_still_goes_to_the_primary_when_a_secondary_is_also_attached() {
+    let mut i = setup();
+    let dir = scratch_dir("m94_format_primary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a(){}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    // Both clients advertise formatting, on purpose: this proves
+    // routing is UNCHANGED (still "always the primary"), not merely
+    // "the primary happens to be the only one that could answer".
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+               :capabilities {}))",
+            caps_with("documentFormattingProvider")
+        ),
+    );
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--secondary (make-lsp--client :conn nil :command \"slang\" \
+               :capabilities {}))",
+            caps_with("documentFormattingProvider")
+        ),
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--secondary test--primary))",
+    );
+    ok(&mut i, "(fset 'lsp--sync-buffer-now (lambda () nil))");
+
+    ok(&mut i, "(setq test--captured-client nil)");
+    ok(
+        &mut i,
+        "(fset 'lsp-request-async (lambda (client method params callback) \
+           (setq test--captured-client client) 1))",
+    );
+    ok(&mut i, "(lsp-format-buffer)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--primary)"),
+        "t",
+        "lsp-format-buffer must still route to lsp--buffer-client, the primary"
+    );
+}
+
+/// Small helper installed once via `ok', not a Rust `format!' string
+/// with nested elisp string literals -- building a `publishDiagnostics'
+/// notification and dispatching it in one call keeps the Rust side of
+/// the next test free of doubled braces/escapes.
+fn install_test_publish_helper(i: &mut Interp) {
+    ok(
+        i,
+        r#"(defun test--publish (client uri msg line)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         (format "[{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":1}},\"message\":\"%s\"}]"
+                                 line line msg))
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+}
+
+/// M99: pre-M99 this test pinned `lsp--decorate-buffer''s DEFAULT
+/// behavior (only the primary decorates). M99 flipped the default to
+/// merge every attached client's diagnostics
+/// (`lsp-merge-diagnostics-from-all-clients', `crates/core/lisp/lsp.el')
+/// -- the default-behavior claim this test's old name made is no longer
+/// true, so it's renamed to say what it actually pins down now: the
+/// M94 exclusive-decoration path, which M99 kept as an explicit opt-out
+/// (`(setq lsp-merge-diagnostics-from-all-clients nil)`), not the
+/// default. The DEFAULT (merged) behavior is covered by
+/// `lsp_highlight_tests.rs`'s M99 tests
+/// (`merge_diagnostics_default_paints_the_union_of_two_attached_clients'
+/// and friends), not here.
+#[test]
+fn with_merge_diagnostics_nil_only_the_primarys_diagnostics_decorate_but_a_secondarys_are_still_stored(
+) {
+    let mut i = setup();
+    let dir = scratch_dir("m94_diag_decorate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "line0\nline1\nline2\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+
+    ok(&mut i, "(setq test--primary (make-lsp--client :conn nil))");
+    ok(
+        &mut i,
+        "(setq test--secondary (make-lsp--client :conn nil))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+    // `lsp-merge-diagnostics-from-all-clients' is a plain (non-buffer-
+    // local) `defvar' -- `setq' here is unconditional global state, not
+    // scoped to this buffer, but it's placed after the buffer/client
+    // setup above to read top-to-bottom as "opt out of the M99 default,
+    // then exercise the M94 exclusive path" alongside the rest of this
+    // test's setup.
+    ok(&mut i, "(setq lsp-merge-diagnostics-from-all-clients nil)");
+
+    ok(
+        &mut i,
+        "(test--publish test--primary (lsp--path-to-uri (buffer-file-name)) \"from primary\" 0)",
+    );
+    assert_eq!(
+        run(&mut i, "(length (overlays-in (point-min) (point-max)))"),
+        "1",
+        "the primary's own publish must decorate the buffer"
+    );
+
+    ok(
+        &mut i,
+        "(test--publish test--secondary (lsp--path-to-uri (buffer-file-name)) \"from secondary\" 1)",
+    );
+    assert_eq!(
+        run(&mut i, "(length (overlays-in (point-min) (point-max)))"),
+        "1",
+        "a non-primary publish must not repaint the buffer's decoration at all"
+    );
+    assert_ne!(
+        run(
+            &mut i,
+            "(assoc (lsp--path-to-uri (buffer-file-name)) (lsp--client-diagnostics test--secondary))"
+        ),
+        "nil",
+        "the secondary's own publish must still be STORED on its own client"
+    );
+}
+
+// ============================================================
+// M94 review fix round (Z2/Z4/Z5).
+// ============================================================
+
+#[test]
+fn primary_slot_self_heals_after_dying_while_a_secondary_stays_attached() {
+    // Z2: verible attaches (primary); verible dies; a slang autostart
+    // completes and must NOT walk into the now-empty primary slot; a
+    // fresh verible reconnect afterwards must reclaim it.
+    let mut i = setup();
+    let dir = scratch_dir("m94_z2_self_heal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"cat\")))",
+    );
+
+    // Primary attaches.
+    ok(&mut i, "(setq test--primary1 (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        "(lsp--attach-current-buffer test--primary1 'rust-mode)",
+    );
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--primary1)"), "t");
+
+    // Primary dies.
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary1))");
+
+    // A secondary (its command does NOT match rust-mode's primary
+    // table entry) attaches while the slot is stale-but-non-nil.
+    ok(
+        &mut i,
+        "(setq test--secondary (lsp-connect \"sh\" (list \"-c\" \"cat\")))",
+    );
+    ok(
+        &mut i,
+        "(lsp--attach-current-buffer test--secondary 'rust-mode)",
+    );
+    assert_eq!(
+        run(&mut i, "lsp--buffer-client"),
+        "nil",
+        "the dead primary must have been cleared, and the secondary must NOT \
+         have taken the now-empty primary slot"
+    );
+    assert_eq!(
+        run(&mut i, "(and (memq test--secondary lsp--buffer-clients) t)"),
+        "t",
+        "the secondary must still be attached, just not as primary"
+    );
+
+    // A fresh primary reconnects and must reclaim the slot.
+    ok(&mut i, "(setq test--primary2 (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        "(lsp--attach-current-buffer test--primary2 'rust-mode)",
+    );
+    assert_eq!(
+        run(&mut i, "(eq lsp--buffer-client test--primary2)"),
+        "t",
+        "the real primary must have reclaimed the slot"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(equal (lsp--client-command lsp--buffer-client) \"cat\")"
+        ),
+        "t"
+    );
+    assert_eq!(
+        run(&mut i, "(and (memq test--secondary lsp--buffer-clients) t)"),
+        "t",
+        "the secondary must still be attached throughout"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary2))");
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--secondary))");
+}
+
+/// M99: same rename rationale as `with_merge_diagnostics_nil_only_the_
+/// primarys_diagnostics_decorate_but_a_secondarys_are_still_stored'
+/// just above -- this test's exact-overlay-count assertions ("1", not
+/// "2") only hold under the M94 exclusive-decoration path, which M99
+/// demoted from the default to an explicit opt-out
+/// (`lsp-merge-diagnostics-from-all-clients' set to nil). Under the new
+/// DEFAULT (merged) behavior the secondary's publish would ADD an
+/// overlay on top of the (still-stored, even though the primary is
+/// dead) primary diagnostic, making the "1" assertions below false --
+/// that is exactly the M99 behavior change, not a regression in it, so
+/// this test now pins the nil-opt-out path by name instead of silently
+/// assuming it.
+#[test]
+fn with_merge_diagnostics_nil_a_dead_primary_reopens_decoration_to_a_live_secondary() {
+    // Z4: `lsp--diagnostics-authoritative-p' must not stay permanently
+    // closed once the ONE-TIME authoritative primary has died -- a
+    // live secondary's own publish must decorate again.
+    let mut i = setup();
+    let dir = scratch_dir("m94_z4_dead_primary_decorate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "line0\nline1\nline2\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+
+    ok(&mut i, "(setq test--primary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        "(setq test--secondary (make-lsp--client :conn nil))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+    // Global (non-buffer-local) `defvar' -- see the sibling test's own
+    // comment on this same line for why placement here (after buffer/
+    // client setup, before any publish) is only about readability, not
+    // buffer-local scoping.
+    ok(&mut i, "(setq lsp-merge-diagnostics-from-all-clients nil)");
+
+    ok(
+        &mut i,
+        "(test--publish test--primary (lsp--path-to-uri (buffer-file-name)) \"from primary\" 0)",
+    );
+    assert_eq!(
+        run(&mut i, "(length (overlays-in (point-min) (point-max)))"),
+        "1"
+    );
+    let primary_pos: i64 = run(
+        &mut i,
+        "(overlay-start (car (overlays-in (point-min) (point-max))))",
+    )
+    .parse()
+    .expect("overlay start should print as an integer");
+
+    // The primary dies.
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary))");
+
+    // The secondary's own publish must now decorate -- authority is
+    // "unestablished" (the primary is dead), which is default-OPEN,
+    // not default-closed.
+    ok(
+        &mut i,
+        "(test--publish test--secondary (lsp--path-to-uri (buffer-file-name)) \"from secondary\" 2)",
+    );
+    assert_eq!(
+        run(&mut i, "(length (overlays-in (point-min) (point-max)))"),
+        "1",
+        "the secondary's publish must have repainted the buffer"
+    );
+    let secondary_pos: i64 = run(
+        &mut i,
+        "(overlay-start (car (overlays-in (point-min) (point-max))))",
+    )
+    .parse()
+    .expect("overlay start should print as an integer");
+    assert_ne!(
+        primary_pos, secondary_pos,
+        "the overlay must have actually moved to the secondary's own diagnostic \
+         location, proving a real repaint happened rather than the old \
+         primary overlay simply being left alone"
+    );
+}
+
+#[test]
+fn hover_prefers_a_capable_primary_over_a_capable_secondary_in_real_attach_order() {
+    // Z5: `lsp--buffer-clients' is most-recently-attached-first, so a
+    // secondary (attached after the primary, the ordinary sequence)
+    // sits AHEAD of the primary in that list. `lsp--capable-client'
+    // must still prefer the primary when it is ALSO capable, rather
+    // than mechanically returning the list's first match. Unlike the
+    // earlier routing tests, this one drives the list through the real
+    // `lsp--attach-current-buffer' sequence instead of hand-building it.
+    let mut i = setup();
+    let dir = scratch_dir("m94_z5_real_order");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"cat\")))",
+    );
+
+    ok(&mut i, "(setq test--primary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        &format!(
+            "(setf (lsp--client-capabilities test--primary) {})",
+            caps_with("hoverProvider")
+        ),
+    );
+    ok(
+        &mut i,
+        "(lsp--attach-current-buffer test--primary 'rust-mode)",
+    );
+    assert_eq!(run(&mut i, "(eq lsp--buffer-client test--primary)"), "t");
+
+    // A second "cat" connection attaches AFTER the primary -- same
+    // command, but arrives too late to take the (already-live) primary
+    // slot, so it becomes a plain member of `lsp--buffer-clients',
+    // consed onto the front (most-recent-first).
+    ok(&mut i, "(setq test--secondary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        &format!(
+            "(setf (lsp--client-capabilities test--secondary) {})",
+            caps_with("hoverProvider")
+        ),
+    );
+    ok(
+        &mut i,
+        "(lsp--attach-current-buffer test--secondary 'rust-mode)",
+    );
+    assert_eq!(
+        run(&mut i, "(eq (car lsp--buffer-clients) test--secondary)"),
+        "t",
+        "sanity: the secondary really is first in list order"
+    );
+
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (lsp--capable-client \"hoverProvider\") test--primary)"
+        ),
+        "t",
+        "the PRIMARY must win even though it is not first in lsp--buffer-clients"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary))");
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--secondary))");
+}
+
+#[test]
+fn idle_pump_prunes_a_dead_client_out_of_buffer_clients_and_its_watermark() {
+    // Z6/AA4: `lsp--sync-buffer-now' opportunistically drops a now-dead
+    // client out of `lsp--buffer-clients' (and its own
+    // `lsp--last-synced-tick' entry) while it's already walking every
+    // attached client for liveness -- no correctness bug without this
+    // (every consumer re-checks liveness itself), but nothing observed
+    // the list actually shrinking until this test.
+    let mut i = setup();
+    let dir = scratch_dir("m94_z6_prune");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--a (lsp-connect \"cat\"))");
+    ok(&mut i, "(lsp--attach-current-buffer test--a 'rust-mode)");
+    ok(
+        &mut i,
+        "(setq test--b (lsp-connect \"sh\" (list \"-c\" \"cat\")))",
+    );
+    ok(&mut i, "(lsp--attach-current-buffer test--b 'rust-mode)");
+    assert_eq!(run(&mut i, "(length lsp--buffer-clients)"), "2");
+    assert_ne!(
+        run(&mut i, "(lsp--client-synced-tick test--b)"),
+        "nil",
+        "sanity: B has a watermark entry before it dies"
+    );
+
+    // B dies out from under the buffer.
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--b))");
+
+    // Drive a sync (the idle pump), which is where the pruning happens.
+    let r = run(&mut i, "(lsp-process-pending-all)");
+    assert!(!r.starts_with("ERROR"), "idle pump signaled: {}", r);
+
+    assert_eq!(
+        run(&mut i, "(length lsp--buffer-clients)"),
+        "1",
+        "the dead client must have been pruned out of the list"
+    );
+    assert_eq!(
+        run(&mut i, "(and (memq test--b lsp--buffer-clients) t)"),
+        "nil"
+    );
+    assert_eq!(
+        run(&mut i, "(and (memq test--a lsp--buffer-clients) t)"),
+        "t",
+        "the still-live client must be untouched"
+    );
+    assert_eq!(
+        run(&mut i, "(lsp--client-synced-tick test--b)"),
+        "nil",
+        "the dead client's own watermark entry must be gone too"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--a))");
+}
+
+// ============================================================
+// M95: five more methods (definition, references, documentSymbol,
+// rename, documentHighlight) route via `lsp--preferred-role-client',
+// which prefers a capable SECONDARY over the primary -- the opposite
+// tie-break from `lsp--capable-client''s own default (still exactly
+// right for completion/hover, and everything else not listed in
+// `lsp-request-preferred-role-alist'). Same stub-client technique as
+// the M94 completion/hover routing tests above: `:conn nil' clients,
+// since routing only reads `lsp--client-capabilities'/
+// `lsp--client-command', never a real transport.
+// ============================================================
+
+/// (METHOD . CAPABILITY-KEY) for each of the five M95 methods, and the
+/// elisp expression that triggers it -- shared by every test below so
+/// the five don't have to be typed out five times each.
+fn m95_methods() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "textDocument/definition",
+            "definitionProvider",
+            "(lsp-definition-at-point)",
+        ),
+        (
+            "textDocument/references",
+            "referencesProvider",
+            "(lsp-references-at-point)",
+        ),
+        (
+            "textDocument/documentSymbol",
+            "documentSymbolProvider",
+            "(lsp-next-symbol)",
+        ),
+        (
+            "textDocument/documentHighlight",
+            "documentHighlightProvider",
+            "(lsp-highlight-at-point)",
+        ),
+    ]
+}
+
+/// Common buffer + primary/secondary setup for the M95 routing tests:
+/// a real file visited, PRIMARY (command "verible") first in
+/// `lsp--buffer-clients', SECONDARY (command "slang") second -- same
+/// shape as `completion_routes_to_a_capable_secondary...' above.
+/// PRIMARY_CAPS/SECONDARY_CAPS are elisp expressions for each client's
+/// `:capabilities' (typically built with `caps_with').
+fn m95_setup(i: &mut Interp, tag: &str, primary_caps: &str, secondary_caps: &str) {
+    let dir = scratch_dir(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        i,
+        &format!(
+            "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+               :capabilities {}))",
+            primary_caps
+        ),
+    );
+    ok(
+        i,
+        &format!(
+            "(setq test--secondary (make-lsp--client :conn nil :command \"slang\" \
+               :capabilities {}))",
+            secondary_caps
+        ),
+    );
+    ok(i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+}
+
+fn m95_stub_request_capture(i: &mut Interp) {
+    ok(i, "(setq test--captured-client nil)");
+    ok(i, "(setq test--captured-method nil)");
+    ok(
+        i,
+        "(fset 'lsp-request-async (lambda (client method params callback) \
+           (setq test--captured-client client) \
+           (setq test--captured-method method) 1))",
+    );
+}
+
+#[test]
+fn four_of_the_five_route_to_a_capable_secondary_over_the_primary() {
+    // Test 1: primary + capable secondary attached -> secondary wins,
+    // for every one of the five methods.
+    for (method, key, trigger) in m95_methods() {
+        let mut i = setup();
+        m95_setup(
+            &mut i,
+            &format!("m95_secondary_wins_{}", key),
+            "(make-hash-table)",
+            &caps_with(key),
+        );
+        m95_stub_request_capture(&mut i);
+        // rename reads a new name via `read-string' before sending.
+        if method == "textDocument/rename" {
+            ok(
+                &mut i,
+                "(fset 'read-string (lambda (prompt callback &optional initial) \
+                   (funcall callback \"bar\")))",
+            );
+        }
+        ok(&mut i, trigger);
+        assert_eq!(
+            run(&mut i, "(eq test--captured-client test--secondary)"),
+            "t",
+            "{method}: must have routed to the capable secondary, not the primary"
+        );
+        assert_eq!(
+            run(&mut i, "test--captured-method"),
+            format!("{:?}", method),
+            "{method}: sanity check that this call site really sends the method \
+             it is paired with in `m95_methods'"
+        );
+    }
+}
+
+#[test]
+fn rename_routes_to_a_capable_secondary_over_the_primary() {
+    // `lsp-rename' isn't in `m95_methods' (it needs `read-string'
+    // stubbed before the request even goes out) -- covered on its own
+    // here instead, same shape as the loop above.
+    let mut i = setup();
+    m95_setup(
+        &mut i,
+        "m95_secondary_wins_rename",
+        "(make-hash-table)",
+        &caps_with("renameProvider"),
+    );
+    m95_stub_request_capture(&mut i);
+    ok(
+        &mut i,
+        "(fset 'read-string (lambda (prompt callback &optional initial) \
+           (funcall callback \"bar\")))",
+    );
+    ok(&mut i, "(lsp-rename)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t"
+    );
+    assert_eq!(
+        run(&mut i, "test--captured-method"),
+        "\"textDocument/rename\""
+    );
+}
+
+#[test]
+fn four_of_the_five_still_go_to_a_single_primary_exactly_as_before() {
+    // Test 2: the single-server case every OTHER language is in (a
+    // Rust buffer only ever has rust-analyzer, and it is the primary)
+    // -- must be indistinguishable from before this milestone. No
+    // secondary attached at all.
+    for (method, _key, trigger) in m95_methods() {
+        let mut i = setup();
+        let dir = scratch_dir(&format!("m95_single_primary_{}", method.replace('/', "_")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+        // No `:capabilities' at all -- the M46 asymmetric-trust default
+        // (unknown capabilities => trusted supported), same as a real
+        // client before its `initialize' reply has been recorded. An
+        // EMPTY hash-table, by contrast, is capabilities KNOWN with the
+        // key ABSENT -- UNSUPPORTED (see `lsp--capability-supported-p'
+        // and the `four_of_the_five_route_to_a_capable_secondary...'
+        // test above, which relies on exactly that to make its primary
+        // incapable on purpose).
+        ok(
+            &mut i,
+            "(setq test--primary (make-lsp--client :conn nil :command \"verible\"))",
+        );
+        ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+        m95_stub_request_capture(&mut i);
+        if method == "textDocument/rename" {
+            ok(
+                &mut i,
+                "(fset 'read-string (lambda (prompt callback &optional initial) \
+                   (funcall callback \"bar\")))",
+            );
+        }
+        ok(&mut i, trigger);
+        assert_eq!(
+            run(&mut i, "(eq test--captured-client test--primary)"),
+            "t",
+            "{method}: a single attached client (no secondary at all) must still \
+             be routed to, exactly as before this milestone"
+        );
+    }
+}
+
+#[test]
+fn rename_still_goes_to_a_single_primary_exactly_as_before() {
+    let mut i = setup();
+    let dir = scratch_dir("m95_single_primary_rename");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    // No `:capabilities' -- trusted supported, see the analogous note in
+    // `four_of_the_five_still_go_to_a_single_primary_exactly_as_before'.
+    ok(
+        &mut i,
+        "(setq test--primary (make-lsp--client :conn nil :command \"verible\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    m95_stub_request_capture(&mut i);
+    ok(
+        &mut i,
+        "(fset 'read-string (lambda (prompt callback &optional initial) \
+           (funcall callback \"bar\")))",
+    );
+    ok(&mut i, "(lsp-rename)");
+    assert_eq!(run(&mut i, "(eq test--captured-client test--primary)"), "t");
+}
+
+#[test]
+fn a_secondary_not_declaring_one_method_falls_back_to_primary_for_that_method_only() {
+    // Test 3: the secondary declares "referencesProvider" but NOT
+    // "definitionProvider" -- definition must fall back to the
+    // primary, while references still routes to the secondary, in the
+    // SAME buffer with the SAME two clients attached.
+    let mut i = setup();
+    // Primary's own `:capabilities' is `nil' (unknown -> trusted
+    // supported, see the note in
+    // `four_of_the_five_still_go_to_a_single_primary_exactly_as_before')
+    // so this test genuinely exercises "the secondary lacks the key,
+    // fall back to a CAPABLE primary" rather than "neither is capable".
+    m95_setup(
+        &mut i,
+        "m95_partial_capability",
+        "nil",
+        &caps_with("referencesProvider"),
+    );
+    m95_stub_request_capture(&mut i);
+
+    ok(&mut i, "(lsp-definition-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--primary)"),
+        "t",
+        "definition: secondary doesn't declare definitionProvider, must fall back \
+         to the primary"
+    );
+
+    m95_stub_request_capture(&mut i);
+    ok(&mut i, "(lsp-references-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "references: secondary DOES declare referencesProvider, must still win"
+    );
+}
+
+#[test]
+fn a_dead_secondary_falls_back_to_the_primary() {
+    // Test 4: both clients are real (`lsp-connect'-produced) so
+    // `lsp--client-conn-live-p' can actually observe the secondary as
+    // dead, rather than trusting a stub `:conn nil' client the way the
+    // other tests here do.
+    let mut i = setup();
+    let dir = scratch_dir("m95_dead_secondary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--primary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        &format!(
+            "(setf (lsp--client-capabilities test--primary) {})",
+            caps_with("definitionProvider")
+        ),
+    );
+    ok(&mut i, "(setq test--secondary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        &format!(
+            "(setf (lsp--client-capabilities test--secondary) {})",
+            caps_with("definitionProvider")
+        ),
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+
+    // Sanity: while both are alive, the secondary wins.
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (lsp--preferred-role-client \"textDocument/definition\" \
+             \"definitionProvider\") test--secondary)"
+        ),
+        "t",
+        "sanity: with both alive, the secondary must win"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--secondary))");
+
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (lsp--preferred-role-client \"textDocument/definition\" \
+             \"definitionProvider\") test--primary)"
+        ),
+        "t",
+        "the now-dead secondary must not be picked -- falls back to the primary"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary))");
+}
+
+#[test]
+fn formatting_still_goes_to_the_primary_even_though_it_is_not_in_the_preference_table() {
+    // Test 5: the guard that M95 did not quietly widen the routing
+    // table beyond the five named methods -- formatting keeps reading
+    // `lsp--buffer-client' directly (via `lsp--live-buffer-client'),
+    // unaffected by `lsp-request-preferred-role-alist' having no entry
+    // for it, exactly as `formatting_still_goes_to_the_primary_when_a_
+    // secondary_is_also_attached' (M94, above) already covers for
+    // `lsp--capable-client'. This test instead asserts directly against
+    // the new M95 table and selector, so a future edit that
+    // accidentally adds "documentFormattingProvider" to the preference
+    // alist is caught here rather than only by the older M94 test.
+    assert_eq!(
+        {
+            let mut i = setup();
+            run(
+                &mut i,
+                "(assoc \"textDocument/formatting\" lsp-request-preferred-role-alist)",
+            )
+        },
+        "nil",
+        "formatting must have no entry in the M95 preference table at all"
+    );
+
+    let mut i = setup();
+    m95_setup(
+        &mut i,
+        "m95_formatting_guard",
+        &caps_with("documentFormattingProvider"),
+        &caps_with("documentFormattingProvider"),
+    );
+    m95_stub_request_capture(&mut i);
+    ok(&mut i, "(lsp-format-buffer)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--primary)"),
+        "t",
+        "formatting must still go to the primary even with a capable secondary \
+         attached"
+    );
+}
+
+#[test]
+fn single_client_missing_one_capability_key_still_routes_there_ungated() {
+    // Reviewer BB1: before M95, all five of these call sites read
+    // `lsp--live-buffer-client' directly, UNGATED -- a single attached
+    // client answered every one of these five requests regardless of
+    // what its own `initialize' reply declared. The fallback branch of
+    // `lsp--preferred-role-client' must reproduce that exactly, so a
+    // real capabilities hash that happens to omit KEY must not turn
+    // into "No LSP server connected in this buffer" -- a server IS
+    // connected, it just didn't declare that one key. Only the
+    // SECONDARY's preference has to be earned via
+    // `lsp--capability-supported-p'; the primary fallback must not be.
+    for (method, key, trigger) in m95_methods() {
+        let mut i = setup();
+        let dir = scratch_dir(&format!("m95_bb1_ungated_{}", method.replace('/', "_")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+        // A REAL capabilities hash-table that simply does not mention
+        // KEY -- capabilities-known-but-key-absent, `lsp--capability-
+        // supported-p''s UNSUPPORTED case, deliberately (not `nil',
+        // which every other single-client test in this file uses, and
+        // which lands on the trusted-supported branch instead -- that
+        // is exactly why none of them could see this regression).
+        ok(
+            &mut i,
+            "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+               :capabilities (let ((h (make-hash-table))) \
+                                (puthash \"someOtherProvider\" t h) h)))",
+        );
+        ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+        m95_stub_request_capture(&mut i);
+        if method == "textDocument/rename" {
+            ok(
+                &mut i,
+                "(fset 'read-string (lambda (prompt callback &optional initial) \
+                   (funcall callback \"bar\")))",
+            );
+        }
+        ok(&mut i, trigger);
+        assert_eq!(
+            run(&mut i, "(eq test--captured-client test--primary)"),
+            "t",
+            "{method} ({key}): a single attached client whose capabilities hash \
+             simply omits this key must still be routed to -- the pre-M95 \
+             call sites never gated on capability at all"
+        );
+    }
+}
+
+#[test]
+fn rename_single_client_missing_capability_key_still_routes_there_ungated() {
+    // Same as `single_client_missing_one_capability_key_still_routes_
+    // there_ungated' above, for `lsp-rename' (not in `m95_methods' --
+    // needs `read-string' stubbed).
+    let mut i = setup();
+    let dir = scratch_dir("m95_bb1_ungated_rename");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        "(setq test--primary (make-lsp--client :conn nil :command \"verible\" \
+           :capabilities (let ((h (make-hash-table))) \
+                            (puthash \"someOtherProvider\" t h) h)))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    m95_stub_request_capture(&mut i);
+    ok(
+        &mut i,
+        "(fset 'read-string (lambda (prompt callback &optional initial) \
+           (funcall callback \"bar\")))",
+    );
+    ok(&mut i, "(lsp-rename)");
+    assert_eq!(run(&mut i, "(eq test--captured-client test--primary)"), "t");
+}
+
+#[test]
+fn the_non_primary_exclusion_is_what_picks_the_secondary_when_both_are_capable() {
+    // Reviewer BB3: with the primary ALSO capable of `key', the
+    // `(not (eq client primary))' exclusion inside `lsp--preferred-
+    // role-client''s candidate scan is the ONLY thing standing between
+    // "the secondary wins, per its M95 preference" and "the dolist
+    // walks onto the primary first and stops there instead" -- every
+    // earlier routing test made the primary incapable, so this
+    // exclusion could be deleted without failing any of them.
+    //
+    // `m95_setup' puts the primary FIRST in `lsp--buffer-clients' --
+    // NOT the ordinary attach order (`lsp--attach-current-buffer'
+    // conses onto the front, most-recently-attached first, so in the
+    // real Verilog flow the secondary, attached after the primary,
+    // ends up first and the primary second). That is deliberate here,
+    // not an oversight: in the REAL order, list position alone would
+    // already pick the secondary, and the exclusion's own effect would
+    // never be exercised -- only with the primary ahead of the
+    // secondary in the scan does reaching the secondary anyway prove
+    // the exclusion (rather than mere list order) is what did it.
+    let mut i = setup();
+    m95_setup(
+        &mut i,
+        "m95_bb3_exclusion",
+        &caps_with("definitionProvider"),
+        &caps_with("definitionProvider"),
+    );
+    m95_stub_request_capture(&mut i);
+    ok(&mut i, "(lsp-definition-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "both primary and secondary declare definitionProvider -- the secondary \
+         must still win, per its M95 preference, not the primary the dolist \
+         would reach first without the non-primary exclusion"
+    );
+}
+
+#[test]
+fn goto_symbol_by_name_and_previous_symbol_also_route_to_a_capable_secondary() {
+    // Reviewer BB2: `lsp-goto-symbol-by-name' is a genuinely SEPARATE
+    // call site from the M95 routing tests above (which only ever
+    // drive documentSymbol through `lsp-next-symbol') -- it is the one
+    // piece of new coverage here. `lsp-previous-symbol' is included
+    // too, for its own sake, but it is NOT a second separate call
+    // site: it shares `lsp--goto-symbol' with `lsp-next-symbol', which
+    // the main loop test above already exercises, so this only re-runs
+    // that same shared body under a different entry point rather than
+    // covering new code.
+    for trigger in ["(lsp-previous-symbol)", "(lsp-goto-symbol-by-name)"] {
+        let mut i = setup();
+        m95_setup(
+            &mut i,
+            &format!(
+                "m95_bb2_docsym_{}",
+                trigger.trim_matches(|c| c == '(' || c == ')')
+            ),
+            "(make-hash-table)",
+            &caps_with("documentSymbolProvider"),
+        );
+        m95_stub_request_capture(&mut i);
+        ok(&mut i, trigger);
+        assert_eq!(
+            run(&mut i, "(eq test--captured-client test--secondary)"),
+            "t",
+            "{trigger} must route documentSymbol to the capable secondary too"
+        );
+        assert_eq!(
+            run(&mut i, "test--captured-method"),
+            "\"textDocument/documentSymbol\""
+        );
+    }
+}
+
+#[test]
+fn highlight_clear_and_idle_tick_treat_a_live_capable_secondary_as_connected() {
+    // Reviewer BB2: `lsp-highlight-clear' and `lsp--idle-highlight-tick'
+    // don't send a request themselves, so they're untested by the
+    // request-capture technique the other M95 tests use -- but M95
+    // routed their own liveness checks through `lsp--preferred-role-
+    // client' too (see their docstrings' M95 notes), so a DEAD primary
+    // with a LIVE, capable secondary attached must still count as
+    // "connected" for both. Both real `lsp-connect'-produced clients
+    // (same technique as `a_dead_secondary_falls_back_to_the_primary'),
+    // so the primary's death is genuinely observable.
+    let mut i = setup();
+    let dir = scratch_dir("m95_bb2_highlight_dead_primary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--primary (lsp-connect \"cat\"))");
+    ok(&mut i, "(setq test--secondary (lsp-connect \"cat\"))");
+    ok(
+        &mut i,
+        &format!(
+            "(setf (lsp--client-capabilities test--secondary) {})",
+            caps_with("documentHighlightProvider")
+        ),
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary test--secondary))",
+    );
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary))");
+
+    // `lsp-highlight-clear': records `lsp--idle-highlight-last-point'
+    // only when "connected" -- must fire with the dead primary but a
+    // live, capable secondary.
+    ok(&mut i, "(goto-char 3)");
+    ok(&mut i, "(setq-local lsp--idle-highlight-last-point nil)");
+    ok(&mut i, "(lsp-highlight-clear)");
+    assert_eq!(
+        run(&mut i, "lsp--idle-highlight-last-point"),
+        "3",
+        "lsp-highlight-clear must treat a live, capable secondary as connected \
+         even though the primary is dead"
+    );
+
+    // `lsp--idle-highlight-tick': must still fire a request (routed to
+    // the live secondary) under the same dead-primary condition.
+    ok(&mut i, "(setq-local lsp--idle-highlight-last-point nil)");
+    m95_stub_request_capture(&mut i);
+    ok(&mut i, "(lsp--idle-highlight-tick 300)"); // default delay is 300
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "lsp--idle-highlight-tick must have fired, routed to the live secondary, \
+         even though the primary is dead"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--secondary))");
+}
+
+#[test]
+fn a_lone_secondary_in_an_empty_primary_slot_answers_the_five_but_not_formatting() {
+    // Reviewer CC1: the "a single attached client behaves identically
+    // to before M95" claim repeated across the M95 docstrings only
+    // holds when that one client occupies the PRIMARY slot. It does
+    // NOT hold when the sole attached client is a SECONDARY sitting in
+    // an EMPTY primary slot -- exactly the state M94's own Z2 self-heal
+    // produces (see `primary_slot_self_heals_after_dying_while_a_
+    // secondary_stays_attached' above): the primary died, and a client
+    // whose `command' doesn't match the mode's primary table entry
+    // joined `lsp--buffer-clients' without ever taking the now-empty
+    // slot. There `lsp--buffer-client' is nil, so `(not (eq client
+    // primary))' in `lsp--preferred-role-client''s candidate scan is
+    // vacuously true for every candidate, and a live, capable lone
+    // secondary answers -- where, before M95, these five methods read
+    // `lsp--buffer-client' raw, got nil, and refused. This is an
+    // IMPROVEMENT, not a regression, and it is kept rather than
+    // special-cased away (see that function's own M95 docstring note)
+    // -- but nothing before this test pinned it in either direction.
+    //
+    // `lsp-format-buffer' still refuses in this exact state: formatting
+    // is untouched by M95 and still reads `lsp--buffer-client' directly
+    // -- this is the other half of the claim, that M95 did not quietly
+    // extend the improvement to the methods it left alone.
+    let mut i = setup();
+    let dir = scratch_dir("m95_cc1_lone_secondary_empty_primary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--secondary (make-lsp--client :conn nil :command \"slang\" \
+               :capabilities {}))",
+            caps_with("definitionProvider")
+        ),
+    );
+    // No `test--primary' at all -- the primary slot is genuinely empty
+    // (`lsp--buffer-client' nil), not merely occupied by an incapable
+    // client, matching the Z2 self-heal state exactly.
+    ok(&mut i, "(setq-local lsp--buffer-client nil)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--secondary))",
+    );
+
+    m95_stub_request_capture(&mut i);
+    ok(&mut i, "(lsp-definition-at-point)");
+    assert_eq!(
+        run(&mut i, "(eq test--captured-client test--secondary)"),
+        "t",
+        "a lone secondary in an empty primary slot must answer definition -- an \
+         improvement over the pre-M95 refusal, not a regression"
+    );
+
+    // Formatting is unaffected -- still reads `lsp--buffer-client'
+    // directly, still nil, still refuses exactly as before M95.
+    assert_eq!(
+        run(&mut i, "(lsp-format-buffer)"),
+        "\"No LSP server connected in this buffer (M-x lsp first)\"",
+        "formatting must still refuse in this exact state -- M95 did not widen \
+         its own improvement onto a method it left alone"
+    );
 }

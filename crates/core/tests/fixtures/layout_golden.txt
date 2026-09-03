@@ -3136,3 +3136,313 @@ runs=22
   run row=9 col=0 cols=23 src=none style=[fg=Some((154, 163, 176)) bg=Some((25, 27, 32))] text="Theme: dark            "
   run row=9 col=23 cols=1 src=none style=[default] text=" "
 
+=== inline_diagnostics ===
+cols=40 rows=16
+cursor=(9, 12)
+windows=1
+  win_id=0 row=0 col=0 rows=15 cols=40 gutter_cols=4 mode_line_row=14
+row 000: " 1● line one                            "
+  style r=0 c=0: fg=Some((100, 108, 125))
+  style r=0 c=1: fg=Some((100, 108, 125))
+  style r=0 c=2: fg=Some((240, 108, 108))
+row 001: "      ▏ unexpected token                "
+  style r=1 c=0: fg=Some((100, 108, 125))
+  style r=1 c=1: fg=Some((100, 108, 125))
+  style r=1 c=2: fg=Some((100, 108, 125))
+  style r=1 c=4: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=5: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=6: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=7: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=8: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=9: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=10: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=11: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=12: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=13: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=14: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=15: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=16: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=17: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=18: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=19: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=20: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=21: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=22: fg=Some((240, 108, 108)) italic=true
+  style r=1 c=23: fg=Some((240, 108, 108)) italic=true
+row 002: " 2  line two                            "
+  style r=2 c=0: fg=Some((100, 108, 125))
+  style r=2 c=1: fg=Some((100, 108, 125))
+row 003: " 3● line three                          "
+  style r=3 c=0: fg=Some((100, 108, 125))
+  style r=3 c=1: fg=Some((100, 108, 125))
+  style r=3 c=2: fg=Some((240, 108, 108))
+row 004: "      ▏ first issue                     "
+  style r=4 c=0: fg=Some((100, 108, 125))
+  style r=4 c=1: fg=Some((100, 108, 125))
+  style r=4 c=2: fg=Some((100, 108, 125))
+  style r=4 c=4: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=5: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=6: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=7: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=8: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=9: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=10: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=11: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=12: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=13: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=14: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=15: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=16: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=17: fg=Some((240, 108, 108)) italic=true
+  style r=4 c=18: fg=Some((240, 108, 108)) italic=true
+row 005: "      ▏ second issue                    "
+  style r=5 c=0: fg=Some((100, 108, 125))
+  style r=5 c=1: fg=Some((100, 108, 125))
+  style r=5 c=2: fg=Some((100, 108, 125))
+  style r=5 c=4: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=5: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=6: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=7: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=8: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=9: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=10: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=11: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=12: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=13: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=14: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=15: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=16: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=17: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=18: fg=Some((229, 181, 103)) italic=true
+  style r=5 c=19: fg=Some((229, 181, 103)) italic=true
+row 006: " 4  line four                           "
+  style r=6 c=0: fg=Some((100, 108, 125))
+  style r=6 c=1: fg=Some((100, 108, 125))
+row 007: " 5● line five                           "
+  style r=7 c=0: fg=Some((100, 108, 125))
+  style r=7 c=1: fg=Some((100, 108, 125))
+  style r=7 c=2: fg=Some((229, 181, 103))
+row 008: "      ▏ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  style r=8 c=0: fg=Some((100, 108, 125))
+  style r=8 c=1: fg=Some((100, 108, 125))
+  style r=8 c=2: fg=Some((100, 108, 125))
+  style r=8 c=4: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=5: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=6: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=7: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=8: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=9: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=10: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=11: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=12: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=13: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=14: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=15: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=16: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=17: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=18: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=19: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=20: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=21: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=22: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=23: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=24: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=25: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=26: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=27: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=28: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=29: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=30: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=31: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=32: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=33: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=34: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=35: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=36: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=37: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=38: fg=Some((229, 181, 103)) italic=true
+  style r=8 c=39: fg=Some((229, 181, 103)) italic=true
+row 009: " 6  line six                            "
+  style r=9 c=0: fg=Some((152, 161, 176)) bg=Some((32, 35, 42))
+  style r=9 c=1: fg=Some((152, 161, 176)) bg=Some((32, 35, 42))
+  style r=9 c=2: bg=Some((32, 35, 42))
+  style r=9 c=3: bg=Some((32, 35, 42))
+  style r=9 c=4: bg=Some((32, 35, 42))
+  style r=9 c=5: bg=Some((32, 35, 42))
+  style r=9 c=6: bg=Some((32, 35, 42))
+  style r=9 c=7: bg=Some((32, 35, 42))
+  style r=9 c=8: bg=Some((32, 35, 42))
+  style r=9 c=9: bg=Some((32, 35, 42))
+  style r=9 c=10: bg=Some((32, 35, 42))
+  style r=9 c=11: bg=Some((32, 35, 42))
+  style r=9 c=12: bg=Some((32, 35, 42))
+  style r=9 c=13: bg=Some((32, 35, 42))
+  style r=9 c=14: bg=Some((32, 35, 42))
+  style r=9 c=15: bg=Some((32, 35, 42))
+  style r=9 c=16: bg=Some((32, 35, 42))
+  style r=9 c=17: bg=Some((32, 35, 42))
+  style r=9 c=18: bg=Some((32, 35, 42))
+  style r=9 c=19: bg=Some((32, 35, 42))
+  style r=9 c=20: bg=Some((32, 35, 42))
+  style r=9 c=21: bg=Some((32, 35, 42))
+  style r=9 c=22: bg=Some((32, 35, 42))
+  style r=9 c=23: bg=Some((32, 35, 42))
+  style r=9 c=24: bg=Some((32, 35, 42))
+  style r=9 c=25: bg=Some((32, 35, 42))
+  style r=9 c=26: bg=Some((32, 35, 42))
+  style r=9 c=27: bg=Some((32, 35, 42))
+  style r=9 c=28: bg=Some((32, 35, 42))
+  style r=9 c=29: bg=Some((32, 35, 42))
+  style r=9 c=30: bg=Some((32, 35, 42))
+  style r=9 c=31: bg=Some((32, 35, 42))
+  style r=9 c=32: bg=Some((32, 35, 42))
+  style r=9 c=33: bg=Some((32, 35, 42))
+  style r=9 c=34: bg=Some((32, 35, 42))
+  style r=9 c=35: bg=Some((32, 35, 42))
+  style r=9 c=36: bg=Some((32, 35, 42))
+  style r=9 c=37: bg=Some((32, 35, 42))
+  style r=9 c=38: bg=Some((32, 35, 42))
+  style r=9 c=39: bg=Some((32, 35, 42))
+row 010: "                                        "
+row 011: "                                        "
+row 012: "                                        "
+row 013: "                                        "
+row 014: " *scratch* *  Fundamental       !3  L6:8"
+  style r=14 c=0: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=1: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=2: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=3: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=4: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=5: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=6: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=7: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=8: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=9: fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true
+  style r=14 c=10: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=11: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=12: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=13: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=14: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=15: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=16: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=17: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=18: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=19: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=20: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=21: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=22: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=23: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=24: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=25: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=26: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=27: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=28: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=29: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=30: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=31: fg=Some((197, 202, 211)) bg=Some((38, 43, 52))
+  style r=14 c=32: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=33: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=34: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=35: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=36: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=37: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=38: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+  style r=14 c=39: fg=Some((229, 181, 103)) bg=Some((38, 43, 52))
+row 015: "Theme: dark                             "
+  style r=15 c=0: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=1: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=2: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=3: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=4: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=5: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=6: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=7: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=8: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=9: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=10: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=11: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=12: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=13: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=14: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=15: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=16: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=17: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=18: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=19: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=20: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=21: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=22: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=23: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=24: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=25: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=26: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=27: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=28: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=29: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=30: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=31: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=32: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=33: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=34: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=35: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=36: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=37: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+  style r=15 c=38: fg=Some((154, 163, 176)) bg=Some((25, 27, 32))
+runs=51
+  run row=0 col=4 cols=8 src=0..8 style=[default] text="line one"
+  run row=2 col=4 cols=8 src=9..17 style=[default] text="line two"
+  run row=3 col=4 cols=10 src=18..28 style=[default] text="line three"
+  run row=6 col=4 cols=9 src=29..38 style=[default] text="line four"
+  run row=7 col=4 cols=9 src=39..48 style=[default] text="line five"
+  run row=9 col=4 cols=8 src=49..57 style=[default] text="line six"
+  run row=0 col=0 cols=2 src=none style=[fg=Some((100, 108, 125))] text=" 1"
+  run row=0 col=2 cols=1 src=none style=[fg=Some((240, 108, 108))] text="●"
+  run row=0 col=3 cols=1 src=none style=[default] text=" "
+  run row=0 col=12 cols=28 src=none style=[default] text="                            "
+  run row=1 col=0 cols=3 src=none style=[fg=Some((100, 108, 125))] text="   "
+  run row=1 col=3 cols=1 src=none style=[default] text=" "
+  run row=1 col=4 cols=20 src=none style=[fg=Some((240, 108, 108)) italic=true] text="  ▏ unexpected token"
+  run row=1 col=24 cols=16 src=none style=[default] text="                "
+  run row=2 col=0 cols=2 src=none style=[fg=Some((100, 108, 125))] text=" 2"
+  run row=2 col=2 cols=2 src=none style=[default] text="  "
+  run row=2 col=12 cols=28 src=none style=[default] text="                            "
+  run row=3 col=0 cols=2 src=none style=[fg=Some((100, 108, 125))] text=" 3"
+  run row=3 col=2 cols=1 src=none style=[fg=Some((240, 108, 108))] text="●"
+  run row=3 col=3 cols=1 src=none style=[default] text=" "
+  run row=3 col=14 cols=26 src=none style=[default] text="                          "
+  run row=4 col=0 cols=3 src=none style=[fg=Some((100, 108, 125))] text="   "
+  run row=4 col=3 cols=1 src=none style=[default] text=" "
+  run row=4 col=4 cols=15 src=none style=[fg=Some((240, 108, 108)) italic=true] text="  ▏ first issue"
+  run row=4 col=19 cols=21 src=none style=[default] text="                     "
+  run row=5 col=0 cols=3 src=none style=[fg=Some((100, 108, 125))] text="   "
+  run row=5 col=3 cols=1 src=none style=[default] text=" "
+  run row=5 col=4 cols=16 src=none style=[fg=Some((229, 181, 103)) italic=true] text="  ▏ second issue"
+  run row=5 col=20 cols=20 src=none style=[default] text="                    "
+  run row=6 col=0 cols=2 src=none style=[fg=Some((100, 108, 125))] text=" 4"
+  run row=6 col=2 cols=2 src=none style=[default] text="  "
+  run row=6 col=13 cols=27 src=none style=[default] text="                           "
+  run row=7 col=0 cols=2 src=none style=[fg=Some((100, 108, 125))] text=" 5"
+  run row=7 col=2 cols=1 src=none style=[fg=Some((229, 181, 103))] text="●"
+  run row=7 col=3 cols=1 src=none style=[default] text=" "
+  run row=7 col=13 cols=27 src=none style=[default] text="                           "
+  run row=8 col=0 cols=3 src=none style=[fg=Some((100, 108, 125))] text="   "
+  run row=8 col=3 cols=1 src=none style=[default] text=" "
+  run row=8 col=4 cols=36 src=none style=[fg=Some((229, 181, 103)) italic=true] text="  ▏ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  run row=9 col=0 cols=2 src=none style=[fg=Some((152, 161, 176)) bg=Some((32, 35, 42))] text=" 6"
+  run row=9 col=2 cols=2 src=none style=[bg=Some((32, 35, 42))] text="  "
+  run row=9 col=12 cols=28 src=none style=[bg=Some((32, 35, 42))] text="                            "
+  run row=10 col=0 cols=40 src=none style=[default] text="                                        "
+  run row=11 col=0 cols=40 src=none style=[default] text="                                        "
+  run row=12 col=0 cols=40 src=none style=[default] text="                                        "
+  run row=13 col=0 cols=40 src=none style=[default] text="                                        "
+  run row=14 col=0 cols=10 src=none style=[fg=Some((197, 202, 211)) bg=Some((38, 43, 52)) bold=true] text=" *scratch*"
+  run row=14 col=10 cols=22 src=none style=[fg=Some((197, 202, 211)) bg=Some((38, 43, 52))] text=" *  Fundamental       "
+  run row=14 col=32 cols=8 src=none style=[fg=Some((229, 181, 103)) bg=Some((38, 43, 52))] text="!3  L6:8"
+  run row=15 col=0 cols=39 src=none style=[fg=Some((154, 163, 176)) bg=Some((25, 27, 32))] text="Theme: dark                            "
+  run row=15 col=39 cols=1 src=none style=[default] text=" "
+row_meta=4
+  row_meta r=1 scale=75 kind=Block
+  row_meta r=4 scale=75 kind=Block
+  row_meta r=5 scale=75 kind=Block
+  row_meta r=8 scale=75 kind=Block
+

@@ -159,6 +159,11 @@ fn find_file_in_same_project_auto_attaches_the_new_buffer() {
 // 2. No connection ever started: auto-attach never runs `lsp' machinery.
 // ============================================================
 
+// M88: this only proves `find-file` itself never spawns -- `lsp--autostart-
+// tick` (the idle-tick step M88 adds) is the thing that actually spawns a
+// server now, and it is gated on `lsp--frontend-started`, which nothing in
+// this test file's `setup()` ever sets. So read this test's name narrowly:
+// "find-file never spawns", not "the editor never spawns".
 #[test]
 fn find_file_with_no_prior_connection_touches_nothing() {
     let mut i = setup();

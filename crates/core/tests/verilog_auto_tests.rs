@@ -310,6 +310,73 @@ fn autoinst_multiple_instances_same_module_and_a_different_module() {
     );
 }
 
+/// M97 Part 2: AUTOINST against an INTERFACE (not a module) instantiation
+/// target, exercising the ANSI-header path specifically -- before this
+/// milestone, `verilog-auto--ports-of-module''s literal `(string= ...
+/// "module_ansi_header")' check failed on an `interface_ansi_header' and
+/// silently took the NON-ANSI branch instead, which would have produced
+/// wrong (here, empty) results rather than signaling an error. Real-parse
+/// dump-verified (M97 recon): an interface's own ANSI header port list
+/// (`interface axi_if (input logic clk, ...);') has the identical
+/// `list_of_port_declarations'/`ansi_port_declaration' shape a module's
+/// does.
+#[test]
+fn autoinst_against_an_interface_ansi_header_target() {
+    let (mut i, _ed) = setup();
+    let inst_line = "  axi_if u_if (/*AUTOINST*/);\n";
+    let indent = " ".repeat("  axi_if u_if (".len());
+    insert_src(
+        &mut i,
+        &format!(
+            "interface axi_if (\n  input  logic clk,\n  input  logic rst_n,\n  output logic valid\n);\nendinterface\n\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire valid;\n{}endmodule\n",
+            inst_line
+        ),
+    );
+    verilog_auto(&mut i);
+    let expected_block = format!(
+        "/*AUTOINST*/\n{indent}// Outputs\n{c1},\n{indent}// Inputs\n{c2},\n{c3}",
+        indent = indent,
+        c1 = conn(&indent, "valid", "valid"),
+        c2 = conn(&indent, "clk", "clk"),
+        c3 = conn(&indent, "rst_n", "rst_n"),
+    );
+    let text = bs(&mut i);
+    assert!(
+        text.contains(&expected_block),
+        "expected block:\n{}\n\ngot buffer:\n{}",
+        expected_block,
+        text
+    );
+}
+
+/// M97 fix round (FF3): `verilog-auto--top-level-modules''s own docstring
+/// claims document order is preserved across BOTH node kinds by a single
+/// tree walk (`verilog-auto--find-all-of-types'), not two separate
+/// single-type walks concatenated. A buffer of only-modules or only-
+/// interfaces can't distinguish the two implementations (their outputs
+/// are identical either way) -- only an INTERLEAVED mix (module,
+/// interface, module, interface) tells them apart: a single walk yields
+/// them in that same interleaved order, while two concatenated walks
+/// would group all modules first, then all interfaces
+/// (`m_a', `m_b', `i_a', `i_b'), a different order entirely.
+#[test]
+fn top_level_modules_preserves_document_order_across_interleaved_modules_and_interfaces() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module m_a;\nendmodule\n\ninterface i_a;\nendinterface\n\nmodule m_b;\nendmodule\n\ninterface i_b;\nendinterface\n",
+    );
+    let names = ok(
+        &mut i,
+        "(mapcar #'verilog-auto--module-name (verilog-auto--top-level-modules (verilog-auto--parse-current-buffer)))",
+    );
+    assert_eq!(
+        names, "(\"m_a\" \"i_a\" \"m_b\" \"i_b\")",
+        "single-walk document order, not module-kind-then-interface-kind: {}",
+        names
+    );
+}
+
 // ===================== AUTOWIRE =====================
 
 #[test]
@@ -458,6 +525,73 @@ fn autowire_reads_autoinst_generated_connections() {
         text
     );
     assert!(msg.contains("1 wires"), "echo: {}", msg);
+}
+
+/// M97 fix round (FF1): `/*AUTOWIRE*/' directly inside an INTERFACE body
+/// used to crash `verilog-auto' outright (`Wrong type argument:
+/// treesit-node-p, nil') -- `verilog-auto--enclosing-of-type' only ever
+/// matched `module_declaration', so the enclosing-declaration lookup came
+/// back nil for an interface and every downstream helper
+/// (`verilog-auto--declared-names', `--find-all-of-type') called
+/// `treesit-node-child-count' on that nil unchecked. An interface with no
+/// instantiations of its own has no output-port candidates for AUTOWIRE
+/// to find, so the correct behavior is a clean no-op, not a crash.
+#[test]
+fn autowire_inside_an_interface_is_a_clean_no_op_not_a_crash() {
+    let (mut i, _ed) = setup();
+    insert_src(&mut i, "interface foo;\n  /*AUTOWIRE*/\nendinterface\n");
+    let msg = verilog_auto(&mut i);
+    assert!(msg.contains("0 wires"), "echo: {}", msg);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("/*AUTOWIRE*/\nendinterface"),
+        "nothing to add -- no Beginning/End markers at all: {}",
+        text
+    );
+    assert!(!text.contains("Beginning of automatic"));
+}
+
+/// M97 fix round (FF1): blast-radius check for the crash above, in a
+/// buffer that mixes ordinary modules with a crashing interface.
+/// `verilog-auto--expand-all-autowire' processes AUTOWIRE sites in
+/// REVERSE document order (`sort' with `>' on each site's own start
+/// position -- see that function's own docstring for why: one module,
+/// one AUTOWIRE, GNU convention), so before this fix, a crash on the
+/// INTERFACE's comment (`foo', positioned between `top' and `bottom')
+/// stopped the `dolist' partway through: `bottom' (processed first,
+/// since it is the LAST site in the buffer) got its AUTOWIRE fully
+/// expanded, while `top' (processed after the crash point) was left with
+/// its own AUTOWIRE comment bare and unexpanded -- a partial expansion,
+/// not a clean all-or-nothing failure. AUTOINST is a separate, EARLIER
+/// pass (unaffected by the AUTOWIRE crash) and had already fully expanded
+/// both instantiations by the time AUTOWIRE ran. Pinned here as the fixed
+/// behavior: every real module's AUTOWIRE now expands, and the interface
+/// site stays a clean no-op, with no partial-expansion asymmetry.
+#[test]
+fn autowire_crash_in_one_interface_does_not_leave_other_sites_partially_expanded() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  sub_mod u1 (/*AUTOINST*/);\n  /*AUTOWIRE*/\nendmodule\n\ninterface foo;\n  /*AUTOWIRE*/\nendinterface\n\nmodule bottom;\n  wire clk;\n  sub_mod u2 (/*AUTOINST*/);\n  /*AUTOWIRE*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    // Both real modules' AUTOWIRE sites expanded (each declares its own
+    // "wire done;" for the AUTOINST-connected but undeclared output).
+    assert_eq!(
+        text.matches("wire done;").count(),
+        2,
+        "both `top' and `bottom' must get their own AUTOWIRE expansion, \
+         with no partial-expansion gap left by the interface's crash: {}",
+        text
+    );
+    // The interface's own site stays untouched -- correct no-op, not a
+    // second, differently-broken failure mode.
+    assert!(
+        text.contains("/*AUTOWIRE*/\nendinterface"),
+        "interface AUTOWIRE site must be a clean no-op: {}",
+        text
+    );
 }
 
 // ===================== AUTOARG =====================
@@ -1900,5 +2034,805 @@ fn autoarg_wrap_width_adds_to_module_line_own_indent() {
         "expected substring:\n{}\ngot:\n{}",
         expected,
         text
+    );
+}
+
+// ===================== AUTO_TEMPLATE (M92) =====================
+//
+// GNU verilog-mode semantics (verilog-mode.el 30.2, read directly rather
+// than guessed -- see crates/core/lisp/verilog-auto.el's own AUTO_TEMPLATE
+// section header): an exact `.NAME (EXPR)' rule always wins over a
+// wildcard rule for the same port; a wildcard's LHS is `^...$'-anchored
+// against the WHOLE port name, and its EXPR's own `\N' backreferences
+// come from that match. Template lookup searches backward from the
+// instantiation first, falling back forward.
+
+const SUB_MOD_TPL: &str = "\
+module sub_mod (
+  input  logic clk,
+  input  logic rst_n,
+  output logic done
+);
+endmodule
+
+";
+
+#[test]
+fn autotemplate_exact_rule_replaces_identity_connection() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(".done"),
+        "done port must still be connected: {}",
+        text
+    );
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "exact rule must replace done's identity connection with `finished': {}",
+        text
+    );
+    assert!(
+        !text.contains(&conn(&indent, "done", "done")),
+        "identity connection for done must not appear once a template rule applies: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_rule_with_backreference() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1),\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    for (name, expr) in [
+        ("clk", "my_clk"),
+        ("rst_n", "my_rst_n"),
+        ("done", "my_done"),
+    ] {
+        assert!(
+            text.contains(&conn(&indent, name, expr)),
+            "wildcard rule must connect {} to {}: {}",
+            name,
+            expr,
+            text
+        );
+    }
+}
+
+#[test]
+fn autotemplate_exact_wins_over_wildcard_for_same_port() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  .\\(.*\\) (my_\\1),\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "exact rule must win over the wildcard for the same port `done': {}",
+        text
+    );
+    assert!(
+        !text.contains(&conn(&indent, "done", "my_done")),
+        "wildcard's own expansion for done must never appear once the exact rule wins: {}",
+        text
+    );
+    assert!(
+        text.contains(&conn(&indent, "clk", "my_clk")),
+        "wildcard rule still applies to ports the exact rule doesn't name: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_no_matching_template_falls_back_to_identity() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* some_other_module AUTO_TEMPLATE (\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "done")),
+        "a template for a DIFFERENT module must not apply -- done falls back to identity: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_rule_naming_an_already_hand_connected_port_stays_excluded() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire done_by_hand;\n  sub_mod u1 (.done(done_by_hand), /*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches(".done(").count(),
+        1,
+        "done must not be regenerated by the template once hand-connected: {}",
+        text
+    );
+    assert!(
+        text.contains(".done(done_by_hand)"),
+        "the user's own hand connection must survive untouched: {}",
+        text
+    );
+    // "(finished)" legitimately appears once, inside the AUTO_TEMPLATE
+    // comment itself (`.done (finished),') -- what must never appear is
+    // a GENERATED, padded connection line using it.
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        !text.contains(&conn(&indent, "done", "finished")),
+        "the template's own EXPR for done must never appear as a generated connection -- the port is already excluded: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_running_verilog_auto_twice_is_byte_identical() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1),\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let after_first = bs(&mut i);
+    verilog_auto(&mut i);
+    let after_second = bs(&mut i);
+    assert_eq!(
+        after_first, after_second,
+        "verilog-auto must be idempotent with a template in play"
+    );
+}
+
+#[test]
+fn autotemplate_comment_survives_delete_auto() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    assert!(bs(&mut i).contains("AUTO_TEMPLATE"));
+    delete_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("AUTO_TEMPLATE"),
+        "verilog-delete-auto must never delete the template comment itself: {}",
+        text
+    );
+    // "(finished)" legitimately survives once inside the AUTO_TEMPLATE
+    // comment itself -- what must be gone is the GENERATED, padded
+    // connection line that used it.
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        !text.contains(&conn(&indent, "done", "finished")),
+        "delete-auto must still strip the generated connection text: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_bare_identifier_becomes_autowire_candidate() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (my_done_wire),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  sub_mod u1 (/*AUTOINST*/);\n  /*AUTOWIRE*/\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire my_done_wire;"),
+        "AUTOWIRE must rescan AUTOINST's own templated output as a bare-identifier candidate: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_backward_lookup_wins_when_templates_appear_both_sides() {
+    let (mut i, _ed) = setup();
+    // A template BEFORE the instantiation applies `finished'; a template
+    // AFTER it (same module name) applies a different EXPR -- the
+    // backward (preceding) one must win.
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  wire done_after;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n\n/* sub_mod AUTO_TEMPLATE (\n  .done (done_after),\n  ); */\n",
+            SUB_MOD_TPL
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "the PRECEDING template must win when both a preceding and a following one match: {}",
+        text
+    );
+    assert!(
+        !text.contains(&conn(&indent, "done", "done_after")),
+        "the following template's own EXPR must not be used when a preceding one exists: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_multi_instance_comma_form_sees_every_instance() {
+    // `sometype u1(...), u2(...);' -- one module_instantiation, two
+    // hierarchical_instance children. AUTOWIRE must consider every
+    // instance's own output connections, not just the first.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module mod_b (\n  output logic ready\n);\nendmodule\n\nmodule top;\n  mod_b u1 (.ready(ready1)), u2 (.ready(ready2));\n  /*AUTOWIRE*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire ready1;"),
+        "the FIRST instance's own output must become an AUTOWIRE candidate: {}",
+        text
+    );
+    assert!(
+        text.contains("wire ready2;"),
+        "the SECOND instance's own output must also become an AUTOWIRE candidate -- this is the M92 fix itself: {}",
+        text
+    );
+}
+
+#[test]
+fn autotemplate_demo_shape_axi4_lite_arbiter_naming_convention() {
+    // Mirrors demo/rtl/top/soc_top.sv's own unexpanded
+    // `axi4_lite_arbiter' instance (see this milestone's own spec): the
+    // submodule's `req_*'/`gnt_*_o' ports need renaming through a
+    // wildcard template to connect to a differently-named parent scope,
+    // exactly the shape identity AUTOINST cannot handle. Built as a
+    // fixture here -- demo/ itself is left untouched per this
+    // milestone's own scope.
+    let (mut i, _ed) = setup();
+    let arbiter = "\
+module axi4_lite_arbiter (
+  input  logic req_valid_i,
+  output logic req_ready_o,
+  input  logic [3:0] req_i,
+  output logic gnt_valid_o,
+  input  logic gnt_ready_i,
+  output logic [3:0] gnt_req_o,
+  output logic [1:0] gnt_idx_o
+);
+endmodule
+
+";
+    let top = "\
+/* axi4_lite_arbiter AUTO_TEMPLATE (
+  .req_\\(.*\\)  (host_req_\\1),
+  .gnt_\\(.*\\)_o (gnt_\\1),
+  ); */
+module soc_top;
+  wire host_req_valid_i;
+  wire host_req_ready_o;
+  wire [3:0] host_req_i;
+  wire gnt_valid;
+  wire gnt_ready_i;
+  wire [3:0] gnt_req;
+  wire [1:0] gnt_idx;
+  axi4_lite_arbiter u_arb (/*AUTOINST*/);
+endmodule
+";
+    insert_src(&mut i, &format!("{}{}", arbiter, top));
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  axi4_lite_arbiter u_arb (".len());
+    for (port, expr) in [
+        ("req_valid_i", "host_req_valid_i"),
+        ("req_ready_o", "host_req_ready_o"),
+        ("req_i", "host_req_i"),
+        ("gnt_valid_o", "gnt_valid"),
+        ("gnt_ready_i", "gnt_ready_i"),
+        ("gnt_req_o", "gnt_req"),
+        ("gnt_idx_o", "gnt_idx"),
+    ] {
+        assert!(
+            text.contains(&conn(&indent, port, expr)),
+            "port {} must connect to {}: {}",
+            port,
+            expr,
+            text
+        );
+    }
+}
+
+// ===================== AUTO_TEMPLATE fix round (M92 S1/S2) =====================
+
+#[test]
+fn autotemplate_exact_rule_with_trailing_line_comment_still_applies() {
+    // GNU's own point-based scanner has an explicit clause for a `//'
+    // end-of-line comment following a rule (`verilog-mode.el' :10184-
+    // :10267) -- a whole-line-anchored regex without the same tolerance
+    // would silently drop the rule instead.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished), // primary output\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "an exact rule followed by a trailing `//' comment must still apply: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a well-formed rule with its own trailing comment must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_rule_with_trailing_line_comment_still_applies() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1), // rename every port\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "my_done")),
+        "a wildcard rule followed by a trailing `//' comment must still apply: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a well-formed wildcard rule with its own trailing comment must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_malformed_rule_line_is_reported_not_silently_dropped() {
+    // A line that matches neither the exact nor the wildcard shape must
+    // be recorded and surfaced in `verilog-auto''s own final message --
+    // never silently discarded (this milestone's whole point is that a
+    // dropped rule must never be invisible).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  totally not a rule\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    // The one well-formed rule alongside the malformed line must still
+    // apply.
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "a well-formed rule elsewhere in the same template must still apply despite a malformed sibling line: {}",
+        text
+    );
+    assert!(
+        msg.contains("not recognized"),
+        "the malformed line must be reported in verilog-auto's own final message: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_standalone_comment_line_inside_body_is_skipped_without_warning() {
+    // A `//'-prefixed line entirely on its own (not trailing a rule) is
+    // tolerated -- must not be reported as a malformed/dropped rule, and
+    // must not interfere with the rules around it.
+    //
+    // M92 fix round X3 (recorded, not chased): this test's own fixture
+    // never reaches `verilog-auto--template-rule-head-re' or
+    // `verilog-auto--template-rule-at' at all -- the `//'-prefix check
+    // in `verilog-auto--parse-template-body' filters the line out
+    // BEFORE either is consulted. It is a real regression guard for
+    // that one skip, but provides no coverage of the X1 balance-scan
+    // parser or the U2/X1 warning path despite living in this same
+    // block of tests.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  // legacy mapping, keep for reference\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "finished")),
+        "a rule following a standalone comment line must still apply: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a standalone `//' comment line inside the template body must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_anchoring_prevents_substring_match() {
+    // The wildcard LHS is anchored `^...$' against the WHOLE port name
+    // (GNU's own behavior, `verilog-mode.el' :10232). Without that
+    // anchoring, a pattern that's semantically just the literal `clk'
+    // (written with a capture group to force the wildcard branch, since
+    // a bare identifier alone is always parsed as an EXACT rule) would
+    // match `clk' as a SUBSTRING inside an unrelated port like
+    // `sysclk_i' too.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  input  logic sysclk_i\n);\nendmodule\n\n/* sub_mod AUTO_TEMPLATE (\n  .\\(clk\\) (buf_\\1),\n  ); */\nmodule top;\n  wire buf_clk;\n  wire sysclk_i;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&conn(&indent, "clk", "buf_clk")),
+        "the port literally named `clk' must match the anchored pattern: {}",
+        text
+    );
+    assert!(
+        text.contains(&conn(&indent, "sysclk_i", "sysclk_i")),
+        "`sysclk_i' merely CONTAINS `clk' as a substring -- with `^...$' anchoring it must stay an identity connection, not `buf_clk': {}",
+        text
+    );
+}
+
+// ===================== AUTO_TEMPLATE fix round 2 (M92 X1/X2/X3) =====================
+
+#[test]
+fn autotemplate_exact_trailing_comment_containing_a_paren_does_not_corrupt_expr() {
+    // M92 fix round X1: `.done (finished), // see (note)' used to
+    // backtrack the greedy `(.*)' capture all the way to the `)' INSIDE
+    // the comment, corrupting EXPR into `finished), // see (note'. A
+    // real parenthetical remark in an RTL comment (`// width = WIDTH
+    // (see spec)') is ordinary, not contrived.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished), // see (note)\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "finished"))),
+        "EXPR must be exactly `finished', not corrupted by the comment's own paren: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a well-formed rule must not be reported as malformed just because its comment has a paren: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_exact_trailing_comment_shaped_like_another_rule_does_not_corrupt_expr() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished), // .other (val)\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "finished"))),
+        "EXPR must be exactly `finished', not corrupted by a comment that merely LOOKS like another rule: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a comment shaped like a rule must not itself be treated as one, nor make the real rule look malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_exact_comment_with_no_separator_before_it_does_not_corrupt_expr() {
+    // No comma/semicolon between the closing `)' and the `//' -- the
+    // balance-scanner's own tail consumption must not require one.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished)// see (note)\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "finished"))),
+        "EXPR must be exactly `finished' even with no separator before the trailing comment: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a rule with no separator before its own trailing comment must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_trailing_comment_containing_a_paren_does_not_corrupt_expr() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1), // see (note)\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "my_done"))),
+        "wildcard EXPR must be exactly `my_done', not corrupted by the comment's own paren: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a well-formed wildcard rule must not be reported as malformed just because its comment has a paren: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_trailing_comment_shaped_like_another_rule_does_not_corrupt_expr() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1), // .other (val)\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "my_done"))),
+        "wildcard EXPR must be exactly `my_done', not corrupted by a comment that merely LOOKS like another rule: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a wildcard rule followed by a rule-shaped comment must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_wildcard_comment_with_no_separator_before_it_does_not_corrupt_expr() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .\\(.*\\) (my_\\1)// see (note)\n  ); */\nmodule top;\n  wire my_clk;\n  wire my_rst_n;\n  wire my_done;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "my_done"))),
+        "wildcard EXPR must be exactly `my_done' even with no separator before its trailing comment: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a wildcard rule with no separator before its own trailing comment must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_expr_with_legitimately_balanced_parens_parses_correctly() {
+    // `.a (foo(bar))' -- EXPR itself legitimately contains a balanced
+    // paren pair. A non-greedy `.*?' fix (rejected -- see this
+    // milestone's own docstring) would get this case wrong the same way
+    // the original greedy `.*' got the trailing-comment case wrong.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (foo(bar)),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "foo(bar)"))),
+        "EXPR must be exactly `foo(bar)', its own balanced parens intact: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "a rule whose EXPR legitimately contains balanced parens must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_two_rules_on_one_line_both_parse() {
+    // M92 fix round X1: this is the reviewer's "free" second finding --
+    // `.a (x), .b (y)' on one physical line used to match as a SINGLE
+    // rule with EXPR captured as `x), .b (y'. Chosen behavior (see
+    // `verilog-auto--template-rule-at's own doc string): both rules
+    // parse correctly, rather than reporting the remainder as
+    // malformed.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished), .clk (my_clk)\n  ); */\nmodule top;\n  wire my_clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "finished"))),
+        "the FIRST rule on the shared line must parse correctly: {}",
+        text
+    );
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "clk", "my_clk"))),
+        "the SECOND rule on the shared line must also parse correctly: {}",
+        text
+    );
+    assert!(
+        !msg.contains("not recognized"),
+        "two well-formed rules sharing one line must not be reported as malformed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_nested_block_comment_truncation_is_reported_not_silent() {
+    // M92 fix round X2: an embedded `/* */' inside the AUTO_TEMPLATE
+    // parens truncates the outer `block_comment' node at the FIRST
+    // `*/' (confirmed by a real parse during the prior fix round), so
+    // `verilog-auto--template-body-text' can never find a balanced
+    // close paren and returns nil. This used to bypass the warning
+    // channel entirely (indistinguishable from "no template at all");
+    // `verilog-auto--find-template' now pushes its own warning in that
+    // case.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  /* inner */\n  .done (finished),\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    // The whole template silently vanishes -- `done' falls back to
+    // identity, exactly the pre-existing (still not fixed) behavior.
+    assert!(
+        text.contains(&format!("{},\n", conn(&indent, "done", "done"))),
+        "the truncated template must fall back to identity, same as before this fix round: {}",
+        text
+    );
+    // What's NEW is that this is no longer silent.
+    assert!(
+        msg.contains("could not be extracted"),
+        "a template comment that was found but whose body couldn't be extracted must now be reported: {}",
+        msg
+    );
+}
+
+#[test]
+fn autotemplate_parse_warnings_reset_across_two_verilog_auto_runs() {
+    // M92 fix round X3: the fresh `(verilog-auto--template-parse-warnings
+    // nil)' binding at the top of `verilog-auto' must not leak a
+    // warning from an earlier run into a LATER, clean run's own
+    // message.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}/* sub_mod AUTO_TEMPLATE (\n  .done (finished),\n  totally not a rule\n  ); */\nmodule top;\n  wire clk;\n  wire rst_n;\n  wire finished;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_TPL
+        ),
+    );
+    let first_msg = verilog_auto(&mut i);
+    assert!(
+        first_msg.contains("not recognized"),
+        "premise: the first run must see the malformed line: {}",
+        first_msg
+    );
+    // Second run over the SAME (now already-expanded) buffer must not
+    // carry the first run's warning forward.
+    let second_msg = verilog_auto(&mut i);
+    assert!(
+        second_msg.contains("not recognized"),
+        "the malformed template comment is still there on the second run too, so it must still be reported: {}",
+        second_msg
+    );
+    // The count must not have grown across the two runs (would indicate
+    // the warning list carried over instead of resetting).
+    assert!(
+        first_msg.contains("1 AUTO_TEMPLATE line(s) not recognized"),
+        "first run must report exactly 1: {}",
+        first_msg
+    );
+    assert!(
+        second_msg.contains("1 AUTO_TEMPLATE line(s) not recognized"),
+        "second run must ALSO report exactly 1, not 2 -- proving the warning list reset between runs: {}",
+        second_msg
     );
 }

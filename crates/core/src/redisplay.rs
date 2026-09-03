@@ -94,6 +94,33 @@ pub struct Grid {
     /// why those need different treatment. The TUI ignores this field
     /// entirely, same as `windows`.
     pub runs: Vec<PaintRun>,
+    /// M87 stage 3: per-row height, a percentage of the frame's base row
+    /// height (`1..=100`, clamped; `100` is a normal row). Length always
+    /// equals `rows`. Additive, same precedent as `windows`/`runs` above
+    /// -- the TUI must not read this field, and every value here is
+    /// `<= 100` on purpose (see this field's design doc, D1 in the M87
+    /// stage 3 spec): the GUI computes its row budget from the *base*
+    /// row height before core renders, so a row taller than 100% would
+    /// overflow the frame the budget was sized for. The corresponding
+    /// "shrink the budget, re-render" iteration is a known, deliberately
+    /// deferred gap -- see `render_window`'s inline-diagnostics block.
+    pub row_scale: Vec<u8>,
+    /// M87 stage 3: per-row kind, parallel to `row_scale` (same length,
+    /// same additive-to-the-TUI precedent). `Block` marks an inline
+    /// diagnostic row: it carries no buffer position (its `PaintRun`s use
+    /// `src: None`, so `buffer_pos_at` already returns `None` for every
+    /// column on it through the existing chrome-row path -- no special
+    /// case needed there) and is never counted as a logical buffer line
+    /// by scrolling.
+    pub row_kind: Vec<RowKind>,
+}
+
+/// See `Grid::row_kind`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowKind {
+    #[default]
+    Text,
+    Block,
 }
 
 /// One contiguous, same-style run of painted screen cells, published
@@ -338,6 +365,8 @@ impl Grid {
             cursor: (0, 0),
             windows: Vec::new(),
             runs: Vec::new(),
+            row_scale: vec![100; rows],
+            row_kind: vec![RowKind::Text; rows],
         }
     }
 
@@ -480,6 +509,22 @@ fn wraps_before(col: usize, w: usize, cols: usize) -> bool {
 /// process-global env vars are a race under parallel test execution
 /// (`complete.rs`'s `abbreviate_home_with` and `panel.rs`'s `place_for`
 /// already use this shape; this follows the same precedent).
+/// The mode line's `LSP` segment state (M88 D7). Three states, not a
+/// bool, because autostart adds a real middle state a user needs to be
+/// able to see: a handshake genuinely in flight, distinct both from "no
+/// connection at all" and from "already attached and answering". The
+/// echo area is documented elsewhere in this file's LSP-adjacent code as
+/// unreliable for this kind of status (`lsp.el`'s own note on why
+/// `find-file-hook`-driven auto-attach never messages), so the mode
+/// line is the one place this has to be visible.
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+enum LspState {
+    #[default]
+    Off,
+    Pending,
+    Attached,
+}
+
 #[derive(Default)]
 struct ModeLineParts<'a> {
     /// `mode-line-prefix` (M28), buffer-local elisp variable — an
@@ -495,7 +540,7 @@ struct ModeLineParts<'a> {
     /// show their directory as part of `title` instead.
     dir: Option<&'a str>,
     home: Option<&'a str>,
-    lsp: bool,
+    lsp: LspState,
     diags: usize,
     line: usize,
     col: usize,
@@ -682,8 +727,13 @@ fn compose_mode_line(p: &ModeLineParts, width: usize) -> ModeLine {
             left_suffix_w += seg_w;
         }
     }
-    if p.lsp {
-        let seg_w = ml_width("LSP  ");
+    let lsp_label = match p.lsp {
+        LspState::Off => None,
+        LspState::Pending => Some("LSP…"),
+        LspState::Attached => Some("LSP"),
+    };
+    if let Some(label) = lsp_label {
+        let seg_w = ml_width(&format!("{}  ", label));
         if used + seg_w <= width {
             used += seg_w;
             show_lsp = true;
@@ -719,7 +769,8 @@ fn compose_mode_line(p: &ModeLineParts, width: usize) -> ModeLine {
         right.push_str(&format!("!{}  ", p.diags));
     }
     if show_lsp {
-        right.push_str("LSP  ");
+        right.push_str(lsp_label.unwrap_or("LSP"));
+        right.push_str("  ");
     }
     right.push_str(&right_base);
 
@@ -1596,6 +1647,59 @@ fn severity_color(interp: &Interp, ed: &Editor, sev: u8) -> Color {
     .unwrap_or(fallback)
 }
 
+/// Split one diagnostic's message on `\n` into the block rows it becomes
+/// (M87 stage 3, D8): one row per resulting line, capped at 3 -- a longer
+/// split keeps the first 3 and appends `…` to the third. Known,
+/// deliberate gap: a diagnostic that genuinely needs a 4th line just
+/// loses it, same spirit as `diag_truncate_tail`'s per-row width cap.
+fn diag_message_lines(msg: &str) -> Vec<String> {
+    let all: Vec<&str> = msg.split('\n').collect();
+    let mut lines: Vec<String> = all.iter().take(3).map(|s| s.to_string()).collect();
+    if all.len() > 3 {
+        if let Some(last) = lines.last_mut() {
+            last.push(ML_ELLIPSIS);
+        }
+    }
+    lines
+}
+
+/// Truncate one diagnostic block row's (already-sanitized) text to at
+/// most `budget` display columns, dropping from the *tail* and suffixing
+/// `ML_ELLIPSIS` -- the opposite direction from `ml_truncate_head`
+/// (M87 stage 3, D8): a diagnostic message's meaning is at the front
+/// ("unexpected token", "unused variable ..."), so keeping the head and
+/// dropping the tail is the useful truncation here, unlike a mode-line
+/// path where the tail (the file/dir name itself) is what's kept.
+/// Never wraps -- there is no second call site the way the buffer-text
+/// loop has `wraps_before`; this is a hard cap, by design (D8).
+fn diag_truncate_tail(s: &str, budget: usize) -> String {
+    if ml_width(s) <= budget {
+        return s.to_string();
+    }
+    // F5 (M87 stage 3 fix round): truncation is needed -- always show
+    // ML_ELLIPSIS, even at budget == 0 (a window narrow enough that the
+    // "  \u{258f} " prefix alone already fills it). The pre-fix early
+    // `if budget == 0 { return String::new() }` special case left a
+    // narrow window showing the bare prefix with no sign that a message
+    // existed at all and had been cut -- worse than the row costing one
+    // column more than the nominal budget in this one degenerate case
+    // (the draw loop's own frame-edge bound still prevents anything
+    // from actually overflowing the grid).
+    let keep = budget.saturating_sub(1); // one column reserved for ML_ELLIPSIS
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = wide_char_width(c);
+        if w + cw > keep {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push(ML_ELLIPSIS);
+    out
+}
+
 /// Render one window pane's buffer and modeline into `rect`. Returns this
 /// window's published layout (task 2) plus the hardware cursor position
 /// when this window is selected -- `None` for two cases: the degenerate
@@ -1644,18 +1748,34 @@ fn render_window(
         gutter_w = 0; // degenerate pane: give the text every column
     }
     let cols = rect.width - gutter_w;
-    let diag_lines: std::collections::HashMap<usize, u8> = editor
+    let raw_diags: Vec<(usize, u8, String)> = editor
         .diagnostics
         .get(&(Rc::as_ptr(&buf) as usize))
-        .map(|v| {
-            let mut m = std::collections::HashMap::new();
-            for &(line, sev) in v {
-                let e = m.entry(line).or_insert(sev);
-                *e = (*e).min(sev); // keep the most severe (lowest code)
-            }
-            m
-        })
+        .cloned()
         .unwrap_or_default();
+    let diag_lines: std::collections::HashMap<usize, u8> = {
+        let mut m = std::collections::HashMap::new();
+        for (line, sev, _msg) in &raw_diags {
+            let e = m.entry(*line).or_insert(*sev);
+            *e = (*e).min(*sev); // keep the most severe (lowest code)
+        }
+        m
+    };
+    // M87 stage 3: same source, grouped by line and keeping every entry
+    // (not just the most severe) in stored order (D9) -- `diag_lines`
+    // above still feeds only the gutter dot/modeline count and is
+    // unchanged by this addition.
+    let inline_diag_on = var_on(interp, "inline-diagnostics");
+    let diag_msgs: std::collections::HashMap<usize, Vec<(u8, String)>> = if inline_diag_on {
+        let mut m: std::collections::HashMap<usize, Vec<(u8, String)>> =
+            std::collections::HashMap::new();
+        for (line, sev, msg) in raw_diags {
+            m.entry(line).or_default().push((sev, msg));
+        }
+        m
+    } else {
+        std::collections::HashMap::new()
+    };
     let ln_face = face_or(
         interp,
         editor,
@@ -1733,6 +1853,7 @@ fn render_window(
         fg: Some((128, 128, 128)),
         ..Style::default()
     };
+    let tx = rect.col + gutter_w; // text area origin column
 
     let paint_gutter = |grid: &mut Grid, row: usize, number: Option<usize>, gutter_w: usize| {
         if gutter_w == 0 || row >= text_rows {
@@ -1766,9 +1887,94 @@ fn render_window(
             }
         }
     };
+
+    // M87 stage 3 (D2-D10): draw the block rows for one buffer line's
+    // diagnostics, immediately below the last row that rendered it --
+    // called right where the draw loop below detects that line is
+    // finished (both the `'\n'` branch and the "buffer ends mid-line"
+    // break need this, since both are "a line just finished" moments).
+    // `*row` is advanced in place, same convention as the draw loop's own
+    // `row`/`col` locals; nothing is emitted once budget runs out (D4) --
+    // dropped silently, exactly like the wrap-continuation break above it
+    // in the file already does for ordinary text rows.
+    let emit_block_rows = |grid: &mut Grid, row: &mut usize, line0based: usize| {
+        let Some(diags) = diag_msgs.get(&line0based) else {
+            return;
+        };
+        let prefix = "  \u{258f} ";
+        let prefix_w = ml_width(prefix);
+        'outer: for (sev, msg) in diags {
+            // An empty message (the pre-stage-3 `(LINE . SEVERITY)` shape,
+            // still accepted for backward compatibility -- see
+            // `lsp--set-buffer-diagnostics`'s doc) has nothing to show;
+            // skip it rather than drawing a blank row that would still
+            // eat into the window's text-row budget for no visible
+            // reason.
+            if msg.trim().is_empty() {
+                continue;
+            }
+            for line_text in diag_message_lines(msg) {
+                // F6 (M87 stage 3 fix round): a blank *interior* line of
+                // a multi-line message (e.g. "real text\n   \n") must be
+                // skipped the same way a wholly blank message already is
+                // above -- otherwise it becomes a row with nothing but
+                // the "  \u{258f} " prefix. Checked post-split so this
+                // still applies per rendered line, not just to the whole
+                // message; a capped-and-ellipsized 3rd line is never
+                // blank (it always ends in ML_ELLIPSIS), so this can't
+                // accidentally eat that one.
+                if line_text.trim().is_empty() {
+                    continue;
+                }
+                if *row + 1 >= text_rows {
+                    break 'outer;
+                }
+                *row += 1;
+                let r = rect.row + *row;
+                grid.row_scale[r] = 75;
+                grid.row_kind[r] = RowKind::Block;
+                paint_gutter(grid, *row, None, gutter_w);
+                let color = severity_color(interp, editor, *sev);
+                let style = Style {
+                    fg: Some(color),
+                    italic: true,
+                    ..Style::default()
+                };
+                let budget = cols.saturating_sub(prefix_w);
+                let sanitized = ml_sanitize(&line_text);
+                let body = diag_truncate_tail(&sanitized, budget);
+                let text = format!("{prefix}{body}");
+                // F1 (M87 stage 3 fix round): no manual `grid.runs.push`
+                // here -- `fill_chrome_runs` (called once, after every
+                // window/popup/panel finishes painting) already turns
+                // every screen cell not claimed by a `src: Some(...)`
+                // buffer-text run into a same-style chrome run, same as
+                // the gutter/mode-line/echo text this block row's cells
+                // are otherwise indistinguishable from. A manual push
+                // here duplicated that: `fill_chrome_runs`'s `covered`
+                // check only looks at `r.src.is_some()`, so a `src: None`
+                // run pushed early is invisible to it and it synthesizes
+                // a second, byte-identical run over the same columns --
+                // every block row's text was shaped and drawn twice.
+                let mut c = 0usize;
+                for ch in text.chars() {
+                    let w = wide_char_width(ch);
+                    if tx + c + w > rect.col + rect.width {
+                        break;
+                    }
+                    if w == 2 {
+                        grid.put_wide(r, tx + c, ch, style);
+                    } else {
+                        grid.put(r, tx + c, ch, style);
+                    }
+                    c += w;
+                }
+            }
+        }
+    };
+
     paint_gutter(grid, 0, at_line_start.then_some(line_no), gutter_w);
 
-    let tx = rect.col + gutter_w; // text area origin column
     let mut chars = b.text.chars_from(pos);
     // Task 1 (mouse support): accumulates `grid.runs` for the buffer
     // text painted below -- see `RunBuilder`'s doc. Chrome (gutter, the
@@ -1784,6 +1990,15 @@ fn render_window(
             cursor = Some((rect.row + row, tx + col.min(cols.saturating_sub(1))));
         }
         if pos >= len {
+            // M87 stage 3 (D9): the buffer ends mid-line (no trailing
+            // `\n`) -- this is still "the last row that renders this
+            // line", the same moment the `'\n'` branch below detects for
+            // every other line, just reached by falling off the end of
+            // the buffer instead. Flush first so this line's own last
+            // run lands in `grid.runs` before the block rows that follow
+            // it, keeping run order matching row order.
+            run.flush(grid);
+            emit_block_rows(grid, &mut row, line_no - 1);
             break;
         }
         if let Some(end) = invisible_end(pos, &inv) {
@@ -1811,6 +2026,14 @@ fn render_window(
         }
         let c = chars.next().unwrap();
         if c == '\n' {
+            // M87 stage 3 (D9): `row`/`line_no` here are still the line
+            // that's finishing (its last visual row, including any wrap
+            // continuations already folded in) -- flush its own last run
+            // first (so run order matches row order), then emit its
+            // block rows before advancing to the next line, so they land
+            // physically between the two.
+            run.flush(grid);
+            emit_block_rows(grid, &mut row, line_no - 1);
             row += 1;
             col = 0;
             pos += 1;
@@ -1997,6 +2220,46 @@ fn render_window(
     // which clears the stale reference. The bias is toward "stays on too
     // long", not "goes dark too early".
     let lsp_on = buffer_var_on(interp, editor, &buf, "lsp--buffer-client");
+    // M88 D7: a real middle state -- read the exact same way, a
+    // buffer-local-aware truthy check, so this is neither an eval call
+    // nor a subprocess probe during redisplay, same discipline as
+    // `lsp_on` just above.
+    //
+    // M94 review Z3 correction (and AA2: the Z3 wording was STILL not
+    // accurate, corrected again below): the invariant this comment
+    // used to claim -- "`lsp--autostart-pending-here` is only ever
+    // non-nil while `lsp--buffer-client` is still nil" -- is FALSE as
+    // of M94. A buffer can have a live PRIMARY (`lsp--buffer-client`
+    // non-nil, `lsp_on` true) while a SECONDARY's own autostart
+    // handshake is independently in flight for the very same buffer
+    // (`lsp--autostart-pending-here` non-empty too) -- M94's own
+    // `secondary_autostart_is_not_blocked_by_an_already_attached_
+    // primary` test (`lsp_autostart_tests.rs`) constructs exactly that
+    // state. `LspState` is a three-way exclusive enum (Off/Pending/
+    // Attached), and giving it a fourth "attached-plus-pending" state
+    // is a bigger UI question than this fix round's scope -- so the
+    // BEHAVIOR here is deliberately left as-is: `lsp_pending` is
+    // suppressed exactly when `lsp_on` is true, i.e. when THE PRIMARY
+    // is attached -- not "once any client is attached", since `lsp_on`
+    // reads only `lsp--buffer-client`, never `lsp--buffer-clients`. A
+    // buffer where only a SECONDARY has ever attached (the primary
+    // slot stays empty -- e.g. a mode with no `lsp-server-alist' entry
+    // at all, or the M94 Z2 self-heal window where a dead primary has
+    // been cleared but not yet reconnected) has `lsp_on` false
+    // PERMANENTLY, so this segment can show Off for a buffer that
+    // genuinely has a live, working secondary client attached, with no
+    // way to tell the two apart from here. A future milestone that
+    // wants to surface secondary attachment/pending explicitly will
+    // need a real design decision about what the segment should show,
+    // not just a bugfix.
+    let lsp_pending = !lsp_on && buffer_var_on(interp, editor, &buf, "lsp--autostart-pending-here");
+    let lsp_state = if lsp_on {
+        LspState::Attached
+    } else if lsp_pending {
+        LspState::Pending
+    } else {
+        LspState::Off
+    };
     let right_style = if diag_count > 0 {
         Style {
             fg: Some(severity_color(interp, editor, 2)),
@@ -2046,7 +2309,7 @@ fn render_window(
         mode_name: &mode_name,
         dir,
         home: home.as_deref(),
-        lsp: lsp_on,
+        lsp: lsp_state,
         diags: diag_count,
         line: point_line,
         col: col_no,
@@ -2793,7 +3056,7 @@ mod tests {
             mode_name: "verilog-mode",
             dir: Some("/home/u/rtl"),
             home: Some("/home/u"),
-            lsp: true,
+            lsp: LspState::Attached,
             diags: 2,
             line: 1,
             ..Default::default()
@@ -2860,7 +3123,7 @@ mod tests {
         let p = ModeLineParts {
             title: "title",
             mode_name: "Fundamental",
-            lsp: true,
+            lsp: LspState::Attached,
             line: 1,
             ..Default::default()
         };
@@ -2868,6 +3131,69 @@ mod tests {
         let ml = compose_mode_line(&p, width);
         assert!(ml.left.contains("Fundamental"));
         assert!(!ml.right.contains("LSP"));
+    }
+
+    #[test]
+    fn u15_lsp_state_labels_and_width() {
+        // F2 review fix: LspState::Pending was never actually rendered
+        // by any test before this -- u1/u5/u12 (and the module-level
+        // 2997/3064/3278-era literals) only ever built LspState::
+        // Attached. A wrong label or a wrong width for the Pending arm
+        // could regress silently.
+        let p_pending = ModeLineParts {
+            title: "title",
+            lsp: LspState::Pending,
+            line: 1,
+            ..Default::default()
+        };
+        let ml = compose_mode_line(&p_pending, 200);
+        assert!(
+            ml.right.contains('\u{2026}'),
+            "expected the ellipsis-suffixed pending label, got: {:?}",
+            ml.right
+        );
+
+        let p_attached = ModeLineParts {
+            title: "title",
+            lsp: LspState::Attached,
+            line: 1,
+            ..Default::default()
+        };
+        let ml2 = compose_mode_line(&p_attached, 200);
+        assert!(ml2.right.contains("LSP"));
+        assert!(
+            !ml2.right.contains('\u{2026}'),
+            "attached must show the plain label, not the pending one: {:?}",
+            ml2.right
+        );
+
+        let p_off = ModeLineParts {
+            title: "title",
+            lsp: LspState::Off,
+            line: 1,
+            ..Default::default()
+        };
+        let ml3 = compose_mode_line(&p_off, 200);
+        assert!(!ml3.right.contains("LSP"));
+
+        // Width accounting: the pending label is one column WIDER than
+        // the plain one (the ellipsis) -- a width that exactly fits
+        // "LSP  " (plus the always-attempted empty-mode-name "  "
+        // suffix and the fixed left/right segments every ModeLineParts
+        // pays for) but not "LSP\u{2026}  " must show Attached fully and
+        // drop Pending entirely, not truncate it into something else.
+        let tight_width =
+            ml_width(" title") + ml_width("  ") + ml_width("L1:0") + ML_GAP + ml_width("LSP  ");
+        let ml_attached_tight = compose_mode_line(&p_attached, tight_width);
+        assert!(ml_attached_tight.right.contains("LSP"));
+        let ml_pending_tight = compose_mode_line(&p_pending, tight_width);
+        assert!(
+            !ml_pending_tight.right.contains("LSP"),
+            "the pending label needs one more column than the plain \
+             label and must be dropped, not squeezed in, when it \
+             doesn't fit: {:?}",
+            ml_pending_tight.right
+        );
     }
 
     #[test]
@@ -3074,7 +3400,7 @@ mod tests {
             mode_name: "verilog-mode",
             dir: Some("/home/u/rtl/top"),
             home: Some("/home/u"),
-            lsp: true,
+            lsp: LspState::Attached,
             diags: 3,
             line: 42,
             col: 7,
@@ -3238,5 +3564,53 @@ mod tests {
     #[test]
     fn e8_zero_width_window_does_not_panic() {
         assert_eq!(echo_scroll_off(100, 50, 0), 0);
+    }
+
+    // --- M87 stage 3 fix round: F5/F6, `diag_truncate_tail`/
+    // `diag_message_lines` as pure functions ---------------------------
+    //
+    // Both are exercised end-to-end through `inline_diagnostics_tests.rs`
+    // already, but that path can't isolate the exact `budget == 0`
+    // boundary F5 is about: at `budget == 0`, `cols == prefix_w` for the
+    // one call site (`emit_block_rows`), which leaves literally zero
+    // spare columns in the window's own text area for anything past the
+    // "  \u{258f} " prefix -- so what actually reaches the screen there is
+    // governed by the draw loop's own frame-edge clamp, not by this
+    // function's return value alone. Testing the function directly (the
+    // project convention for pure functions -- see this file's other
+    // `compose_mode_line`/`ml_*` tests above) pins down the value this
+    // function is responsible for, independent of that separate clamp.
+
+    #[test]
+    fn f5_truncate_tail_emits_the_ellipsis_even_at_zero_budget() {
+        // Budget 0: no room for any of the original text, but the
+        // function must still signal "something was cut" rather than
+        // silently returning nothing.
+        assert_eq!(diag_truncate_tail("unexpected token", 0), "\u{2026}");
+        // Budget 1: unchanged from before this fix -- already correct.
+        assert_eq!(diag_truncate_tail("unexpected token", 1), "\u{2026}");
+        // A message that already fits its budget is returned verbatim,
+        // no truncation (and no ellipsis) at all.
+        assert_eq!(diag_truncate_tail("ok", 5), "ok");
+    }
+
+    #[test]
+    fn f6_message_lines_drops_blank_interior_lines_after_trim() {
+        // A blank line in the MIDDLE of a multi-line message (trailing
+        // whitespace only) must not become an empty row -- callers
+        // (`emit_block_rows`) are expected to skip any line for which
+        // this returns something blank; confirm what they see.
+        let lines = diag_message_lines("real text\n   \nmore text");
+        assert_eq!(lines, vec!["real text", "   ", "more text"]);
+        assert!(
+            lines[1].trim().is_empty(),
+            "the interior line IS blank after trim"
+        );
+        // A wholly blank message likewise splits into one blank line --
+        // `emit_block_rows`'s own `msg.trim().is_empty()` guard (checked
+        // before ever calling this) is what skips that case entirely;
+        // this function's own job is only the split/cap, not the
+        // blank-skip policy.
+        assert_eq!(diag_message_lines(""), vec![""]);
     }
 }

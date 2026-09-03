@@ -709,6 +709,62 @@ fn verilog_module_header_line_has_a_documented_one_level_indent_quirk() {
     );
 }
 
+/// M97 fix round (FF2): `package'/`interface'/`class' header lines inherit
+/// `module_declaration''s own documented one-level indent quirk, for the
+/// exact same structural reason (the opening keyword is a descendant of
+/// the very node whose BODY needs the extra level) -- see indent.el's
+/// header, M97 fix round FF2 section, for the reasoning; this pins it as a
+/// known, intentional v1 gap for the three new types too rather than
+/// leaving it undocumented and unpinned.
+#[test]
+fn verilog_package_interface_and_class_header_lines_share_the_documented_one_level_indent_quirk() {
+    for (open, close) in [
+        ("package p;", "endpackage"),
+        ("interface i;", "endinterface"),
+        ("class c;", "endclass"),
+    ] {
+        let (mut i, _ed) = setup();
+        run(&mut i, "(verilog-mode)");
+        run(
+            &mut i,
+            &format!("(insert {:?})", format!("{}\n{}\n", open, close)),
+        );
+        run(&mut i, "(goto-char (point-min))");
+        assert_eq!(
+            run(&mut i, "(verilog-indent-line)"),
+            "4",
+            "documented v1 gap: `{}''s own header line computes one level deep, not 0",
+            open
+        );
+    }
+}
+
+/// M97 fix round (FF2): the same quirk verified against the real showcase
+/// file, `demo/rtl/pkg/soc_pkg.sv' -- line 7, `package soc_pkg;', is
+/// on-disk at column 0; this pins that re-TABbing it computes column 2
+/// instead (one level at this file's own 2-column style), NOT because
+/// this milestone regressed it, but because it inherits the exact same
+/// documented quirk as every other declaration header line in this
+/// section.
+#[test]
+fn verilog_soc_pkg_sv_package_header_line_computes_one_level_deep_against_its_own_on_disk_column() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../demo/rtl/pkg/soc_pkg.sv");
+    let src = std::fs::read_to_string(path).expect("demo/rtl/pkg/soc_pkg.sv must exist");
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(&mut i, &format!("(insert {:?})", src));
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"package soc_pkg;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "documented v1 gap, not a regression: the package header line computes one level \
+         deep (2, this file's own indent width) against its real on-disk column 0"
+    );
+}
+
 /// Blank-line MISSING-token handling (see indent.el's header) applies
 /// unchanged to verilog: the nearest real character before a blank line
 /// between two top-level `endmodule's is that PREVIOUS `endmodule' itself,
@@ -752,6 +808,326 @@ fn verilog_ret_after_open_begin_falls_back_to_error_tree_recovery() {
     // "  always @(*) begin" has 2 leading spaces, so the new line gets 2,
     // not the ideal (unreachable here) "one level deeper".
     assert_eq!(bs(&mut i), "module m;\n  always @(*) begin\n  ");
+}
+
+// --- M90: a SEPARATE wrap-step axis for wrapped port/parameter/argument ---
+// lists (`indent-wrap-width'/`indent--wrap-node-types' in indent.el) --
+// `verible-verilog-format' at its default flags (the tool that produced
+// `demo/rtl''s committed formatting byte for byte) indents these
+// continuation lines by a FIXED 4 columns regardless of the file's own
+// block-indent width -- measured at `--indentation_spaces' 2/3/4/8, the
+// wrap delta stayed 4 every time. Node names below (`list_of_port_
+// connections'/`list_of_parameter_value_assignments'/`list_of_arguments')
+// were confirmed against a real parse (M90, a throwaway `(treesit-node-
+// string root)' dump of this same shape of snippet -- deleted after use,
+// per the M33/M34/M38 convention), not just read off `grammar.js'.
+
+#[test]
+fn verilog_wrapped_port_list_continuation_lands_at_wrap_step_not_block_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n    .clk(clk),\n    .rst(rst)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \".clk\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "module body depth (1 * standard-indent-width 2) + one indent-wrap-width step (4) = \
+         6, matching verible's --wrap_spaces default, not the module's own 2-column block width"
+    );
+}
+
+#[test]
+fn verilog_wrapped_port_list_continuation_wrap_step_is_decoupled_from_block_width() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 8)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n    .clk(clk),\n    .rst(rst)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \".clk\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "12",
+        "same instantiation, standard-indent-width now 8: 1 * 8 + 4 = 12, NOT 1 * 8 + 8 = 16 -- \
+         indent-wrap-width stays a fixed 4 even when the block width changes; this is the test \
+         that would fail if the wrap step were ever folded back into the block multiply"
+    );
+}
+
+#[test]
+fn verilog_wrapped_parameter_value_assignment_list_continuation_gets_a_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module #(\n    .W(8),\n    .D(4)\n  ) u_sub (\n    .clk(clk)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \".W(8)\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "a `#(...)' parameter list continuation gets the same wrap step as a port list"
+    );
+}
+
+#[test]
+fn verilog_wrapped_call_argument_list_continuation_gets_a_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  initial begin\n    do_call(\n      a,\n      b\n    );\n  end\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"a,\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "8",
+        "ordinary call argument continuation: module body (1) + seq_block (1) = 2 block \
+         levels at width 2 (= 4), plus one wrap step (4) = 8"
+    );
+}
+
+#[test]
+fn verilog_wrapped_port_list_closing_paren_line_stays_at_base_column() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n    .clk(clk),\n    .rst(rst)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \");\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "the closing `);' line is a SIBLING of list_of_port_connections, not a descendant, so \
+         it gets no wrap step and stays at the instantiation's own base column"
+    );
+}
+
+#[test]
+fn verilog_wrapped_port_list_second_continuation_line_does_not_stack_wrap_steps() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n    .clk(clk),\n    .rst(rst)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \".rst\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "the second continuation line in a three-line list lands at the SAME column as the \
+         first -- the wrap step applies once (per ancestor list node), not once per line"
+    );
+}
+
+#[test]
+fn verilog_ansi_header_wrapped_port_and_parameter_lists_unaffected_by_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top #(\n  parameter W = 8\n) (\n  input logic clk,\n  input logic rst\n);\n  wire w;\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"parameter W\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "the module's OWN ANSI parameter_port_list continuation still lands at the module \
+         body's own depth (module_declaration's count alone) -- list_of_port_declarations and \
+         parameter_port_list are deliberately NOT in indent--wrap-node-types, so this must not \
+         double-count against the pre-existing module_declaration-based behavior"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"input logic clk\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "same for the ANSI port list continuation"
+    );
+}
+
+/// M90 fix-round pin, NOT a target: real `verible-verilog-format' does not
+/// always use the fixed wrap step -- when a wrapped call's own argument is
+/// itself a call whose opening paren is followed by MORE TEXT on the same
+/// line (not a hanging list), verible switches to paren-column alignment
+/// for that continuation line (measured: column 29, aligned under
+/// `other_call_with_a_long_name('s own opening paren). This engine keeps
+/// computing the fixed-step answer instead -- block depth 1 * 4 + wrap
+/// depth 2 * 4 = 12 -- because reproducing verible's conditional switch
+/// needs line-length lookahead this engine has no mechanism for (see
+/// indent.el's M90 header comment for the full reasoning, and why this is
+/// a documented scope decision rather than a bug). This test pins what
+/// this engine ACTUALLY computes, 12, not verible's 29 -- if this test
+/// ever needs to change to 29, that is a real feature (line-length-aware
+/// paren alignment), not a refactor, and belongs in its own milestone.
+#[test]
+fn verilog_nested_call_inside_wrapped_call_diverges_from_verible_paren_alignment_a_documented_scope_decision(
+) {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  initial do_call_with_a_long_name(other_call_with_a_long_name(\n    arg1, arg2, arg3\n  ));\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"arg1\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "12",
+        "block depth 1 (module body, standard-indent-width default 4) + wrap depth 2 (two \
+         nested list_of_arguments ancestors, indent-wrap-width 4 each) = 12 -- this is what \
+         the fixed-step model computes, NOT real verible's paren-aligned 29, and that gap is a \
+         documented, deliberate scope decision (see indent.el's M90 header), not a bug"
+    );
+}
+
+/// M97 Part 1: `package'/`endpackage' body, using `demo/rtl/pkg/soc_pkg.sv''s
+/// real shape (a `parameter int unsigned ...;' line one level inside
+/// `package soc_pkg;'). Reproduced BEFORE the fix landed a `package_declaration'
+/// entry in `indent--block-node-types': with that entry absent, a body line
+/// gets zero block-depth increment and computes column 0, not 2 -- see
+/// indent.el's M97 header for the SUSPECTED-entry reconnaissance this
+/// confirmed.
+#[test]
+fn verilog_package_body_indents_one_level_and_endpackage_dedents() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package soc_pkg;\nparameter int unsigned AddrWidth = 32;\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"parameter\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "package body is one level deeper than the package header, standard-indent-width default 4 \
+         (the on-disk file's own 2-column formatting is a separate, `indent-detect-width' concern -- \
+         not exercised here, since `verilog-mode' is turned on before any content is inserted)"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"endpackage\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "0",
+        "`endpackage` dedents back to the package header's own depth"
+    );
+}
+
+/// M97 Part 1: `interface'/`endinterface' body -- `interface_declaration' was
+/// as absent from `indent--block-node-types' as `package_declaration', and
+/// `endinterface' as absent from `indent--verilog-closers' as `endpackage'.
+#[test]
+fn verilog_interface_body_indents_one_level_and_endinterface_dedents() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "interface axi_if;\nlogic valid;\nendinterface\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "interface body is one level deeper than the interface header, standard-indent-width 4"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"endinterface\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "0",
+        "`endinterface` dedents back to the interface header's own depth"
+    );
+}
+
+/// M97 Part 1: `class'/`endclass' body, the third of the three
+/// SUSPECTED-entry-adjacent block types.
+#[test]
+fn verilog_class_body_indents_one_level_and_endclass_dedents() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(
+        &mut i,
+        &format!("(insert {:?})", "class foo;\nint x;\nendclass\n"),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"int\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "class body is one level deeper than the class header, standard-indent-width 4"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"endclass\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "0",
+        "`endclass` dedents back to the class header's own depth"
+    );
 }
 
 // --- Bash: v1 copy-previous-line's indentation -----------------------------

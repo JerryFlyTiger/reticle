@@ -64,7 +64,7 @@ use std::rc::Rc;
 
 use core::commands::feed_keys;
 use core::editor::Editor;
-use core::redisplay::{render, Grid, Style};
+use core::redisplay::{render, Grid, RowKind, Style};
 use elisp::Interp;
 
 fn setup(cols: usize, rows: usize) -> (Interp, Rc<RefCell<Editor>>) {
@@ -172,6 +172,26 @@ fn serialize(grid: &Grid) -> String {
             "  run row={} col={} cols={} src={} style=[{}] text={:?}\n",
             r.row, r.col, r.cols, src_desc, style_desc, r.text
         ));
+    }
+    // M87 stage 3: `row_scale`/`row_kind`, appended the same
+    // append-only way `runs` was above -- but ONLY when at least one row
+    // isn't the default (`100`/`Text`), so the 11 pre-stage-3 scenarios
+    // above (none of which ever set a diagnostic -- see this file's own
+    // header doc) emit not one extra byte here, keeping their fixture
+    // text byte-identical. A scenario that DOES set a diagnostic gets
+    // this section, one line per non-default row.
+    let nondefault: Vec<(usize, u8, RowKind)> = (0..grid.rows)
+        .filter(|&r| grid.row_scale[r] != 100 || grid.row_kind[r] != RowKind::Text)
+        .map(|r| (r, grid.row_scale[r], grid.row_kind[r]))
+        .collect();
+    if !nondefault.is_empty() {
+        out.push_str(&format!("row_meta={}\n", nondefault.len()));
+        for (r, scale, kind) in nondefault {
+            out.push_str(&format!(
+                "  row_meta r={} scale={} kind={:?}\n",
+                r, scale, kind
+            ));
+        }
     }
     out
 }
@@ -415,6 +435,34 @@ fn scenario_scroll(out: &mut String) {
     capture(&i, &ed, "scroll_forces_window_start_off_zero", out);
 }
 
+/// Scenario 10 (M87 stage 3): inline diagnostic block rows -- the one
+/// path none of the 11 scenarios above ever exercised (see this file's
+/// header doc, "What's excluded and why", updated for stage 3). Three
+/// sub-cases in one frame: a single-line message under line 1, a
+/// two-diagnostic line (stored order) under line 3, and a message wider
+/// than the window under line 5 (truncated with `…`, never wrapped).
+/// `display-line-numbers` is on, so the gutter-dot/modeline-count path
+/// (unaffected by this milestone, D7) is visible in the same capture.
+fn scenario_inline_diagnostics(out: &mut String) {
+    let (mut i, ed) = setup(40, 16);
+    run(
+        &mut i,
+        "(insert \"line one\\nline two\\nline three\\nline four\\nline five\\nline six\")",
+    );
+    run(&mut i, "(setq display-line-numbers t)");
+    run(
+        &mut i,
+        &format!(
+            "(lsp--set-buffer-diagnostics (current-buffer) \
+             '((0 1 . \"unexpected token\") \
+                (2 1 . \"first issue\") (2 2 . \"second issue\") \
+                (4 2 . \"{}\")))",
+            "x".repeat(80)
+        ),
+    );
+    capture(&i, &ed, "inline_diagnostics", out);
+}
+
 // ---------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------
@@ -432,6 +480,7 @@ fn build_golden() -> String {
     scenario_long_wrap(&mut out);
     scenario_echo_area(&mut out);
     scenario_scroll(&mut out);
+    scenario_inline_diagnostics(&mut out);
     out
 }
 

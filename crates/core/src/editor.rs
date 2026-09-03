@@ -404,11 +404,15 @@ pub struct Editor {
     /// Background highlight engine (M15, see `crate::highlight`).
     /// Spawned lazily on the first `treesit-highlight-mode`.
     pub hl: Option<crate::highlight::Engine>,
-    /// LSP diagnostics per buffer (M16): buffer pointer → (0-based
-    /// line, severity 1=error/2=warning/3+=info). Feeds the gutter dots
-    /// and the modeline count; the squiggle overlays live on the buffer
-    /// itself (set from lsp.el).
-    pub diagnostics: HashMap<usize, Vec<(usize, u8)>>,
+    /// LSP diagnostics per buffer (M16): buffer pointer → (0-based line,
+    /// severity 1=error/2=warning/3+=info, message text). Feeds the
+    /// gutter dots, the modeline count, and (M87 stage 3) the inline
+    /// diagnostic block rows the renderer draws under the offending
+    /// line; the squiggle overlays live on the buffer itself (set from
+    /// lsp.el). Removed on buffer kill (`builtins::buffers::kill-buffer`)
+    /// -- this map is keyed by `Rc::as_ptr`, which a later unrelated `Rc`
+    /// can reuse once the old buffer is freed.
+    pub diagnostics: HashMap<usize, Vec<(usize, u8, String)>>,
     /// Floating hover text (M16): set by `show-hover-popup` (the async
     /// LSP hover callback uses it), drawn by the GUI as a popup at the
     /// cursor and echoed in the TUI. Cleared on the next keystroke.

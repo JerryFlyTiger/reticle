@@ -8,13 +8,19 @@
 ;; `verilog-auto' (C-c C-a) and `verilog-delete-auto' (C-c C-k).
 ;;
 ;; v1 scope is deliberately narrow. EXCLUDED, matching this repo's own
-;; disclosure convention (see e.g. treesit.rs's module doc): AUTO_TEMPLATE
-;; (per-instance connection templates), AUTOSENSE (`always @*' sensitivity
-;; lists -- SystemVerilog's `always_ff'/`always_comb'/`@*' mostly obsolete
-;; it anyway), AUTOINPUT/AUTOOUTPUT/AUTOINOUT (top-of-hierarchy port
-;; propagation), AUTOREG/AUTORESET/AUTOTIEOFF/AUTOUNUSED (register and
-;; tie-off inference), and instance arrays (`u1[3:0] (...)' multi-instance
-;; syntax). `verilog-auto' runs when the user asks for it via C-c C-a,
+;; disclosure convention (see e.g. treesit.rs's module doc): AUTOSENSE
+;; (`always @*' sensitivity lists -- SystemVerilog's `always_ff'/
+;; `always_comb'/`@*' mostly obsolete it anyway), AUTOINPUT/AUTOOUTPUT/
+;; AUTOINOUT (top-of-hierarchy port propagation), AUTOREG/AUTORESET/
+;; AUTOTIEOFF/AUTOUNUSED (register and tie-off inference), and instance
+;; arrays (`u1[3:0] (...)' multi-instance syntax). AUTO_TEMPLATE
+;; (per-instance connection templates -- exact and wildcard-with-`\N'
+;; rules, M92; see that section's own header below for the sub-cuts
+;; still excluded: `@' numbering, `@"(lisp-expr)"' evaluated templates,
+;; one body shared by several module names, and `[]'/`[][]' magic
+;; bit-range tokens) IS in scope, and is the reason AUTOINST can produce
+;; anything beyond an identity connection. `verilog-auto' runs when the
+;; user asks for it via C-c C-a,
 ;; and additionally on every save -- opt-in, `verilog-auto-on-save' is
 ;; nil by default -- via `before-save-hook' (M40; see that variable's
 ;; own docstring).
@@ -274,6 +280,7 @@ variable in `init.el' instead.")
 (defvar verilog-auto--missing-modules nil)
 (defvar verilog-auto--ansi-autoarg-modules nil)
 (defvar verilog-auto--multi-autowire-modules nil)
+(defvar verilog-auto--template-parse-warnings nil)
 
 ;; --- Generic tree-sitter walking helpers ---------------------------------
 ;;
@@ -314,8 +321,41 @@ depth-first, left to right, or nil."
 (defun verilog-auto--find-all-of-type (node type)
   (verilog-auto--find-all node (lambda (n) (string= (treesit-node-type n) type))))
 
+(defun verilog-auto--find-all-of-types (node types)
+  "Like `verilog-auto--find-all-of-type', but TYPES is a list of node-type
+strings, matched by membership rather than a single `string='. Document
+order is preserved across the whole TYPES set (a single tree walk, not
+one walk per type concatenated afterward -- see `verilog-auto--top-
+level-modules', M97), unlike calling `verilog-auto--find-all-of-type'
+once per type and appending the results, which would interleave two
+declaration kinds out of buffer order."
+  (verilog-auto--find-all node (lambda (n) (member (treesit-node-type n) types))))
+
 (defun verilog-auto--find-first-of-type (node type)
   (verilog-auto--find-first node (lambda (n) (string= (treesit-node-type n) type))))
+
+(defconst verilog-auto--ansi-header-types '("module_ansi_header" "interface_ansi_header")
+  "Node types `verilog-auto--header-node'/`verilog-auto--ansi-header-p'
+treat as an ANSI header -- ports declared with their directions right
+there in the header itself, as opposed to a `*_nonansi_header' (names
+only, directions declared separately in the body). M97: widened from
+`module_ansi_header' alone once `verilog-auto--top-level-modules' was
+widened to resolve `interface_declaration's too -- `interface_ansi_
+header' is the exact same shape (dump-verified, M97 recon: same `name:'
+field, same `list_of_port_declarations' child).")
+
+(defun verilog-auto--ansi-header-p (header)
+  "Non-nil if HEADER's own node type is one of
+`verilog-auto--ansi-header-types'. Centralizes what used to be a bare
+`(string= (treesit-node-type header) \"module_ansi_header\")' at three
+call sites in this file plus one in verilog-complete.el -- widening
+just the string literal at each site, without this predicate, would
+have left every one of them silently treating an `interface_ansi_
+header' as non-ANSI (the `else' branch), which is wrong: an ANSI
+interface header's `/*AUTOARG*/'-adjacent region is user-written ports,
+never machine-generated, exactly like an ANSI module header's (see
+`verilog-delete-auto')."
+  (member (treesit-node-type header) verilog-auto--ansi-header-types))
 
 (defun verilog-auto--comment-p (node text)
   (and (string= (treesit-node-type node) "block_comment")
@@ -335,6 +375,27 @@ ancestor that does, walking up via `treesit-node-parent'; nil if none
 does."
   (let ((n node))
     (while (and n (not (string= (treesit-node-type n) type)))
+      (setq n (treesit-node-parent n)))
+    n))
+
+(defun verilog-auto--enclosing-of-types (node types)
+  "Like `verilog-auto--enclosing-of-type', but TYPES is a list of node-
+type strings, matched by membership. M97 fix round (FF1): the AUTOWIRE
+call sites below need this -- their own AUTOINST/AUTOARG siblings were
+deliberately left at the single-type `verilog-auto--enclosing-of-type'
+\(the M97 spec's own words: an AUTOINST comment's enclosing declaration
+\"is always a module\", never an interface, because AUTOINST fires
+inside a `hierarchical_instance', not directly inside a module/interface
+body). AUTOWIRE's own comment sits directly in the body instead, so
+THAT reasoning does not carry over -- an `/*AUTOWIRE*/' inside `interface
+foo; /*AUTOWIRE*/ endinterface' has an INTERFACE as its nearest
+`module_declaration'-or-`interface_declaration' ancestor, and the
+single-type version returned nil there, which every caller below then
+fed unchecked into `treesit-node-child-count'-calling helpers -- a hard
+crash (`Wrong type argument: treesit-node-p, nil'), not a graceful
+no-op."
+  (let ((n node))
+    (while (and n (not (member (treesit-node-type n) types)))
       (setq n (treesit-node-parent n)))
     n))
 
@@ -395,13 +456,25 @@ files -- see `verilog-auto--find-module-in-libraries')."
   (treesit-parse-string 'verilog text))
 
 (defun verilog-auto--top-level-modules (root)
-  (verilog-auto--find-all-of-type root "module_declaration"))
+  "Every top-level `module_declaration' AND `interface_declaration' under
+ROOT, in document order (M97: widened from `module_declaration' alone
+-- `interface_declaration' has the identical `name:'-field shape, dump-
+verified, M97 recon). The name \"modules\" is kept for this function
+\(every caller already spells it that way, and an interface IS a
+resolvable instantiation target, the same role a module plays here) --
+see this file's header for the M39 tree-shape notes this extends."
+  (verilog-auto--find-all-of-types root '("module_declaration" "interface_declaration")))
 
 (defun verilog-auto--header-node (module-decl)
-  "MODULE-DECL's own module_ansi_header or module_nonansi_header
-child."
+  "MODULE-DECL's own ANSI or non-ANSI header child -- `module_ansi_header'/
+`module_nonansi_header' for a `module_declaration', or `interface_ansi_
+header'/`interface_nonansi_header' for an `interface_declaration' (M97:
+dump-verified same `name:' field, same `list_of_port_declarations'/
+`list_of_ports' children as the module headers they mirror)."
   (or (verilog-auto--find-first-of-type module-decl "module_ansi_header")
-      (verilog-auto--find-first-of-type module-decl "module_nonansi_header")))
+      (verilog-auto--find-first-of-type module-decl "module_nonansi_header")
+      (verilog-auto--find-first-of-type module-decl "interface_ansi_header")
+      (verilog-auto--find-first-of-type module-decl "interface_nonansi_header")))
 
 (defun verilog-auto--module-name (module-decl)
   (treesit-node-text
@@ -723,7 +796,7 @@ items."
 
 (defun verilog-auto--ports-of-module (module-decl)
   (let ((header (verilog-auto--header-node module-decl)))
-    (if (string= (treesit-node-type header) "module_ansi_header")
+    (if (verilog-auto--ansi-header-p header)
         (verilog-auto--ansi-ports header)
       (verilog-auto--nonansi-ports module-decl header))))
 
@@ -832,33 +905,398 @@ was the most recently `push'ed) sidesteps that entirely."
       (setcar lines (substring (car lines) 0 (1- (length (car lines))))))
     (nreverse lines)))
 
+;; --- AUTO_TEMPLATE (M92) ---------------------------------------------------
+;;
+;; GNU's own shape (verilog-mode.el's `verilog-read-auto-template-middle'/
+;; `verilog-auto-inst-port'), read from the real 30.2 source rather than
+;; guessed:
+;;   /* InstModule AUTO_TEMPLATE (
+;;      .name  (expr-with-\\1-etc),
+;;      .other (expr),
+;;      ); */
+;; Two rule shapes inside the parens, distinguished by trying the EXACT
+;; form's regexp first and only falling back to the WILDCARD form if that
+;; fails (`cond' order in GNU's own `verilog-auto-inst-port', :12325-
+;; :12334) -- so a plain-identifier LHS like `.clk_i' is always an exact
+;; rule, never accidentally treated as a (trivial, single-literal-match)
+;; wildcard:
+;; - EXACT: `.NAME (EXPR)' where NAME is a bare identifier
+;;   ([A-Za-z0-9_$]+, no regex metacharacters) -- matches by NAME equality
+;;   against the port name, EXPR substituted in verbatim (no backrefs).
+;; - WILDCARD: `.PATTERN (EXPR)' where PATTERN is itself an elisp regexp
+;;   (GNU's own LHS charset for this form, `verilog-mode.el' :10232-
+;;   :10234, allows ordinary identifier chars plus `+@^.*?|[]' and
+;;   backslash-escaped `(', `)', `|', digits -- i.e. exactly the
+;;   metacharacters a hand-written regexp needs, deliberately excluding a
+;;   literal, unescaped `(' or `)' so the boundary between PATTERN and the
+;;   following `(EXPR)' is never ambiguous). PATTERN is anchored `^...$'
+;;   (GNU wraps it that way itself, :10232) and matched against the WHOLE
+;;   port name; EXPR may reference `\\1'..`\\9' captured from that match.
+;;
+;; v1 scope cut (see this file's own top-of-file header): `@' per-instance
+;; numbering, `@"(lisp-expr)"' evaluated-once-per-AUTOINST templates, one
+;; template body shared by several module names (GNU's own `,' module-name
+;; list before AUTO_TEMPLATE), and the `[]'/`[][]' magic bit-range tokens
+;; GNU substitutes into an EXPR that used them (:12363-12366) -- an EXPR
+;; here is used exactly as written, never reconciled against the port's
+;; own declared range. `verilog-auto--substitute-params' (parameter-name
+;; substitution in a RANGE like `[WIDTH-1:0]') is likewise never applied to
+;; a template EXPR -- out of scope per this milestone's own spec, and GNU
+;; doesn't do it either (parameter substitution there is a `verilog-mode'
+;; option scoped to auto-declared wire types, a different mechanism).
+;;
+;; Known gap, pre-existing and outside this file's own scope (M92 fix
+;; round S5): a LITERAL backslash written inside a wildcard EXPR is
+;; silently dropped by the replacement-template handling
+;; `verilog-auto--template-lookup' calls into (`replace-regexp-in-string'
+;; -> `crates/elisp/src/regex.rs's `replace_all', :1643-1701) -- that
+;; function's own template scanner only preserves a backslash when it is
+;; immediately followed by `&', a digit, or ANOTHER backslash (two
+;; backslashes in the EXPR text collapse to one literal backslash in the
+;; output); any other single backslash is consumed as an escape
+;; introducer and the character after it is emitted bare, unescaped. A
+;; Verilog escaped identifier (e.g. `\my$signal ') begins with exactly
+;; this kind of lone backslash, so a template EXPR that names one loses
+;; it. Not fixable from this file alone -- the template-expansion
+;; primitive is shared, generic regex machinery with its own test
+;; coverage, and this milestone's spec scopes a Rust change out
+;; explicitly ("if you conclude a Rust change is needed, stop and
+;; report"); documented here instead of silently discovered later.
+
+(defvar verilog-auto--template-rule-head-re
+  "^\\.\\(\\(?:[-A-Za-z0-9_$+@^.*?|]\\|\\[\\|\\]\\|\\\\[()|0-9]\\)+\\)[ \t]*("
+  "Matches a template rule's own `.NAME-OR-PATTERN  (' head -- up
+through, but NOT past, the opening paren that starts EXPR. The captured
+group's own charset is GNU's wildcard LHS charset (identifier chars,
+`+@^.*?|[]', and backslash-escaped `(', `)', `|', or a digit) -- a
+strict SUPERSET of a bare identifier, so this one regex serves both
+shapes; `verilog-auto--template-rule-at' (below) decides exact vs.
+wildcard AFTERWARD by testing whether the captured text is nothing but
+`[A-Za-z0-9_$]+'.
+
+M92 fix round X1: this regex used to also try to capture EXPR itself
+via a trailing `(\\(.*\\))[ \t]*[,;)]*\\(?:[ \t]*//.*\\)?$' anchored at
+end-of-line. `.*' is greedy and nothing in it excludes `)', so a
+trailing `// comment (with a paren)' made the match backtrack all the
+way to THAT paren as if it were EXPR's own close -- `.done (finished),
+// see (note)' silently captured EXPR as `\"finished), // see (note\"',
+a syntactically broken connection with no warning at all (the line
+still matched, so `verilog-auto--parse-template-body's `t' branch below
+was never reached either). Fixed by never regex-capturing EXPR: this
+regex only finds the HEAD, and `verilog-auto--template-rule-at' finds
+EXPR's own close paren by depth-count balance-scanning instead (the
+same technique `verilog-auto--template-body-text' already uses for the
+AUTO_TEMPLATE block's own outer parens) -- a `)' inside a comment, or
+belonging to a SECOND rule on the same line, can then never be mistaken
+for EXPR's own boundary, and `.a (foo(bar))' -- a legitimate EXPR that
+itself contains balanced parens -- parses correctly too, which a
+non-greedy `.*?' fix would have gotten equally wrong (first-match is as
+incorrect as last-match here).")
+
+(defun verilog-auto--balanced-paren-end (s open)
+  "Position in S of the `)' that balance-matches the `(' at position
+OPEN (S's own char index), depth-counting nested parens along the way,
+or nil if S runs out first. Deliberately scoped to ONE line's own text
+(a caller-provided single physical line, or the trimmed remainder of
+one after an earlier rule was already parsed off its front) -- EXPR is
+never expected to span multiple lines, matching this file's existing
+per-line template convention."
+  (let ((depth 1) (i (1+ open)) (n (length s)) (close nil))
+    (while (and (< i n) (not close))
+      (cond
+       ((eq (aref s i) ?\() (setq depth (1+ depth)))
+       ((eq (aref s i) ?\))
+        (setq depth (1- depth))
+        (when (= depth 0) (setq close i))))
+      (setq i (1+ i)))
+    close))
+
+(defun verilog-auto--template-rule-at (s)
+  "If S (a string with no leading whitespace) begins with a well-formed
+`.NAME-OR-PATTERN (EXPR)' rule, return (NAME-OR-PATTERN EXPR REST) --
+REST the TRIMMED remainder of S after this one rule's own trailing
+separator punctuation (`,'/`;'/`)', zero or more, matching this file's
+existing leniency) and an optional `// ...' end-of-line comment; REST
+may be empty. Returns nil if S doesn't even match
+`verilog-auto--template-rule-head-re' at all (caller treats the whole
+of S as a malformed/unrecognized rule in that case) -- note a
+successfully parsed head with an UNBALANCED paren (no matching close
+anywhere in S, `verilog-auto--balanced-paren-end' returns nil) also
+returns nil here, same treatment.
+
+M92 fix round X1 also resolves, as a side effect of parsing this way
+instead of one whole-line regex: `.a (x), .b (y)' on a single line used
+to match as ONE rule with EXPR captured as `\"x), .b (y\"' (the same
+greedy-`)' defect as the trailing-comment case above). Chosen behavior
+here -- since REST is handed back to the caller
+(`verilog-auto--parse-template-body'), which loops calling this
+function again on REST until it's exhausted or a call fails -- is to
+parse BOTH rules correctly: `.a (x)' first, EXPR verbatim `\"x\"', REST
+`\".b (y)\"'; then `.b (y)' on the next iteration. A trailing chunk that
+ISN'T a valid second rule falls through to the caller's own warning
+path instead, same as a whole malformed line would."
+  (if (not (string-match verilog-auto--template-rule-head-re s))
+      nil
+    (let* ((name (match-string 1 s))
+           (open (1- (match-end 0)))
+           (close (verilog-auto--balanced-paren-end s open)))
+      (if (not close)
+          nil
+        (let* ((expr (substring s (1+ open) close))
+               (tail (substring s (1+ close)))
+               (i 0) (n (length tail)))
+          (while (and (< i n) (memq (aref tail i) '(?\s ?\t))) (setq i (1+ i)))
+          (while (and (< i n) (memq (aref tail i) '(?, ?\; ?\)))) (setq i (1+ i)))
+          (while (and (< i n) (memq (aref tail i) '(?\s ?\t))) (setq i (1+ i)))
+          (when (and (< (1+ i) n) (eq (aref tail i) ?/) (eq (aref tail (1+ i)) ?/))
+            (setq i n))
+          (list name expr (string-trim (substring tail i))))))))
+
+(defun verilog-auto--parse-template-body (text)
+  "TEXT is the substring between an AUTO_TEMPLATE block's own outermost
+parens (see `verilog-auto--template-body-text'). Returns (EXACT . WILD):
+EXACT an alist of (NAME . EXPR), most-recently-defined-in-TEXT first (so
+a plain `assoc' lookup naturally prefers the LATEST rule for a NAME that
+appears more than once, matching GNU's own `assoc'-into-a-forward-consed
+list behavior); WILD a list of (ANCHORED-PATTERN . EXPR) pairs in
+DOCUMENT (file) order -- callers must scan front to back and stop at the
+FIRST pattern that matches (GNU's own `verilog-auto-inst-port' loops
+every wildcard without an early exit and keeps overwriting its result,
+which -- because ITS OWN list is built in reverse-of-file order -- nets
+out to \"the earliest-written-in-the-template matching rule wins\"; this
+function's list is built the other way around, so simple front-to-back
+`first match wins' scanning reproduces the identical result without
+replaying GNU's own reversed-overwrite trick).
+
+Lines that are blank, or start with `//' once trimmed, are skipped (GNU
+tolerates the same). Every OTHER line is handed to
+`verilog-auto--template-rule-at' in a loop: on success, the returned
+rule is filed into EXACT or WILD (an all-identifier-char NAME is exact,
+anything else is wrapped `^...$' and filed as wildcard) and the loop
+continues on that call's own REST -- so `.a (x), .b (y)' parses as TWO
+rules (see `verilog-auto--template-rule-at's own doc string for why
+this choice, not \"report the remainder as malformed,\" was made). The
+FIRST call that fails on a given line's remaining text -- REST doesn't
+even start with a recognizable `.HEAD (' shape, or its own paren never
+balances -- pushes THAT REMAINING TEXT (not necessarily the whole
+original line, if an earlier rule on the same line already parsed
+successfully) onto `verilog-auto--template-parse-warnings', folded into
+`verilog-auto''s own end-of-command message (the same \"can't show two
+things in one echo line\" pattern as every other notice this file
+collects) -- M92 fix round S1: this used to fall through a `cond'
+silently (no warning path at all), which is exactly how a perfectly
+well-formed rule with its own trailing `// comment' used to vanish
+before X1/S1 together made this whole parse tolerant of one. A rule can
+still be malformed for other reasons (stray punctuation, a paren that
+never balances on this line -- GNU's own point-based scanner would
+`error' outright on those, `verilog-read-auto-template-middle's `(t
+(error ...))' branch, `verilog-mode.el' :10184-10267), so this
+project's posture stays warn-and-skip rather than GNU's hard `error',
+consistent with the rest of this file (a missing module, an ANSI
+AUTOARG, a second AUTOWIRE per module -- none of those abort
+`verilog-auto' either).
+
+A `/* */' block comment EMBEDDED inside the AUTO_TEMPLATE parens is
+still not tolerated, but not for the reason an earlier draft of this
+docstring claimed (\"unhandled/undefined, not silently wrong-but-
+plausible\") -- that was inaccurate. Confirmed with a real parse (M92
+fix round S3): this grammar's `block_comment' node ends at the FIRST
+`*/' it finds, full stop -- block comments do not nest, so `/* Mod
+AUTO_TEMPLATE ( /* inner */ .foo (bar), ); */' parses as ONE
+block_comment node whose own text is only `\"/* Mod AUTO_TEMPLATE ( /*
+inner */\"' -- everything from `.foo' onward, including the template's
+own real rules and the closing `); */', is NOT part of any comment node
+at all. `verilog-auto--template-body-text' then finds `AUTO_TEMPLATE'
+and its opening `(' inside that TRUNCATED text, but the paren-depth
+scan never finds a matching close (there isn't one left in the
+truncated string), so it returns nil -- and THIS function is never even
+called in that case (`verilog-auto--find-template' short-circuits on a
+nil body before reaching here). So the actual failure mode is \"the
+template silently vanishes,\" never \"a commented-out rule gets
+silently treated as live\" -- there IS no comment-swallowing to speak
+of, because the grammar's own non-nesting `*/' rule means the surviving
+fragment can't even see the rules that would have to be swallowed.
+
+M92 fix round X2: because this function is the ONLY place that ever
+pushes onto `verilog-auto--template-parse-warnings', the nested-`/* */'
+case used to bypass the warning channel entirely -- indistinguishable
+from \"no AUTO_TEMPLATE comment exists for this module at all,\" with no
+notice of any kind. `verilog-auto--find-template' now pushes its own
+warning when it finds a MATCHING AUTO_TEMPLATE comment whose body
+extraction still fails, so the failure is no longer silent even though
+the underlying truncation itself is still not fixed (see that
+function's own doc string for why: fixing it would mean scanning raw
+buffer text PAST a node's own boundary to find the REAL `*/', exactly
+the search-by-node-KIND discipline this file's own top-of-file header
+commits to never doing)."
+  (let (exact wild)
+    (dolist (raw (split-string text "\n"))
+      (let ((line (string-trim raw)))
+        (unless (or (string-empty-p line) (string-prefix-p "//" line))
+          (let ((remaining line) (progress t))
+            (while (and progress (> (length remaining) 0))
+              (let ((parsed (verilog-auto--template-rule-at remaining)))
+                (if parsed
+                    (let ((name (nth 0 parsed)) (expr (nth 1 parsed)) (rest (nth 2 parsed)))
+                      (if (string-match-p "\\`[A-Za-z0-9_$]+\\'" name)
+                          (push (cons name expr) exact)
+                        (push (cons (concat "^" name "$") expr) wild))
+                      (setq remaining rest))
+                  (progn
+                    (push remaining verilog-auto--template-parse-warnings)
+                    (setq remaining "" progress nil)))))))))
+    (cons exact (nreverse wild))))
+
+(defun verilog-auto--template-body-text (comment)
+  "The substring of COMMENT's own text (a block_comment, already
+confirmed to contain \"AUTO_TEMPLATE\" by `verilog-auto--template-for-
+module') between the `(' that opens its rule list and the matching,
+paren-depth-balanced `)', or nil if that shape isn't found (a malformed
+template is left as inert, unparsed text -- same fallback posture as
+\"no template found\" below, never a hard error that would abort the
+whole `verilog-auto' run over one bad comment)."
+  (let* ((text (treesit-node-text comment))
+         (kw (string-match "AUTO_TEMPLATE" text)))
+    (when kw
+      (let ((open (string-match "(" text (+ kw (length "AUTO_TEMPLATE")))))
+        (when open
+          (let ((depth 1) (i (1+ open)) (n (length text)) (close nil))
+            (while (and (< i n) (not close))
+              (cond
+               ((eq (aref text i) ?\() (setq depth (1+ depth)))
+               ((eq (aref text i) ?\))
+                (setq depth (1- depth))
+                (when (= depth 0) (setq close i))))
+              (setq i (1+ i)))
+            (and close (substring text (1+ open) close))))))))
+
+(defun verilog-auto--template-for-module (template-comments type-name inst-start)
+  "The AUTO_TEMPLATE block_comment for module TYPE-NAME nearest to
+INST-START: the one with the LARGEST start position at or before
+INST-START (\"nearest preceding\"), else -- if none precedes it -- the
+one with the SMALLEST start position after it (\"nearest following\";
+GNU's own comment at :10286-10292 calls this fallback historical and not
+really spec'd, but keeps it, so this does too). nil if no comment in
+TEMPLATE-COMMENTS (every `block_comment' node in the buffer -- see
+`verilog-auto--expand-all-autoinst', which gathers this ONCE per
+`verilog-auto' pass and hands the same list to every site, M92 fix
+round S4: this function used to re-walk the WHOLE tree via
+`verilog-auto--find-all-of-type' on every single call, i.e. once per
+/*AUTOINST*/ site, an O(sites * tree-size) cost a file with several
+sites paid for no reason -- AUTOINST did no comment-wide scan at all
+before AUTO_TEMPLATE existed) matches TYPE-NAME's own header shape (`/*
+TYPE-NAME AUTO_TEMPLATE ...'; GNU's own regex additionally tolerates
+leading whitespace and an OMITTED `/*' -- both dropped here since every
+v1 test fixture's own template comment is a real `block_comment' node,
+which by definition always starts with a real `/*')."
+  (let* ((pat (concat "\\`/\\*[ \t\n\r]*" (regexp-quote type-name) "[ \t\n\r]+AUTO_TEMPLATE"))
+         (matching (verilog-auto--filter
+                    (lambda (n) (string-match-p pat (treesit-node-text n)))
+                    template-comments))
+         before before-pos after after-pos)
+    (dolist (c matching)
+      (let ((s (treesit-node-start c)))
+        (if (<= s inst-start)
+            (when (or (null before-pos) (> s before-pos))
+              (setq before c before-pos s))
+          (when (or (null after-pos) (< s after-pos))
+            (setq after c after-pos s)))))
+    (or before after)))
+
+(defun verilog-auto--find-template (template-comments type-name inst-start)
+  "Parsed (EXACT . WILD) template (`verilog-auto--parse-template-body')
+for an instantiation of TYPE-NAME starting at INST-START, or nil if no
+matching AUTO_TEMPLATE comment exists, or its own body can't be
+extracted (`verilog-auto--template-body-text' failure -- see its own
+doc string, in particular the nested-`/* */'-truncates-the-comment
+case). TEMPLATE-COMMENTS as in `verilog-auto--template-for-module',
+which this simply forwards to.
+
+M92 fix round X2: when a MATCHING AUTO_TEMPLATE comment is found but its
+own body can't be extracted, that used to return nil with no trace at
+all -- indistinguishable from \"no AUTO_TEMPLATE comment exists for this
+module,\" and silently bypassing the ONLY place
+(`verilog-auto--parse-template-body') that ever pushes onto
+`verilog-auto--template-parse-warnings', since that function is never
+even reached in this case. A warning is now pushed HERE instead, naming
+TYPE-NAME, so this failure surfaces in `verilog-auto''s own final
+message same as every other malformed-template case -- the underlying
+truncation itself is still not fixed (see
+`verilog-auto--template-body-text's own doc string for why: it would
+mean scanning raw buffer text past a node's own boundary, which this
+file's own top-of-file header commits to never doing), only no longer
+silent."
+  (let ((comment (verilog-auto--template-for-module template-comments type-name inst-start)))
+    (when comment
+      (let ((body (verilog-auto--template-body-text comment)))
+        (if body
+            (verilog-auto--parse-template-body body)
+          (push (format "AUTO_TEMPLATE for module %s: comment found but its own body could not be extracted (often an embedded /* */ inside the block, which ends the comment early)" type-name)
+                verilog-auto--template-parse-warnings)
+          nil)))))
+
+(defun verilog-auto--template-lookup (template port-name)
+  "EXPR for PORT-NAME per TEMPLATE (`verilog-auto--find-template's
+return value), or nil if no rule applies to PORT-NAME at all --
+`verilog-auto--connection-text' falls back to today's identity
+connection in that case. Exact match wins outright over any wildcard
+(see this section's own header); a wildcard's EXPR has its own `\\N'
+substituted via `replace-regexp-in-string' against PORT-NAME itself --
+since the wildcard's own stored pattern is `^...$'-anchored (see
+`verilog-auto--parse-template-body'), that single call matches the
+WHOLE of PORT-NAME exactly once, so its output IS the fully-substituted
+EXPR, not a partial in-place replacement."
+  (let ((exact (cdr (assoc port-name (car template)))))
+    (if exact
+        exact
+      (let ((wild (cdr template)) (result nil))
+        (while (and wild (not result))
+          (let ((lhs (caar wild)) (expr (cdar wild)))
+            (when (string-match-p lhs port-name)
+              (setq result (replace-regexp-in-string lhs expr port-name))))
+          (setq wild (cdr wild)))
+        result))))
+
 ;; --- AUTOINST --------------------------------------------------------------
 
-(defun verilog-auto--connection-text (port overrides indent)
+(defun verilog-auto--connection-text (port overrides indent template)
   "\".NAME  (EXPR)\" (INDENT NOT included in the returned text -- only
 in the padding measurement, via `verilog-auto--pad-to-column's OFFSET;
 the caller, `verilog-auto--grouped-lines', prepends INDENT itself to
-every line uniformly, connections and group headers alike). EXPR is
-NAME alone for a rangeless port, else NAME with its (param-substituted)
-range appended, e.g. \"count[WIDTH-1:0]\"."
+every line uniformly, connections and group headers alike). TEMPLATE is
+this instantiation's own AUTO_TEMPLATE lookup structure
+(`verilog-auto--find-template'), or nil if none applies. When TEMPLATE
+has a rule for this port (`verilog-auto--template-lookup'), EXPR is that
+rule's own substituted text verbatim -- OVERRIDES/param substitution is
+never applied to it (out of scope, see this section's own header).
+Otherwise (no template, or no rule for this port) EXPR falls back to
+today's identity behavior: NAME alone for a rangeless port, else NAME
+with its (param-substituted) range appended, e.g. \"count[WIDTH-1:0]\"."
   (let* ((name (nth 0 port))
          (range (nth 2 port))
-         (expr (if range (concat name (verilog-auto--substitute-params range overrides)) name))
+         (templated (and template (verilog-auto--template-lookup template name)))
+         (expr (or templated
+                   (if range (concat name (verilog-auto--substitute-params range overrides)) name)))
          (dotname (concat "." name)))
     (concat (verilog-auto--pad-to-column dotname verilog-auto-inst-column (length indent))
             "(" expr ")")))
 
-(defun verilog-auto--inst-lines (groups overrides indent)
+(defun verilog-auto--inst-lines (groups overrides indent template)
   (verilog-auto--grouped-lines
    groups indent
-   (lambda (p) (verilog-auto--connection-text p overrides indent))))
+   (lambda (p) (verilog-auto--connection-text p overrides indent template))))
 
-(defun verilog-auto--expand-autoinst-site (module-instantiation comment)
+(defun verilog-auto--expand-autoinst-site (template-comments module-instantiation comment)
   "Expand the /*AUTOINST*/ site marked by COMMENT (a descendant of
-MODULE-INSTANTIATION). Already-explicit connections are left alone and
-excluded from the generated set; if that leaves nothing to add (every
-port already connected), nothing at all is inserted. Returns 1 if the
-instantiated module was found (whether or not anything was actually
+MODULE-INSTANTIATION). TEMPLATE-COMMENTS is every `block_comment' node
+in the buffer, gathered ONCE by `verilog-auto--expand-all-autoinst' and
+shared across every site (M92 fix round S4 -- see
+`verilog-auto--template-for-module's own doc string for why), needed to
+look up an AUTO_TEMPLATE for this instantiation's own module type
+(`verilog-auto--find-template'). Already-explicit connections are left
+alone and excluded from the generated set; if that leaves nothing to add
+(every port already connected), nothing at all is inserted. Returns 1 if
+the instantiated module was found (whether or not anything was actually
 inserted), 0 if it couldn't be resolved (GNU warn-and-skip; see
 `verilog-auto--module-ports')."
   (let* ((type-name (treesit-node-text
@@ -871,13 +1309,15 @@ inserted), 0 if it couldn't be resolved (GNU warn-and-skip; see
               (mapcar (lambda (c) (treesit-node-text (treesit-node-child-by-field-name c "port_name")))
                       (verilog-auto--find-all-of-type hier "named_port_connection")))
              (overrides (verilog-auto--instance-param-overrides module-instantiation))
+             (template (verilog-auto--find-template
+                        template-comments type-name (treesit-node-start module-instantiation)))
              (remaining (verilog-auto--filter
                          (lambda (p) (not (member (nth 0 p) connected)))
                          ports))
              (groups (verilog-auto--group-by-direction remaining))
              (open-paren (treesit-node-child hier 1))
              (indent (make-string (1+ (verilog-auto--node-column open-paren)) ?\s))
-             (lines (verilog-auto--inst-lines groups overrides indent)))
+             (lines (verilog-auto--inst-lines groups overrides indent template)))
         (when lines
           (goto-char (treesit-node-end comment))
           (insert "\n" (string-join lines "\n")))
@@ -886,10 +1326,14 @@ inserted), 0 if it couldn't be resolved (GNU warn-and-skip; see
 (defun verilog-auto--expand-all-autoinst ()
   "Expand every pending /*AUTOINST*/ site in the current buffer from a
 single parse (see this file's header for why processing them
-rightmost-first needs no reparse between sites). Returns the count of
+rightmost-first needs no reparse between sites). TEMPLATE-COMMENTS
+(every `block_comment' node in ROOT) is gathered exactly once here and
+threaded through to every site (M92 fix round S4), rather than each
+site re-walking the whole tree on its own. Returns the count of
 instances processed."
   (let* ((root (verilog-auto--parse-current-buffer))
          (mis (verilog-auto--find-all-of-type root "module_instantiation"))
+         (template-comments (verilog-auto--find-all-of-type root "block_comment"))
          (sites nil))
     (dolist (mi mis)
       (let ((c (verilog-auto--find-comment mi "/*AUTOINST*/")))
@@ -897,7 +1341,7 @@ instances processed."
     (setq sites (sort sites (lambda (a b) (> (car a) (car b)))))
     (let ((total 0))
       (dolist (site sites total)
-        (setq total (+ total (verilog-auto--expand-autoinst-site (nth 1 site) (nth 2 site))))))))
+        (setq total (+ total (verilog-auto--expand-autoinst-site template-comments (nth 1 site) (nth 2 site))))))))
 
 ;; --- AUTOWIRE ---------------------------------------------------------------
 
@@ -935,7 +1379,8 @@ grammar's exact nested shape for `bus[3:0]' or `{a,b}'."
   "Expand one /*AUTOWIRE*/ site. Returns the number of wire
 declarations inserted (0 if the candidate set is empty -- no
 Beginning/End markers are inserted in that case, GNU style)."
-  (let* ((module-decl (verilog-auto--enclosing-of-type comment "module_declaration"))
+  (let* ((module-decl (verilog-auto--enclosing-of-types
+                       comment '("module_declaration" "interface_declaration")))
          (declared (verilog-auto--declared-names module-decl))
          (insts (verilog-auto--find-all-of-type module-decl "module_instantiation"))
          (seen (make-hash-table :test 'equal))
@@ -945,8 +1390,17 @@ Beginning/End markers are inserted in that case, GNU style)."
                           (treesit-node-child-by-field-name mi "instance_type")))
              (ports (verilog-auto--module-ports type-name))
              (overrides (verilog-auto--instance-param-overrides mi))
-             (hier (verilog-auto--find-first-of-type mi "hierarchical_instance")))
-        (when hier
+             ;; M92 review fix: the grammar allows a SINGLE
+             ;; module_instantiation to hold several comma-separated
+             ;; hierarchical_instance children (`sometype u1(...), u2(...);'
+             ;; -- see M39's own tree-shape notes). `find-first-of-type'
+             ;; used to only ever look at the FIRST one, so every
+             ;; instance but the first silently lost its outputs' wire
+             ;; candidacy; AUTOINST is unaffected since it scopes to the
+             ;; hierarchical_instance enclosing its own /*AUTOINST*/
+             ;; comment, never to `mi' as a whole.
+             (hiers (verilog-auto--find-all-of-type mi "hierarchical_instance")))
+        (dolist (hier hiers)
           (dolist (conn (verilog-auto--find-all-of-type hier "named_port_connection"))
             (let* ((pname (treesit-node-text (treesit-node-child-by-field-name conn "port_name")))
                    (cnode (treesit-node-child-by-field-name conn "connection"))
@@ -991,7 +1445,7 @@ that anyway."
   (let ((seen (make-hash-table :test 'eql))
         (firsts nil) (extras nil))
     (dolist (c comments)
-      (let* ((m (verilog-auto--enclosing-of-type c "module_declaration"))
+      (let* ((m (verilog-auto--enclosing-of-types c '("module_declaration" "interface_declaration")))
              (key (and m (treesit-node-start m))))
         (if (and key (gethash key seen))
             (push c extras)
@@ -1028,7 +1482,7 @@ an older version of this code into that shape."
          (firsts (car split))
          (extras (cdr split)))
     (dolist (c extras)
-      (let* ((m (verilog-auto--enclosing-of-type c "module_declaration"))
+      (let* ((m (verilog-auto--enclosing-of-types c '("module_declaration" "interface_declaration")))
              (nm (and m (verilog-auto--module-name m))))
         (when (and nm (not (member nm verilog-auto--multi-autowire-modules)))
           (push nm verilog-auto--multi-autowire-modules))))
@@ -1062,7 +1516,7 @@ AUTOINST/AUTOWIRE look up via `verilog-auto--module-ports'). A
 non-ANSI header where `/*AUTOARG*/' sits alongside OTHER, genuinely
 explicit arg names is accordingly not handled specially -- see this
 file's header."
-  (if (string= (treesit-node-type header) "module_ansi_header")
+  (if (verilog-auto--ansi-header-p header)
       (progn
         (push (verilog-auto--module-name module-decl) verilog-auto--ansi-autoarg-modules)
         0)
@@ -1211,7 +1665,7 @@ by the phases that run afterward)."
         ;; `verilog-auto--expand-autoarg-site'), so the region after it
         ;; is never machine-generated -- it's the user's own explicit
         ;; ANSI port declarations, which must never be deleted.
-        (when (and c (not (string= (treesit-node-type header) "module_ansi_header")))
+        (when (and c (not (verilog-auto--ansi-header-p header)))
           (let ((close (verilog-auto--last-child (verilog-auto--header-port-list header))))
             (when close
               (push (cons (treesit-node-end c) (treesit-node-start close)) ranges))))))
@@ -1247,6 +1701,7 @@ one undo group."
           (verilog-auto--missing-modules nil)
           (verilog-auto--ansi-autoarg-modules nil)
           (verilog-auto--multi-autowire-modules nil)
+          (verilog-auto--template-parse-warnings nil)
           (n-inst 0) (n-wire 0) (n-arg 0))
       (setq n-inst (verilog-auto--expand-all-autoinst))
       (setq n-wire (verilog-auto--expand-all-autowire))
@@ -1255,6 +1710,7 @@ one undo group."
       (setq verilog-auto--missing-modules (nreverse verilog-auto--missing-modules))
       (setq verilog-auto--ansi-autoarg-modules (nreverse verilog-auto--ansi-autoarg-modules))
       (setq verilog-auto--multi-autowire-modules (nreverse verilog-auto--multi-autowire-modules))
+      (setq verilog-auto--template-parse-warnings (nreverse verilog-auto--template-parse-warnings))
       ;; Folded onto whichever of the three messages below actually
       ;; fires -- see `verilog-delete-auto's own docstring for why an
       ;; immediate, separate echo for either of these would just be
@@ -1270,6 +1726,16 @@ one undo group."
                           (if (> (length verilog-auto--multi-autowire-modules) 1)
                               (format " (%d total)" (length verilog-auto--multi-autowire-modules))
                             ""))
+                "")
+              ;; M92 fix round S1: a template rule line that matched
+              ;; neither the exact nor the wildcard shape used to vanish
+              ;; with no trace at all; recorded and folded in here now,
+              ;; same "can't show two things in one echo line" reasoning
+              ;; as every other notice above.
+              (if verilog-auto--template-parse-warnings
+                  (format "; %d AUTO_TEMPLATE line(s) not recognized (first: %S)"
+                          (length verilog-auto--template-parse-warnings)
+                          (car verilog-auto--template-parse-warnings))
                 ""))))
         (cond
          (verilog-auto--missing-modules

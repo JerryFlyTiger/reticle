@@ -382,6 +382,45 @@
 ;;    for that (not `file://' over an editor-internal `/ssh:' path) --
 ;;    is out of scope for v1 entirely, not something this milestone
 ;;    attempts even partially.
+;;  - M99: `lsp-start' gained a third, optional CWD argument, passed by
+;;    `lsp-connect'/`lsp--autostart-begin' as the project root (when it
+;;    exists on disk) -- so a server's own per-project config file with
+;;    relative paths (e.g. `slang-server''s `.slang/server.json', whose
+;;    `flags' can read `"-I include"') resolves correctly regardless of
+;;    where the editor process itself was launched from, rather than
+;;    only by accident. Known gaps, documented rather than silently
+;;    fixed:
+;;      - `lsp-merge-diagnostics-from-all-clients' (default t) now
+;;        paints the UNION of every attached client's diagnostics for a
+;;        buffer, since this project's two Verilog servers are
+;;        complementary rather than redundant (see that variable's own
+;;        docstring for the measured numbers). There is deliberately NO
+;;        cross-server dedup: if two servers each flag the same real
+;;        syntax error in their own wording, both diagnostics are shown
+;;        -- see `lsp--diagnostics-for-uri''s docstring for why nothing
+;;        here can tell that case apart from two genuinely different
+;;        defects that happen to read similarly.
+;;      - M87 stage 3's inline diagnostic rows involve TWO separate
+;;        budgets in `crates/core/src/redisplay.rs', and merging two
+;;        servers' diagnostics interacts with only one of them: each
+;;        individual diagnostic message is capped at 3 rendered lines
+;;        (`diag_message_lines', a `take(3)` on the message split on
+;;        `\n`, unrelated to how many clients published it) -- that cap
+;;        is untouched by M99. What DOES get more likely to bind is the
+;;        other budget, `text_rows` (the window's own text-row count,
+;;        computed from window height, not a fixed constant): the inline
+;;        rows for every diagnostic on every line share that one
+;;        per-WINDOW budget, so a buffer with two servers' diagnostics
+;;        merged onto it produces more total rows competing for the same
+;;        budget than a single server would have, and rows past the
+;;        budget are silently dropped (`emit_block_rows`'s `break
+;;        'outer`) exactly as they already were pre-M99 for a single
+;;        chatty server. This milestone does not raise or otherwise
+;;        change that budget.
+;;      - The `.slang/server.json' config file's `flags' relative paths
+;;        are resolved by slang-server itself against ITS OWN cwd, which
+;;        M99 pins to the project root -- a user who writes an absolute
+;;        path there instead is unaffected either way.
 
 (cl-defstruct lsp--client
   conn                  ; the raw lsp-connection handle
@@ -433,11 +472,19 @@
     id))
 
 (defun lsp--merge-diagnostics (client uri diags)
+  "Store DIAGS (CLIENT's own publish for URI) unconditionally, then let
+`lsp--decorate-buffer' decide whether CLIENT is also allowed to repaint
+the buffer's squiggles/gutter/inline rows (M94: a buffer with two
+attached clients would otherwise flicker between them after every
+edit -- see `lsp--diagnostics-authoritative-command's own doc).
+Storage is unconditional and per-CLIENT (`lsp--client-diagnostics')
+regardless of which client gets to decorate, so a non-decorating
+client's diagnostics are never lost, only not painted."
   (setf (lsp--client-diagnostics client)
         (cons (cons uri diags)
               (delq (assoc uri (lsp--client-diagnostics client))
                     (lsp--client-diagnostics client))))
-  (lsp--decorate-buffer uri diags))
+  (lsp--decorate-buffer client uri diags))
 
 (defun lsp--severity-color (sev)
   (cond ((eq sev 1) "#f44747")
@@ -509,39 +556,271 @@ from buffer positions."
   (cons (1- (line-number-at-pos pos))
         (lsp--utf16-character-at pos)))
 
-(defun lsp--decorate-buffer (uri diags)
+;; --- M94: diagnostics decoration authority -------------------------------
+
+(defvar lsp--diagnostics-authoritative-command nil
+  "Buffer-local (M94): the server COMMAND string (matching
+`lsp--client-command') whose `textDocument/publishDiagnostics' is
+allowed to DECORATE this buffer -- overlays, gutter dots, the mode-
+line count, M87 stage 3's inline diagnostic rows. nil (the default)
+means \"whichever client is `lsp--buffer-client', the primary\", so a
+buffer with only one attached client behaves exactly as before this
+variable existed -- decoration was never gated by anything before
+M94, and a single client is trivially always its own primary.
+
+A second attached client's diagnostics are still STORED on its own
+`lsp--client-diagnostics' either way (`lsp--merge-diagnostics' never
+consults this variable, only `lsp--decorate-buffer' does) -- only
+DECORATION is gated, so `next-diagnostic'/`previous-diagnostic'/
+`lsp--diagnostics-at-point' could still reach a non-decorating
+client's diagnostics explicitly in a future extension. As of M94 v1
+they do NOT: all three read only `lsp--buffer-client''s (the
+primary's) diagnostics, so a secondary's publishes are stored but not
+navigable -- an accepted scope limit, not an oversight. Not consulted
+by anything except `lsp--diagnostics-authoritative-client'.
+
+M94 review AA5: this variable is a STUB, not live configuration -- it
+is `defvar'd here and read by `lsp--diagnostics-authoritative-client',
+but as of M94 v1 NOTHING ever `setq'/`setq-local's it anywhere in this
+file or its tests. It exists so the override path is already wired for
+a future milestone that wants to let a buffer (or a user) name which
+attached server's diagnostics get decorated instead of always
+defaulting to the primary; until that milestone, this variable is
+always nil in practice and every buffer's decoration authority is
+decided purely by `lsp--buffer-client' liveness, as described above.")
+
+(defun lsp--diagnostics-authoritative-client ()
+  "The current buffer's diagnostics-authoritative client (M94), if
+LIVE, else nil. Either the attached client (`lsp--effective-buffer-
+clients') whose own `command' `equal's `lsp--diagnostics-authoritative-
+command' (when that variable is set), or `lsp--buffer-client' (the
+primary) otherwise. Returns nil -- \"authority unestablished\", NOT
+\"nothing may decorate\" -- whenever no such client is currently live:
+no primary has ever attached, or the one that did has since died. See
+`lsp--diagnostics-authoritative-p', the only caller, for why that
+distinction is the whole fix for M94 review Z1/Z4: it must never be
+read as an all-or-nothing gate."
+  (if lsp--diagnostics-authoritative-command
+      (let (found)
+        (dolist (client (lsp--effective-buffer-clients) found)
+          (when (and (not found)
+                     (lsp--client-p client)
+                     (equal (lsp--client-command client)
+                            lsp--diagnostics-authoritative-command)
+                     (lsp--client-conn-live-p client))
+            (setq found client))))
+    (and lsp--buffer-client (lsp--client-conn-live-p lsp--buffer-client)
+         lsp--buffer-client)))
+
+(defun lsp--diagnostics-authoritative-p (client)
+  "Non-nil if CLIENT may decorate the current buffer (M94). DEFAULT
+OPEN: true unless a DIFFERENT, LIVE authoritative client already
+exists for this buffer (`lsp--diagnostics-authoritative-client') --
+this only ever REJECTS a client that is meant to be non-authoritative
+while another live one already holds that role; it never requires
+proof of primacy before a buffer's first (and possibly only)
+publisher is allowed to decorate it.
+
+M94 review Z1: the original version compared CLIENT against
+`lsp--buffer-client' directly and returned nil whenever that was nil
+(no primary attached at all) -- exactly backwards for the ordinary
+case of a single client with nothing yet calling it \"primary\"
+(`gui_features_tests.rs's `lsp_diagnostics_decorate_the_visiting_
+buffer' dispatches from a synthetic client with no `M-x lsp' ever run
+in the buffer, and that publish must still decorate). Z4: the same
+raw `eq' also had no liveness check, so a primary that died left every
+later publish from a live secondary permanently rejected -- fixed for
+free by routing through `lsp--diagnostics-authoritative-client', whose
+own liveness check is what makes authority nil (hence \"decorate\")
+once the one-time authoritative client is gone.
+
+M94 review AA5 (boundary, not a bug -- v1 as designed): this gate is
+flicker-proof ONLY because a buffer today has AT MOST one primary and
+one secondary attached (`lsp-server-alist' plus `lsp-secondary-server-
+alist' each contribute at most one entry per mode). If a future
+milestone ever attaches a THIRD client, every one of them would
+default-open decorate whenever the (single) authoritative slot is
+empty, which is exactly the flicker between publishers this gate
+exists to prevent -- default-open only avoids flicker for the
+\"zero or one authoritative client\" case, not \"more than two
+clients total\". Likewise, a MODE that registers only a secondary
+(no `lsp-server-alist' entry at all, so the primary slot stays
+PERMANENTLY nil -- see `lsp--client-role-is-primary-p') never
+establishes authority at all, so its secondary decorates
+unconditionally forever; harmless with exactly one such client, but
+the same flicker risk the moment a second one is added for that
+mode. Neither case is reachable with this milestone's own default
+configuration (Verilog: one primary, one secondary), so this is
+recorded as a known boundary for a future extension to respect, not
+fixed here."
+  (let ((authoritative (lsp--diagnostics-authoritative-client)))
+    (or (not authoritative) (eq client authoritative))))
+
+(defvar lsp-merge-diagnostics-from-all-clients t
+  "M99: when non-nil (the default), `lsp--decorate-buffer' paints the
+UNION of every attached client's stored diagnostics for a buffer's URI,
+not just the diagnostics-authoritative one -- see
+`lsp--diagnostics-for-uri'. This exists because, measured against real
+Verilog LSP servers, the two this project talks to are COMPLEMENTARY,
+not redundant: on a tab-indented file, `verible-verilog-ls' reports 3
+`no-tabs' style-lint diagnostics and `slang-server' reports 0; on
+`demo/rtl/top/soc_top.sv', verible reports 0 and slang reports 17
+(undriven-output-port, never-assigned, and other elaboration-level
+diagnostics verible doesn't perform at all). Routing every buffer's
+decoration through only the M94 authoritative client would silently
+throw away one server's entire category of diagnostics.
+
+Setting this to nil restores the exact M94 behavior: only the
+diagnostics-authoritative client's own publish decorates the buffer,
+and a secondary client's diagnostics are stored (`lsp--merge-
+diagnostics' always stores, regardless of this variable) but never
+painted. Kept as an escape hatch rather than deleting the M94 gate
+outright, since the flicker M94 was written to prevent is a real
+failure mode this variable's own default merely routes around instead
+of eliminating -- see `lsp--diagnostics-for-uri''s doc comment for what
+merging costs in exchange (no cross-server dedup) and this file's M99
+header note for the inline-diagnostic-row consequence.")
+
+(defun lsp--diagnostics-for-uri (client uri)
+  "The list of diagnostic hash-tables that should be considered
+'published for URI' from CLIENT's point of view, for painting
+(`lsp--decorate-buffer') or navigation (`next-diagnostic'/`previous-
+diagnostic'/`lsp--diagnostics-at-point').
+
+When `lsp-merge-diagnostics-from-all-clients' is nil: exactly CLIENT's
+own stored diagnostics for URI (`lsp--client-diagnostics'), as a list
+in their original published order -- the pre-M99 behavior, just
+returned as a list instead of a vector so callers don't need to know
+which storage shape they got.
+
+When non-nil (the default): the diagnostics stored for URI by every
+client in `(lsp--effective-buffer-clients)', in that list's order, each
+client's own diagnostics kept in their original published order, CLIENT
+appended at the end if it isn't already among them (this matters: a
+caller can pass a synthetic CLIENT that was never attached via `M-x lsp'
+and so never joined `lsp--buffer-clients' -- a test fixture does exactly
+this -- and dropping its diagnostics here would make `lsp-merge-
+diagnostics-from-all-clients' silently narrower than advertised).
+
+Dedup happens at the CLIENT-LIST level (the walked list of clients is
+made unique by `memq' before anything is read from it), NOT at the
+diagnostic-content level -- every diagnostic actually stored on a
+client that's walked exactly once is kept unconditionally, with no key
+built from its fields at all. This is deliberate, not an omission: a
+content-derived key (say, start line/character/severity/message) can
+never tell apart \"the same diagnostic walked twice\" (the only real
+duplication this function needs to guard against -- CLIENT or another
+client appearing more than once in the walked list) from \"two
+genuinely different diagnostics that happen to start at the same place
+with the same severity and the same wording, but a different `range.
+end''\ -- or, across two different servers, two independent diagnoses
+of the same real defect that happen to read identically. Both of those
+are real diagnostics a user needs to see; silently dropping the second
+one because its key collided with the first would be exactly the kind
+of quiet data loss this function exists to avoid. See the file header's
+M99 note for the same point made about cross-server near-duplicates.
+
+Deliberately NOT filtered by `lsp--client-conn-live-p': a single dead
+client's decorations already persist untouched until something
+publishes fresh ones (there was never a liveness filter on this path
+before M99), and adding one here would be an unrelated behavior change
+this milestone isn't scoped to make."
+  (if (not lsp-merge-diagnostics-from-all-clients)
+      ;; `diags' is a VECTOR (verbatim from `json-parse-string'), and
+      ;; this elisp implementation's `append' -- unlike real Emacs --
+      ;; only accepts a proper list in a non-final argument position, so
+      ;; the vector is walked by hand rather than via `(append diags
+      ;; nil)'. No dedup here: this is a single client's own publish,
+      ;; verbatim, matching the pre-M99 caller contract exactly.
+      (let ((diags (cdr (assoc uri (lsp--client-diagnostics client))))
+            (out nil))
+        (when diags
+          (let ((n (length diags)) (i 0))
+            (while (< i n)
+              (push (aref diags i) out)
+              (setq i (1+ i)))))
+        (nreverse out))
+    ;; Dedup the CLIENT LIST itself (not diagnostic content -- see the
+    ;; docstring above): walk `lsp--effective-buffer-clients', appending
+    ;; CLIENT at the end if absent, then drop any client already seen
+    ;; earlier in that same walk via `memq', preserving first-occurrence
+    ;; order throughout.
+    (let ((raw-clients (lsp--effective-buffer-clients)))
+      (unless (memq client raw-clients)
+        (setq raw-clients (append raw-clients (list client))))
+      (let ((clients nil))
+        (dolist (c raw-clients)
+          (unless (memq c clients)
+            (push c clients)))
+        (setq clients (nreverse clients))
+        (let ((out nil))
+          (dolist (c clients)
+            (let ((diags (cdr (assoc uri (lsp--client-diagnostics c)))))
+              (when diags
+                (let ((n (length diags)) (i 0))
+                  (while (< i n)
+                    (push (aref diags i) out)
+                    (setq i (1+ i)))))))
+          (nreverse out))))))
+
+(defun lsp--decorate-buffer (client uri diags)
   "M16: turn published diagnostics into wavy underlines + gutter data
-for the buffer visiting URI, if any. Old decorations are replaced."
+for the buffer visiting URI, if any. Old decorations are replaced.
+
+M94: only does any of that when CLIENT is the buffer's diagnostics-
+authoritative client (`lsp--diagnostics-authoritative-p') -- a
+non-authoritative CLIENT's publish was already stored by
+`lsp--merge-diagnostics' before this was ever called, so this function
+existing at all changes nothing for a buffer with only one attached
+client (its lone client is always authoritative by that function's own
+default).
+
+M99: when `lsp-merge-diagnostics-from-all-clients' is non-nil (the
+default), the authoritative-client gate above is SKIPPED entirely, and
+what actually gets painted is `(lsp--diagnostics-for-uri client uri)'
+-- the union across every attached client -- rather than DIAGS (CLIENT's
+own fresh publish, still the parameter that got this function called at
+all, but no longer what determines what's drawn). This is what removes
+the M94 flicker risk rather than merely working around it: whichever
+client just published, the repaint always redraws the same union, so
+there is nothing left to flicker between. DIAGS itself was already
+stored into `lsp--client-diagnostics' by `lsp--merge-diagnostics' before
+this function runs, so `lsp--diagnostics-for-uri' sees it."
   (let* ((path (if (string-prefix-p "file://" uri) (substring uri 7) uri))
          (buf (get-file-buffer path)))
     (when buf
       (with-current-buffer-internal buf
         (lambda ()
-          ;; Drop our old squiggles only.
-          (dolist (ov (overlays-in (point-min) (point-max)))
-            (when (overlay-get ov 'lsp-diag)
-              (delete-overlay ov)))
-          (let ((gutter nil) (i 0) (n (length diags)))
-            (while (< i n)
-              (let* ((d (aref diags i))
-                     (range (gethash "range" d))
-                     (start (gethash "start" range))
-                     (end (gethash "end" range))
-                     (sev (or (gethash "severity" d) 1))
-                     (sev (if (eq sev :null) 1 sev))
-                     (from (lsp--pos-at (gethash "line" start)
-                                        (gethash "character" start)))
-                     (to (lsp--pos-at (gethash "line" end)
-                                      (gethash "character" end)))
-                     (ov (make-overlay from (if (> to from) to (1+ from)))))
-                (overlay-put ov 'lsp-diag t)
-                (overlay-put ov 'face
-                             (list ':underline
-                                   (list ':style 'wave
-                                         ':color (lsp--severity-color sev))))
-                (setq gutter (cons (cons (gethash "line" start) sev) gutter)))
-              (setq i (1+ i)))
-            (lsp--set-buffer-diagnostics buf gutter)))))))
+          (when (or lsp-merge-diagnostics-from-all-clients
+                    (lsp--diagnostics-authoritative-p client))
+            ;; Drop our old squiggles only.
+            (dolist (ov (overlays-in (point-min) (point-max)))
+              (when (overlay-get ov 'lsp-diag)
+                (delete-overlay ov)))
+            (let ((gutter nil))
+              (dolist (d (lsp--diagnostics-for-uri client uri))
+                (let* ((range (gethash "range" d))
+                       (start (gethash "start" range))
+                       (end (gethash "end" range))
+                       (sev (or (gethash "severity" d) 1))
+                       (sev (if (eq sev :null) 1 sev))
+                       (from (lsp--pos-at (gethash "line" start)
+                                          (gethash "character" start)))
+                       (to (lsp--pos-at (gethash "line" end)
+                                        (gethash "character" end)))
+                       (ov (make-overlay from (if (> to from) to (1+ from))))
+                       (msg (or (gethash "message" d) "")))
+                  (overlay-put ov 'lsp-diag t)
+                  (overlay-put ov 'face
+                               (list ':underline
+                                     (list ':style 'wave
+                                           ':color (lsp--severity-color sev))))
+                  ;; M87 stage 3: (LINE . (SEVERITY . MESSAGE)) -- adds the
+                  ;; message text `lsp--set-buffer-diagnostics' needs to feed
+                  ;; inline diagnostic rows, alongside the gutter dot/count it
+                  ;; already fed.
+                  (setq gutter (cons (cons (gethash "line" start) (cons sev msg)) gutter))))
+              (lsp--set-buffer-diagnostics buf gutter))))))))
 
 (defun lsp--dispatch (client msg)
   "Handle one parsed JSON-RPC message: fold a `publishDiagnostics`
@@ -723,8 +1002,20 @@ rather than left to the caller (`lsp'/`lsp--maybe-auto-attach') because
 CONN only exists here -- a caller catching the re-signaled error never
 gets a handle to kill it itself. Not reached at all on a spawn failure
 (`lsp-start' signaling): there is no CONN yet in that case, nothing to
-kill."
-  (let* ((conn (lsp-start command args))
+kill.
+
+M99: ROOT-PATH is also passed to `lsp-start' as the server process's
+cwd, but only when it names a directory that actually exists on disk
+(`file-directory-p'). This matters because some servers (slang-server's
+`.slang/server.json') resolve per-project config relative paths against
+the server's own cwd, not against `rootUri' or the config file's
+location -- pinning the cwd is the only way such a config works
+regardless of where the editor itself was launched from. The existence
+guard exists so a bogus or stale ROOT-PATH can't turn a spawn that
+would otherwise succeed (cwd unset, inherited from the editor) into one
+that fails outright."
+  (let* ((conn (lsp-start command args
+                          (and root-path (file-directory-p root-path) root-path)))
          (client (make-lsp--client :conn conn :command command)))
     (condition-case err
         (let* ((id (lsp--request
@@ -1257,8 +1548,19 @@ exactly. DIRECTION is `next' or `prev'."
   "Shared body of `lsp-next-symbol'/`lsp-previous-symbol': request
 `textDocument/documentSymbol', then jump to the nearest symbol in
 DIRECTION (`next' or `prev') once the reply lands. Async, same
-staleness/buffer-identity discipline as `lsp-format-buffer'."
-  (let ((client (lsp--live-buffer-client)))
+staleness/buffer-identity discipline as `lsp-format-buffer'.
+
+M95: routes via `lsp--preferred-role-client' (\"textDocument/
+documentSymbol\", \"documentSymbolProvider\") instead of reading
+`lsp--live-buffer-client' directly, so a capable secondary answers this
+in preference to the primary -- see that variable's own docstring for
+why (verible omits ports/parameters and mistypes the module itself). A buffer with only one attached client occupying the PRIMARY slot
+behaves identically to before -- see `lsp--preferred-role-client''s own
+docstring for the one state that is NOT identical (a lone SECONDARY
+sitting in an empty primary slot), which this now answers where it
+previously refused."
+  (let ((client (lsp--preferred-role-client "textDocument/documentSymbol"
+                                             "documentSymbolProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
@@ -1327,9 +1629,13 @@ positions."
 `lsp-previous-symbol' never had (see their own docstrings). Fetches
 `textDocument/documentSymbol' fresh on every call, same no-cache
 discipline as `lsp--goto-symbol' (see `lsp--buffer-symbols's doc for
-why). Bound to `C-c l s' (M48 Part D, see simple.el)."
+why). Bound to `C-c l s' (M48 Part D, see simple.el).
+
+M95: routes via `lsp--preferred-role-client', same as `lsp--goto-symbol'
+-- see its own M95 note."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--preferred-role-client "textDocument/documentSymbol"
+                                             "documentSymbolProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
@@ -1420,23 +1726,26 @@ astral-plane character before the diagnostic, the squiggle
 `lsp--decorate-buffer' draws and the point range this function
 considers \"inside\" the same diagnostic can disagree by a character or
 two. Fixing `lsp--decorate-buffer' to match is the file header's own
-tracked follow-up, not an M48-shaped change."
+tracked follow-up, not an M48-shaped change.
+
+M99: reads the same union `lsp--diagnostics-for-uri' reads for painting
+-- previously this only ever considered `lsp--buffer-client''s own
+diagnostics, so a diagnostic drawn on screen from a secondary client
+could be invisible to this function (and hence to `lsp-code-action-at-
+point', which calls this) even though the squiggle was right there."
   (let ((client lsp--buffer-client)
         (file (buffer-file-name))
         (pos (point))
         (out nil))
     (when (and client file)
-      (let* ((diags (lsp-diagnostics client file))
-             (n (if diags (length diags) 0)))
-        (dotimes (idx n)
-          (let* ((d (aref diags idx))
-                 (range (gethash "range" d))
-                 (start (gethash "start" range))
-                 (end (gethash "end" range))
-                 (from (lsp--pos-at-utf16 (gethash "line" start) (gethash "character" start)))
-                 (to (lsp--pos-at-utf16 (gethash "line" end) (gethash "character" end))))
-            (when (if (= from to) (= pos from) (and (>= pos from) (< pos to)))
-              (push d out))))))
+      (dolist (d (lsp--diagnostics-for-uri client (lsp--path-to-uri file)))
+        (let* ((range (gethash "range" d))
+               (start (gethash "start" range))
+               (end (gethash "end" range))
+               (from (lsp--pos-at-utf16 (gethash "line" start) (gethash "character" start)))
+               (to (lsp--pos-at-utf16 (gethash "line" end) (gethash "character" end))))
+          (when (if (= from to) (= pos from) (and (>= pos from) (< pos to)))
+            (push d out)))))
     (nreverse out)))
 
 (defun lsp--code-action-context (diags)
@@ -1666,9 +1975,21 @@ TICK is captured right after `lsp--sync-buffer-now', and checked again
 just before applying.
 
 Empty `changes' (or a null result) messages \"Rename not available
-here\" rather than applying nothing silently."
+here\" rather than applying nothing silently.
+
+M95: routes via `lsp--preferred-role-client' (\"textDocument/rename\",
+\"renameProvider\") instead of reading `lsp--live-buffer-client'
+directly, so a capable secondary answers this in preference to the
+primary -- see that variable's own docstring for why (verible drops the
+`endmodule : LABEL' end-label on a module rename, an IEEE 1800 compile
+error). A buffer with only one attached client occupying the PRIMARY slot
+behaves identically to before -- see `lsp--preferred-role-client''s own
+docstring for the one state that is NOT identical (a lone SECONDARY
+sitting in an empty primary slot), which this now answers where it
+previously refused."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--preferred-role-client "textDocument/rename"
+                                             "renameProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
@@ -1803,6 +2124,59 @@ zero candidates at a port-connection `.' (46 candidates at an ordinary
 identifier position, so completion itself works), which is exactly the
 position the local tier covers.")
 
+(defvar lsp-secondary-server-alist
+  '((verilog-mode . ("slang-server")))
+  "Alist of MAJOR-MODE -> (COMMAND . ARGS), mirroring `lsp-server-alist'
+above but for a SECOND server attached to the same buffer (M94),
+routed by capability rather than picked by the user. `lsp-server-alist'
+itself is UNCHANGED -- its entry stays the buffer's PRIMARY client,
+`lsp--buffer-client', with every one of its existing semantics and
+every existing reader untouched. This table only ever adds to the new
+`lsp--buffer-clients' list.
+
+Only autostart (`lsp--autostart-maybe-begin') ever consults this
+table -- `M-x lsp' and the `find-file-hook' reuse path
+(`lsp--maybe-auto-attach') are unchanged and only ever look at
+`lsp-server-alist'. A buffer opened before autostart has run, or with
+`lsp-autostart' nil, never gets a secondary client attached; that is
+an accepted v1 gap, not a bug (compare `lsp-autostart's own doc for
+the equivalent gap the PRIMARY side had before M88).
+
+For `verilog-mode', the default secondary is `slang-server': measured
+2026-08-11/2026-09-02 against real binaries on `demo/rtl/', it is the
+only one of the two Verilog servers this editor knows about that
+advertises `completionProvider' or publishes real elaborated
+diagnostics (undriven output ports, variables never assigned) that
+verible cannot find structurally -- see `lsp-server-alist''s own
+docstring for the fuller verible-versus-slang comparison this decision
+is drawn from.
+
+`lsp-completion-at-point' and `lsp-hover-at-point' (M94) route to
+whichever attached client's advertised capabilities support the
+request. M95 adds five more to that routed set -- definition,
+references, documentSymbol, rename, documentHighlight -- each PREFERRING
+the secondary over the primary (the opposite tie-break from
+`lsp--capable-client''s default), per `lsp-request-preferred-role-alist'
+and measured against real binaries: verible is silently incomplete on
+references and documentSymbol, drops the `endmodule : LABEL' end-label
+on a module rename (an IEEE 1800 compile error), and fails definition/
+documentHighlight on a name reached through `import PKG::*'. codeAction
+and formatting are UNCHANGED -- formatting because slang has no
+formatting capability at all, codeAction because it was never
+evaluated for this milestone -- both keep reading `lsp--buffer-client'
+directly, so the primary (verible, by default) answers those exactly as
+it did before either milestone existed. Picking the better of two
+answers when BOTH servers could answer the same request, for any method
+NOT in `lsp-request-preferred-role-alist', is still explicitly OUT OF
+SCOPE -- that needs per-capability probing of both servers, not an
+architecture change, and is left for a follow-up milestone.
+
+Diagnostics: both attached clients' publishes are always STORED
+(`lsp--client-diagnostics', already per-client), but only the buffer's
+diagnostics-authoritative client's publish is DECORATED on screen --
+see `lsp--diagnostics-authoritative-command' for why, and why this
+table has no matching \"which one wins\" knob of its own.")
+
 ;; --- Project root detection ---
 
 (defvar lsp--project-root-markers
@@ -1852,19 +2226,221 @@ between the two rather than each reimplementing the same
 over time."
   (and file (string-prefix-p "/ssh:" file)))
 
-(defun lsp--project-root (file)
-  "Project root for FILE: the nearest ancestor directory -- starting at
-FILE's own directory and walking up -- containing one of
-`lsp--project-root-markers', or FILE's own directory if none do.
-Returned without a trailing slash, matching `lsp-connect's ROOT-PATH."
-  (let* ((start (file-name-directory (expand-file-name file)))
-         (dir start)
-         (found nil))
+(defun lsp--nearest-marker-root (start)
+  "Walk upward from START (a directory, trailing slash) looking for the
+nearest ancestor -- START itself included -- containing any one of
+`lsp--project-root-markers'. Returns that directory (trailing slash),
+or nil if none of START's ancestors has one. The original, mode-
+agnostic algorithm; kept as its own function so `lsp--project-root'
+can fall back to it verbatim for non-Verilog buffers."
+  (let ((dir start) (found nil))
     (while (and dir (not found))
       (if (lsp--dir-has-marker-p dir)
           (setq found dir)
         (let ((parent (file-name-directory (directory-file-name dir))))
           (setq dir (if (and parent (not (string= parent dir))) parent nil)))))
+    found))
+
+(defun lsp--home-directory ()
+  "The user's home directory, no trailing slash, as `expand-file-name'
+resolves \"~\". Computed fresh on every call rather than cached at
+load time, because M93's own bound test overrides `$HOME' between
+calls and must see the change take effect immediately."
+  (directory-file-name (expand-file-name "~")))
+
+(defvar lsp--nearest-filelist-root-cache (make-hash-table :test 'equal)
+  "Per-(START . HOME) memo for `lsp--nearest-filelist-root'. Added in
+M93's fix round: `lsp--autostart-maybe-begin' calls `lsp--project-root'
+(hence this function, for a Verilog buffer) from `lsp--autostart-tick'
+-- once per idle tick, i.e. once per frame/poll -- and for a buffer
+that never attaches (no server registered, autostart already given up,
+or simply not connected yet) that repeats the SAME filesystem walk on
+every single tick with no caller-side throttling. Without this cache,
+a Verilog buffer with no `verible.filelist' anywhere above it pays one
+`file-exists-p' per ancestor up to `lsp--home-directory' every tick,
+forever. (Reviewer-confirmed, M93 second fix round: reverting this
+cache entirely fails no test in this file -- every assertion here
+checks only the FINAL root string, and a fresh, uncached walk returns
+the identical answer, so the cache's only observable effect is speed.
+No test in this suite watches call count or wall time; the 212.59us ->
+5.82us improvement recorded in the M93 fix-round report for the
+already-attached case, and the smaller before/after difference measured
+for this cache specifically, are not something a green test run
+certifies on its own.)
+
+Keyed on the PAIR (START . HOME), not START alone -- W2, M93 third fix
+round: `lsp--home-directory' reads `$HOME' fresh on every call
+specifically so a test overriding it takes effect immediately (see
+that function's own docstring), but a cache keyed on START alone would
+silently defeat that guarantee -- the same START directory probed
+before and after `$HOME' changes within one process would return the
+answer computed under the OLD home on the second call, disagreeing
+with what a fresh walk would say. Including HOME in the key makes a
+home change simply populate a new cache entry instead of returning a
+stale one; this was unreachable in practice only because every test
+that exercises this cache uses a directory unique to that test, never
+reusing a probed START across a `$HOME' override.
+
+The stored value is the walk's own result (a directory string or nil)
+wrapped in a one-element list, so a cached \"found nothing\" answer
+(value nil) is distinguishable from \"never computed\" via `gethash's
+own DEFAULT argument -- a bare `gethash' with no default would
+conflate the two, since a hash table's normal miss value is also nil.
+
+Never invalidated in v1 apart from the HOME component above: creating,
+deleting, or moving a `verible.filelist' during a live session, with
+`$HOME' unchanged, leaves any already-probed directory's answer stale
+until the editor restarts. Accepted because (a) a project's marker
+layout changing shape underneath a running session is rare, (b) a
+stale answer costs at most one wrong autostart root or one wrong
+AUTO/nav lookup -- recoverable by restarting the editor or, in v1, not
+otherwise -- never silent data loss, and (c) every OTHER repeated call
+to `lsp--project-root' for the same file (every `hover'/`definition'
+request, for instance) already re-walks the filesystem from scratch
+with no caching at all; this cache is a savings layered on top of that
+existing behavior, not a new correctness contract this function is
+introducing.")
+
+(defun lsp--nearest-filelist-root (start)
+  "Walk upward from START (a directory, trailing slash) looking for the
+nearest ancestor -- START itself included -- containing a
+`verible.filelist' directly. Returns that directory (trailing slash),
+or nil if no ancestor has one (memoized -- see
+`lsp--nearest-filelist-root-cache'). Unlike `lsp--nearest-marker-root'
+this checks ONLY `verible.filelist', ignoring every other entry in
+`lsp--project-root-markers' -- so a `.git' or `Cargo.toml' sitting
+between START and the filelist does not stop the walk here, which is
+the entire point of calling this separately from `lsp--project-root'.
+
+M93 fix round (R1): the walk never ascends past, and never returns,
+`lsp--home-directory' -- checked BEFORE probing each directory, so
+home itself is never accepted as an answer either. Without this bound
+a stray `verible.filelist' left directly in `$HOME', or in a directory
+ABOVE `$HOME' shared by several unrelated checkouts (a NAS mount point,
+`/Users' itself, ...), would outrank the buffer's own much nearer
+`.git' and hand `lsp-connect' a `rootUri' spanning that entire
+unrelated tree -- this function's whole reason for existing is to look
+PAST a nearer generic marker for a SPECIFIC project's own filelist, not
+to wander into a different project (or no project at all) entirely.
+Bounding at `$HOME' does not fully close this -- a stray filelist
+somewhere under `$HOME' but still above the buffer's own project
+remains possible -- but it closes the two concrete cases raised in
+review, and a boundary any tighter than `$HOME' has no natural anchor
+to use instead.
+
+CONSEQUENCE, spelled out because the mechanism above only states the
+means and not the effect (M93 third fix round, W1): a
+`verible.filelist' placed directly AT `$HOME' is deliberately never
+honoured by this function, even when it is the only filelist anywhere
+above the buffer. A buffer under `$HOME' with its own nearer `.git'
+and a `verible.filelist' sitting exactly at `$HOME' itself resolves to
+the `.git' directory -- i.e. this function returns nil, and
+`lsp--project-root' falls through to `lsp--nearest-marker-root' -- NOT
+to `$HOME'. This is not an accident left over from the bound above; it
+is the bound doing exactly its job. Accepting `$HOME' as an answer
+here would hand `lsp-connect' the user's entire home directory as a
+`rootUri', which is precisely the failure mode R1 exists to prevent --
+a filelist one directory higher (in `$HOME's own parent) and a
+filelist AT `$HOME' are the same class of danger, and both are
+excluded by the same check. See
+`project_root_verilog_filelist_at_home_itself_is_not_honoured'
+(`lsp_mode_tests.rs'), which pins this as intended behavior, not
+something to \"fix\" back to honouring it."
+  (let* ((home (lsp--home-directory))
+         (cache-key (cons start home))
+         (cached (gethash cache-key lsp--nearest-filelist-root-cache
+                           'lsp--filelist-root-not-cached)))
+    (if (not (eq cached 'lsp--filelist-root-not-cached))
+        (car cached)
+      (let ((dir start) (found nil))
+        (while (and dir (not found)
+                    (not (string= (directory-file-name dir) home)))
+          (if (file-exists-p (concat dir "verible.filelist"))
+              (setq found dir)
+            (let ((parent (file-name-directory (directory-file-name dir))))
+              (setq dir (if (and parent (not (string= parent dir))) parent nil)))))
+        (puthash cache-key (list found) lsp--nearest-filelist-root-cache)
+        found))))
+
+(defun lsp--project-root (file)
+  "Project root for FILE: the nearest ancestor directory -- starting at
+FILE's own directory and walking up -- containing one of
+`lsp--project-root-markers', or FILE's own directory if none do.
+Returned without a trailing slash, matching `lsp-connect's ROOT-PATH.
+
+M93: for a Verilog/SystemVerilog FILE (`lsp--verilog-buffer-p'), a
+`verible.filelist' outranks every other, nearer marker. The plain walk
+above stops at the FIRST ancestor holding ANY marker, so a nearer
+`.git' (by far the common case -- a Verilog subtree checked into a
+larger repo) shadows a `verible.filelist' that sits further up and
+defines the actual project; `verilog-auto.el''s filelist reader would
+then silently look in the wrong place -- and worse, `lsp-connect'
+sends this exact value as the server's own `rootUri', so the SERVER
+itself gets misrooted, not just this editor's local AUTO/nav
+convenience. Measured 2026-08-11 (see `lsp--project-root-markers''s
+own docstring for the sibling `.slang' case, and M93's recon for this
+one) against a real `verible-verilog-ls': `textDocument/definition'
+against `rootUri' = the nearer `.git' ancestor returns `[]'; the same
+request against `rootUri' = the filelist ancestor resolves correctly.
+
+This deliberately diverges from `verilog-auto.el''s own documented
+stance (see its `verilog-auto--library-filelist-files' docstring,
+\"known limitation, accepted rather than fixed\") that matching
+verible's own rootUri-relative-to-nearest-marker algorithm is correct
+even when a `.git' sits in between. That stance holds for a CLIENT-
+side reader deciding where to look for a file the SERVER already
+computed its own root from independently -- but here the value this
+function returns becomes the server's root too, and the measurement
+above shows the server needs the filelist ancestor to answer
+anything. Diverging is not second-guessing verible; it is refusing to
+hand it the one rootUri that makes it blind. Do not \"fix\" this back
+into agreement with that other docstring -- they are describing two
+different roles for the same string.
+
+Only the nearest `verible.filelist' ancestor wins when several are
+nested (`lsp--nearest-filelist-root' stops at the first hit walking
+up), never an outer one. A non-Verilog FILE, or a Verilog FILE with no
+`verible.filelist' anywhere above it, resolves exactly as before this
+milestone -- the marker-precedence list and its ordering are
+unchanged for every other language. A non-Verilog FILE is structurally
+unreachable from the new codepath at all (`filelist-root' below is
+always nil for it), so it costs exactly what it cost before this
+milestone, not merely \"resolves the same\". And the new codepath can
+never SPLIT a previously shared root into two: `lsp--nearest-filelist-
+root's answer, when non-nil, is always the SAME AS or FARTHER FROM
+FILE than `lsp--nearest-marker-root's own answer would have been
+(a `verible.filelist' ancestor at or nearer than the nearest generic
+marker is already that nearest marker's own directory, since it's
+itself one of `lsp--project-root-markers') -- so two files that used to
+share a root because the SAME `.git' covered both keep sharing a root
+after this milestone; the only thing that can change is which
+directory that shared root actually is.
+
+M93 fix round: this is bounded at `lsp--home-directory' (see
+`lsp--nearest-filelist-root's own docstring for why and its limits) --
+a stray filelist above `$HOME' can no longer outrank a buffer's own
+much nearer marker.
+
+Case sensitivity: `lsp--verilog-buffer-p' matches `.v'/`.vh'/`.sv'/
+`.svh' exactly, so a file named e.g. `Top.V' is not recognized as
+Verilog by this function and silently falls back to the pre-M93
+shadowed walk for that one file -- the very bug this milestone exists
+to fix, just for that extension spelling. Deliberately not changed
+here: the predicate is shared with `lsp--references-empty-message' and
+is out of this milestone's scope; recorded so the next reader finds it
+stated rather than by surprise.
+
+NOT handled here, and out of scope for M93: a `verible.filelist' that
+exists but omits files actually on disk. The server then answers
+incompletely with no signal on the wire at all (confirmed by capturing
+the full JSON-RPC session: no `partialResultToken', no
+`window/logMessage', nothing on the response envelope) -- detecting
+that needs a disk walk cross-checked against the filelist, which lives
+in `verilog-auto.el' and is not this function's job."
+  (let* ((start (file-name-directory (expand-file-name file)))
+         (filelist-root (and (lsp--verilog-buffer-p file)
+                              (lsp--nearest-filelist-root start)))
+         (found (or filelist-root (lsp--nearest-marker-root start))))
     (directory-file-name (or found start))))
 
 ;; --- Connecting: M-x lsp ---
@@ -1892,23 +2468,111 @@ trip over here."
           nil)))))
 
 (defvar lsp--buffer-client nil
-  "Buffer-local: the `lsp--client' this buffer talks to. Set by `lsp'
-the first time it connects successfully in a buffer; nil if `lsp'
-hasn't been run here (or failed). `lsp-hover-at-point',
-`lsp-definition-at-point', and the diagnostic-navigation commands all
-read this rather than taking a client argument.")
+  "Buffer-local: the `lsp--client' this buffer talks to -- the buffer's
+PRIMARY client (M94: see `lsp--buffer-clients' for every attached
+client, primary included). Set by `lsp' the first time it connects
+successfully in a buffer; nil if `lsp' hasn't been run here (or
+failed). `lsp-definition-at-point' and the diagnostic-navigation
+commands read this rather than taking a client argument, and every
+request site except completion/hover (M94's two capability-routed
+exceptions -- see `lsp--capable-client') still does too, unchanged.
+`lsp-hover-at-point' now reads `lsp--capable-client' instead, which
+falls back to exactly this variable whenever no OTHER attached client
+supports `\"hoverProvider\"'.")
+
+(defvar lsp--buffer-clients nil
+  "Buffer-local (M94): every `lsp--client' attached to this buffer,
+`lsp--buffer-client' (the primary) included. `lsp--buffer-client'
+itself is UNCHANGED by this variable existing -- same semantics, same
+readers -- this list only ever grows alongside it, in
+`lsp--attach-current-buffer', so per-capability routing
+(`lsp--capable-client') and per-client protocol sync
+(`lsp--last-synced-tick') can walk every attached client without
+disturbing anything that reads `lsp--buffer-client' directly. Order is
+attach order, most-recently-attached first (the same `cons' discipline
+`lsp--clients' already uses); `lsp--buffer-client' is always the
+authoritative answer for \"which one is primary\", never this list's
+first element, regardless of order.
+
+M94 review Z5 correction: `lsp--capable-client' DOES rely on this
+list's order for its fallback (non-primary) branch -- when the primary
+itself isn't capable, it picks the first OTHER capable client in THIS
+order, i.e. whichever attached most recently among the rest. It checks
+the primary FIRST, separately, precisely so a merely-later-attached
+secondary never wins a tie against an equally-capable primary; see
+that function's own docstring for the concrete case (`hoverProvider:
+false' on verible) this exists to prevent.
+See `lsp--effective-buffer-clients' for how a caller (or a pre-M94
+test that only ever sets `lsp--buffer-client' directly) that never
+touches this list at all is still treated as \"one attached client\",
+not \"none\".")
 
 (defvar lsp--last-synced-tick nil
-  "Buffer-local (M35): the `buffer-modified-tick' as of the last
-`textDocument/didOpen' or `textDocument/didChange' sent for this
-buffer. Set alongside `lsp--buffer-client' by `lsp' right after
-didOpen, and updated by `lsp--sync-buffer-now' after each didChange.
-Not a strict iff with `lsp--buffer-client' (a dead client clears that
-variable but leaves this one; test stand-ins set that one without
-this) -- the guarantee that matters is one-directional: this stays
-nil until a real didOpen has been sent here, and
-`lsp--sync-buffer-now' requires BOTH a live client and a non-nil tick
-record, so a didChange can never precede its didOpen.")
+  "Buffer-local: alist of (CLIENT . TICK) -- M94, was a single integer
+per buffer before a buffer could have more than one attached client.
+TICK is the `buffer-modified-tick' as of the last `textDocument/
+didOpen' or `textDocument/didChange' sent to CLIENT for THIS buffer.
+Set alongside `lsp--buffer-client'/`lsp--buffer-clients' by
+`lsp--attach-current-buffer' right after CLIENT's own didOpen (via
+`lsp--set-client-synced-tick'), and updated per-client by
+`lsp--sync-buffer-now' after each didChange it sends. A client with no
+entry here has never been didOpen'd for THIS buffer -- most concretely,
+one that attaches AFTER an edit a different, already-attached client
+already saw: that edit must never be treated as already synced to the
+newcomer, since it never actually received a didChange (or a didOpen
+whose text already covered it) -- `lsp--attach-current-buffer' always
+creates a fresh entry at the CURRENT tick from CLIENT's own didOpen, so
+this invariant holds by construction rather than by comparing tick
+numbers after the fact. `lsp--client-synced-tick'/
+`lsp--set-client-synced-tick'/`lsp--clear-client-synced-tick' are the
+only things that read or write this alist; nothing else in this file
+inspects its shape directly.")
+
+(defun lsp--client-synced-tick (client)
+  "TICK last synced to CLIENT for the current buffer (M94), per
+`lsp--last-synced-tick', or nil if CLIENT has never been didOpen'd
+here."
+  (cdr (assq client lsp--last-synced-tick)))
+
+(defun lsp--set-client-synced-tick (client tick)
+  "Buffer-locally record TICK as the tick last synced to CLIENT (M94),
+replacing any existing entry for CLIENT in `lsp--last-synced-tick'."
+  (setq-local lsp--last-synced-tick
+              (cons (cons client tick)
+                    (let (out)
+                      (dolist (entry lsp--last-synced-tick (nreverse out))
+                        (unless (eq (car entry) client)
+                          (push entry out)))))))
+
+(defun lsp--clear-client-synced-tick (client)
+  "Remove CLIENT's entry from `lsp--last-synced-tick' (M94), if any."
+  (setq-local lsp--last-synced-tick
+              (let (out)
+                (dolist (entry lsp--last-synced-tick (nreverse out))
+                  (unless (eq (car entry) client)
+                    (push entry out))))))
+
+(defun lsp--client-conn-live-p (client)
+  "Non-nil if CLIENT (M94) is usable for a protocol send: either not a
+real `lsp--client' struct at all (a test's bare stand-in symbol, same
+asymmetric trust `lsp--live-buffer-client' already extends to a
+non-struct `lsp--buffer-client'), or a real struct whose own `conn' is
+either not a probe-able connection object or reports alive."
+  (or (not (lsp--client-p client))
+      (let ((conn (lsp--client-conn client)))
+        (not (and (lsp-connection-p conn) (not (lsp-live-p conn)))))))
+
+(defun lsp--effective-buffer-clients ()
+  "`lsp--buffer-clients' (M94), with `lsp--buffer-client' prepended if
+it isn't already a member -- so a caller (or a pre-M94 test) that only
+ever sets `lsp--buffer-client' directly, never touching the new list at
+all, is still treated by every M94 routing/sync helper as \"this buffer
+has one attached client\", exactly the single-client behavior every
+reader of `lsp--buffer-client' has been allowed to assume since before
+this milestone, rather than \"this buffer has none\"."
+  (if (and lsp--buffer-client (not (memq lsp--buffer-client lsp--buffer-clients)))
+      (cons lsp--buffer-client lsp--buffer-clients)
+    lsp--buffer-clients))
 
 (defun lsp--error-string (err)
   "Best-effort human-readable text for a `condition-case' ERR object.
@@ -1924,6 +2588,46 @@ directly; anything else falls back to printing the whole condition."
 (defun lsp--server-for-mode (mode)
   "(COMMAND . ARGS) registered for MODE in `lsp-server-alist', or nil."
   (cdr (assq mode lsp-server-alist)))
+
+(defun lsp--secondary-server-for-mode (mode)
+  "(COMMAND . ARGS) registered for MODE in `lsp-secondary-server-alist'
+(M94), or nil."
+  (cdr (assq mode lsp-secondary-server-alist)))
+
+(defun lsp--client-role-is-primary-p (client mode)
+  "Non-nil if CLIENT (M94) is ELIGIBLE to occupy the PRIMARY slot,
+`lsp--buffer-client', for a buffer in major MODE: its own advertised
+`command' (M59) matches MODE's `lsp-server-alist' entry. A client
+whose command only matches `lsp-secondary-server-alist' (or neither
+table -- unreachable in production, since every attach path threads
+its client's command through one of the two tables, but a test could
+construct one) is never eligible, REGARDLESS of whether the primary
+slot happens to be empty right now -- see `lsp--attach-current-
+buffer''s own M94 Z2 note for why \"the slot is empty\" was never a
+safe substitute for \"this client is actually the primary\".
+
+M94 review AA3: CLIENT's `command' is required to be a real (non-nil)
+string, checked explicitly -- without this, a MODE with no
+`lsp-server-alist' entry at all makes `(lsp--server-for-mode mode)'
+return nil, so `(car (lsp--server-for-mode mode))' is also nil, and a
+client whose own `command' also happens to be nil (a pre-M59 client,
+or a hand-built test stub that never set `:command') would satisfy
+`(equal nil nil)' -- \"eligible\", directly contradicting this
+docstring's own \"never eligible\" claim about anything not threaded
+through a real table entry. No reachable production path can hit this
+(every live-client producer supplies a real command string), so this
+is closing a contract gap, not fixing a live bug."
+  (and (lsp--client-p client)
+       (lsp--client-command client)
+       (equal (lsp--client-command client) (car (lsp--server-for-mode mode)))))
+
+(defvar inline-diagnostics t
+  "Non-nil shows each LSP diagnostic as an extra row drawn directly under
+the buffer line it belongs to (M87 stage 3), in addition to the gutter
+dot and modeline count, which this variable does not affect. A plain
+global toggle, like `hl-line-mode' in simple.el. Set to nil to reproduce
+the pre-stage-3 `Grid' exactly -- no block rows, no row-scale/row-kind
+change on any row.")
 
 (defvar lsp-auto-attach t
   "When non-nil, a newly visited file that's in a project already
@@ -1987,20 +2691,73 @@ attach to an EXISTING one) -- a sufficiently large document and a slow-
 draining server could still block here. Pre-existing (`M-x lsp' always
 had this), not introduced by M63, but M63 does change how it's
 triggered: from a deliberately-pressed command to something that can
-fire from `find-file' and, via backfill, several times in a row."
-  (setq-local lsp--buffer-client client)
-  (condition-case err
-      (progn
-        (lsp-did-open client (buffer-file-name) (buffer-string)
-                      (cdr (assq mode lsp-language-id-alist)))
-        ;; Same tick didOpen just sent as its version (M35): no edit can
-        ;; land between the two calls, so this is the baseline
-        ;; `lsp--sync-buffer-now' diffs future edits against.
-        (setq-local lsp--last-synced-tick (buffer-modified-tick)))
-    (error
-     (setq-local lsp--buffer-client nil)
-     (setq-local lsp--last-synced-tick nil)
-     (signal (car err) (cdr err)))))
+fire from `find-file' and, via backfill, several times in a row.
+M88 adds one more trigger: the autostart completion closure's own call
+to `lsp--auto-attach-backfill', reachable from the ambient idle tick
+with no user action at all.
+
+M94: CLIENT is only ever recorded as `lsp--buffer-client' (the
+PRIMARY) when the buffer doesn't already have one -- attaching a
+SECOND client (from `lsp-secondary-server-alist', via autostart) must
+never clobber a primary that's already there. CLIENT is unconditionally
+added to `lsp--buffer-clients' on a successful didOpen either way (if
+not already a member -- `lsp' itself calling this twice for the exact
+same CLIENT is prevented one layer up, by its own already-connected
+check, but nothing stops two DIFFERENT call sites, e.g. `M-x lsp' and a
+concurrent autostart backfill, from racing to attach the same CLIENT,
+so this guards it directly rather than trusting every caller not to).
+A failed didOpen only rolls back `lsp--buffer-client' to nil when THIS
+call is the one that set it (i.e. the buffer had no LIVE primary
+before) -- an already-established primary must survive a SECONDARY's
+own didOpen failure untouched.
+
+\"Already has one\" is checked via `lsp--live-buffer-client', not a
+raw truthy read of `lsp--buffer-client' (M63's reattach fix, carried
+over): a buffer whose OWN primary connection died earlier still has a
+non-nil `lsp--buffer-client' pointing at the corpse, and a plain
+truthy check would refuse to ever replace it -- `lsp--live-buffer-
+client's clearing side effect is exactly what lets a fresh CLIENT
+become the new primary here, same as it always has.
+
+M94 review Z2: \"already has one\" alone is not enough -- CLIENT must
+also be ELIGIBLE for the primary slot, per `lsp--client-role-is-
+primary-p' (its own `command' must match MODE's `lsp-server-alist'
+entry, not just any entry). Before this fix, the ONLY thing deciding
+primacy was whether the slot was empty: verible attaches (primary);
+verible dies with nothing yet clearing the stale reference (the mode
+line does not probe liveness every frame); a slang autostart already
+in flight completes and reaches this function via `lsp--auto-attach-
+backfill'; `lsp--live-buffer-client' probes, finds the dead verible,
+nils the slot -- and slang, a SECONDARY, walked straight into the now-
+empty primary slot. Every untouched request site (definition,
+references, rename, documentSymbol, codeAction, documentHighlight,
+formatting) would then talk to a server whose own docstring says it
+has no formatting of any kind, and reconnecting verible afterwards
+would find a live primary (slang) and merely append -- it would never
+self-heal. Now a client that isn't primary-table-eligible always joins
+`lsp--buffer-clients' but never touches the primary slot, empty or
+not, leaving it open for the real primary to reclaim."
+  (let* ((had-primary (lsp--live-buffer-client))
+         (is-primary-candidate (lsp--client-role-is-primary-p client mode))
+         (set-primary (and is-primary-candidate (not had-primary))))
+    (when set-primary
+      (setq-local lsp--buffer-client client))
+    (condition-case err
+        (progn
+          (lsp-did-open client (buffer-file-name) (buffer-string)
+                        (cdr (assq mode lsp-language-id-alist)))
+          ;; Same tick didOpen just sent as its version (M35): no edit can
+          ;; land between the two calls, so this is the baseline
+          ;; `lsp--sync-buffer-now' diffs future edits against -- now
+          ;; per-CLIENT (M94).
+          (lsp--set-client-synced-tick client (buffer-modified-tick))
+          (unless (memq client lsp--buffer-clients)
+            (setq-local lsp--buffer-clients (cons client lsp--buffer-clients))))
+      (error
+       (when set-primary
+         (setq-local lsp--buffer-client nil))
+       (lsp--clear-client-synced-tick client)
+       (signal (car err) (cdr err))))))
 
 (defun lsp--auto-attach-client (file mode)
   "Client to silently reuse for FILE/MODE, or nil if nothing should be
@@ -2046,6 +2803,63 @@ different server instance than another buffer in the same project."
       (when entry
         (lsp--get-connection (car entry) (lsp--project-root file)))))))
 
+(defun lsp--buffer-has-live-client-for-command-p (command)
+  "Non-nil if the current buffer already has a LIVE client (per
+`lsp--effective-buffer-clients', M94) whose own advertised `command'
+(M59) `equal's COMMAND. Unlike `lsp--live-buffer-client' (which only
+ever answers for the PRIMARY, regardless of which server it talks to),
+this is what M94's per-command guards need: a buffer with a live
+PRIMARY for one server must not be mistaken for \"already covered\"
+when a DIFFERENT server entirely is what's actually being asked about
+-- the exact silent-sink failure `lsp--autostart-maybe-begin' and
+`lsp--auto-attach-backfill' both had before this function existed (see
+their own M94 notes)."
+  (let (found)
+    (dolist (client (lsp--effective-buffer-clients) found)
+      (when (and (not found)
+                 (lsp--client-p client)
+                 (lsp--client-conn-live-p client)
+                 (equal (lsp--client-command client) command))
+        (setq found t)))))
+
+(defun lsp--auto-attach-backfill-matches-p (file mode client)
+  "Non-nil if FILE (a non-remote file-visiting buffer's path, whose
+BUF-MODE the caller has already confirmed `eq' to MODE) should be
+attached to CLIENT by `lsp--auto-attach-backfill' (M94): CLIENT's own
+advertised `command' (M59) matches EITHER `lsp-server-alist''s or
+`lsp-secondary-server-alist''s entry for MODE, and the live connection
+already registered for that exact (COMMAND . ROOT) key is CLIENT
+itself.
+
+Generalizes the pre-M94 check, `(eq (lsp--auto-attach-client file
+mode) client)' -- that helper only ever consulted `lsp-server-alist'
+(the PRIMARY table), so it could never match a SECONDARY client at
+all, not even for the very buffer whose own idle tick started the
+secondary's autostart in the first place; backfill would silently
+attach nothing for it. `lsp--auto-attach-client' itself is
+deliberately left untouched (still primary-only) -- it also backs
+`lsp--maybe-auto-attach', the `find-file-hook' reuse path, which stays
+primary-only by design in this milestone (see `lsp-secondary-server-
+alist''s own doc).
+
+Checks `lsp-auto-attach' itself (guard 1 of `lsp--auto-attach-client',
+carried over explicitly): the old `eq'-against-`lsp--auto-attach-
+client' check got this for free since that helper's own first guard
+is `(not lsp-auto-attach)'; this replacement calls neither
+`lsp--auto-attach-client' nor `lsp--server-for-mode' the same way, so
+without repeating the check here, `lsp-auto-attach' nil would no
+longer suppress BACKFILL (only the `find-file-hook' path would still
+honor it), regressing M88's F4b fix."
+  (and lsp-auto-attach
+       file
+       (not (lsp--remote-path-p file))
+       (lsp--client-p client)
+       (let ((command (lsp--client-command client)))
+         (and command
+              (or (equal (car (lsp--server-for-mode mode)) command)
+                  (equal (car (lsp--secondary-server-for-mode mode)) command))
+              (eq (lsp--get-connection command (lsp--project-root file)) client)))))
+
 (defun lsp--auto-attach-backfill (mode client)
   "Called by `lsp' right after it successfully attaches the current
 buffer to CLIENT (major MODE): walks `buffer-list' and silently
@@ -2074,16 +2888,24 @@ macro over `with-current-buffer-internal', see simple.el) restores the
 original current buffer when done, mirroring `lsp-process-pending-
 all's own use of the same primitive.
 
-The \"already attached\" guard checks `lsp--live-buffer-client', not the
-raw `lsp--buffer-client' (M63 round 2 fix): a buffer whose OWN
-connection died earlier still has a non-nil `lsp--buffer-client'
-pointing at the corpse, and a plain truthy check would mistake that for
-\"already covered\" and skip it forever -- even though the connection
-CLIENT points to here is a fresh, live one the corpse's buffer should
-now be talking to instead. `lsp--live-buffer-client's clearing side
-effect (nil-ing out a dead reference) is exactly what's wanted here
-too, and it fires on the right buffer since this runs inside
-`with-current-buffer'.
+The \"already attached\" guard checks `lsp--buffer-has-live-client-for-
+command-p' (M94), not `lsp--live-buffer-client' (M63 round 2's fix,
+generalized): a buffer whose OWN connection died earlier still has a
+non-nil `lsp--buffer-client' pointing at the corpse, and a plain
+truthy check would mistake that for \"already covered\" and skip it
+forever -- even though the connection CLIENT points to here is a
+fresh, live one the corpse's buffer should now be talking to instead.
+Checking per-COMMAND rather than per-buffer-any-client is what M94
+adds: a buffer with a live PRIMARY (verible, say) must not be
+mistaken for \"already covered\" when CLIENT is a SECONDARY (slang)
+autostarting for the first time -- `(not (lsp--live-buffer-client))'
+would have silently sunk that for every buffer in the project,
+including the very one whose idle tick started the handshake.
+
+The MATCH itself uses `lsp--auto-attach-backfill-matches-p' (M94),
+not the old `(eq (lsp--auto-attach-client file mode) client)' -- see
+that function's own doc for why the old check could never match a
+secondary client at all.
 
 The `condition-case' wraps the WHOLE per-buffer body, guard evaluation
 included -- not just the attach call. Same shape, and for the same
@@ -2102,8 +2924,9 @@ one; the asymmetry is exactly what the tail review flagged."
           (let ((file (buffer-file-name)))
             (when (and file
                        (eq (major-mode-internal-get) mode)
-                       (not (lsp--live-buffer-client))
-                       (eq (lsp--auto-attach-client file mode) client))
+                       (not (lsp--buffer-has-live-client-for-command-p
+                             (lsp--client-command client)))
+                       (lsp--auto-attach-backfill-matches-p file mode client))
               (lsp--attach-current-buffer client mode))))
       (error nil))))
 
@@ -2176,6 +2999,14 @@ independent reasons, not one:
       (let* ((command (car entry))
              (args (cdr entry))
              (root (lsp--project-root file)))
+        ;; M88 F1 review fix: an explicit `M-x lsp' always wins a race
+        ;; against an in-flight autostart for this exact key -- cancel
+        ;; it first (kills nothing that's attached yet, since nothing
+        ;; is: I2) so the connection this call is about to reuse-or-make
+        ;; is the only one left standing, instead of the autostart's own
+        ;; completion later shadowing it in `lsp--connections' while its
+        ;; own server process leaks for the rest of the session.
+        (lsp--autostart-cancel-pending command root)
         (condition-case err
             (let ((client (or (lsp--get-connection command root)
                                (let ((new (lsp-connect command args root)))
@@ -2224,71 +3055,265 @@ with stand-ins on purpose."
           (progn (setq-local lsp--buffer-client nil) nil)
         lsp--buffer-client))))
 
+(defun lsp--capable-client (key)
+  "This buffer's PRIMARY (`lsp--buffer-client'), if it's LIVE and
+supports KEY (a JSON key string, via `lsp--capability-supported-p' --
+e.g. \"completionProvider\" or \"hoverProvider\"); otherwise the first
+OTHER live, capable client in `lsp--effective-buffer-clients' (M94,
+attach order -- most-recently-attached first, per that variable's own
+doc). nil if the buffer has no attached client at all, or none of them
+support KEY. Calls `lsp--live-buffer-client' first, for its usual
+dead-PRIMARY-clearing side effect, same as every other buffer-local
+client reader in this file, before looking anywhere else.
+
+M94 review Z5: the primary is checked FIRST, deliberately, not simply
+whichever attached client comes first in `lsp--buffer-clients' --
+attach order is most-recent-first, so a secondary (attached AFTER the
+primary, the common case) would otherwise always win a tie. verible
+(the Verilog default primary) advertising `hoverProvider: false' still
+counts as SUPPORTED under M46's asymmetric-trust rule, so without this
+preference every hover in a two-client Verilog buffer would go to the
+secondary even though the primary could have answered it too.
+
+Two request sites call this DIRECTLY (M94, deliberately narrow):
+completion and hover are the only two capabilities that milestone
+treated as having exactly ONE possible answer among a buffer's attached
+clients (see `lsp-secondary-server-alist''s own doc for why), with no
+preferred role of their own -- primary-first is exactly right for both.
+M95's five methods (definition, references, documentSymbol, rename,
+documentHighlight) do NOT call this function at all -- see
+`lsp--preferred-role-client''s own docstring for why its fallback is
+deliberately the UNGATED `lsp--live-buffer-client' instead: those five
+were never gated on `lsp--capability-supported-p' before M95, and a
+fallback through THIS function would have re-gated them, which a
+review round caught as a regression. codeAction and formatting keep
+reading `lsp--buffer-client' directly and are unaffected by either
+function existing at all, so the primary answers those exactly as it
+did before M94."
+  (lsp--live-buffer-client)
+  (cond
+   ((and lsp--buffer-client
+         (lsp--client-conn-live-p lsp--buffer-client)
+         (lsp--capability-supported-p lsp--buffer-client key))
+    lsp--buffer-client)
+   (t
+    (let (found)
+      (dolist (client (lsp--effective-buffer-clients) found)
+        (when (and (not found)
+                   (not (eq client lsp--buffer-client))
+                   (lsp--client-conn-live-p client)
+                   (lsp--capability-supported-p client key))
+          (setq found client)))))))
+
+(defvar lsp-request-preferred-role-alist
+  '(("textDocument/definition" . secondary)
+    ("textDocument/references" . secondary)
+    ("textDocument/documentSymbol" . secondary)
+    ("textDocument/rename" . secondary)
+    ("textDocument/documentHighlight" . secondary))
+  "Alist of (METHOD . ROLE), M95: which role (only `secondary' as of
+M95; `primary' would be a legal value but nothing needs to say so
+explicitly -- that is `lsp--capable-client''s own default) should answer
+METHOD (a JSON-RPC method string, e.g. \"textDocument/definition\"),
+consulted by `lsp--preferred-role-client'. A method with NO entry here
+is entirely unaffected by this table existing -- `lsp--preferred-role-
+client' falls straight through to `lsp--capable-client''s ordinary
+primary-first order for it, exactly as before this variable existed.
+
+Seeded with the five methods M95 measured verible-verilog-ls (Verilog's
+default primary) answering worse than slang-server (Verilog's default
+secondary) against real binaries on `demo/rtl/', cross-checked against
+`grep' ground truth -- see PLAN.md's M95 record for the full probe:
+references silently omits the symbol's own declaration and does no
+cross-file lookup for a module name at all (1/3, 1/2, 4/5, 0/7 against
+slang's exact 3/3, 2/2, 5/5, 7/7); rename drops the `endmodule : LABEL'
+end-label on a module rename, which IEEE 1800 SS23.2.5 requires to
+match -- a compile error, not a cosmetic gap; definition and
+documentHighlight both fail on a name reached through `import PKG::*'
+(the style `demo/rtl/top/soc_top.sv' itself uses), the latter also
+producing a false-positive merge of two unrelated identically-spelled
+identifiers; documentSymbol returns fewer than half as many symbols,
+types the module itself wrong, and omits every port and parameter.
+
+Neither server surfaces `typedef' declarations (enum or struct) in
+documentSymbol at all, even though both resolve those same types fine
+for `definition' -- a real, shared gap in both servers that routing
+cannot fix and does not attempt to; it stays a known gap regardless of
+which one answers documentSymbol.
+
+codeAction and formatting are deliberately absent -- formatting because
+slang has no formatting capability at all (see `lsp-secondary-server-
+alist''s own doc), codeAction because it was never evaluated for this
+milestone.")
+
+(defun lsp--preferred-role-client (method key)
+  "The client that should answer METHOD (a JSON-RPC method string),
+given KEY (its capability JSON key, exactly as `lsp--capability-
+supported-p' expects -- e.g. \"definitionProvider\" for
+\"textDocument/definition\").
+
+M95: if `lsp-request-preferred-role-alist' maps METHOD to `secondary',
+the first live, capable, NON-primary client in `lsp--effective-buffer-
+clients' wins outright, ahead of the primary -- the opposite tie-break
+from `lsp--capable-client''s own default (see that function's
+docstring for why the default exists at all: without it, a hover in a
+two-client Verilog buffer would always go to the secondary even when
+the primary could answer too). That default is still exactly right for
+every method NOT listed in the preference table, which is why it is
+never overridden globally, only for the five methods this alist names.
+
+Falls back to the PRIMARY (`lsp--live-buffer-client', already captured
+above as PRIMARY) whenever METHOD has no entry in the preference table,
+prefers `primary', or the preferred secondary is missing, dead, or does
+not declare KEY. Deliberately `lsp--live-buffer-client', NOT
+`lsp--capable-client' -- these five methods were never gated on
+`lsp--capability-supported-p' before M95 (see the M94-era docstring
+this one replaced), and the fallback exists precisely to reproduce that
+UNGATED behaviour exactly: a secondary has to EARN the request by
+actually declaring KEY, but the primary is asked exactly as it always
+was, capabilities hash or no. (`lsp-format-buffer' shows what an
+explicit \"server doesn't advertise this\" message for an ungated
+primary would look like, via `lsp--capability-supported-p' -- adding
+one here for these five would be a genuine improvement, but a separate
+decision from this fallback fix, not a side effect of it.) This is also
+what keeps a single-server buffer WHOSE ONE CLIENT OCCUPIES THE PRIMARY
+SLOT (every language here except Verilog -- a Rust buffer has only
+rust-analyzer, and it is the primary) indistinguishable from before
+this function existed: with no secondary attached at all,
+`lsp--effective-buffer-clients' contains only the primary, so the
+`secondary' branch below never finds a non-primary candidate and
+control always falls through to PRIMARY, ungated, exactly as it did
+before M95.
+
+One single-client state is NOT identical, and this is deliberate: a
+buffer whose SOLE attached client is a SECONDARY sitting in an EMPTY
+primary slot -- exactly the state M94's Z2 self-heal produces (the
+primary dies; a client whose own `command' doesn't match the mode's
+primary table entry, per `lsp--client-role-is-primary-p', joins
+`lsp--buffer-clients' without ever taking the now-empty slot). There
+PRIMARY is nil, so `(not (eq client primary))' is vacuously true for
+every candidate in the scan below, and a live, capable lone secondary
+answers. Before M95 these five methods read `lsp--buffer-client' raw,
+got nil, and reported \"No LSP server connected in this buffer\" even
+though a live, capable server was attached -- so this is an
+IMPROVEMENT over the pre-M95 behaviour in that one state, not a
+regression, and it is kept rather than special-cased away. But it is
+NOT the same behaviour, and any docstring or comment that claims a
+single attached client is unconditionally indistinguishable from
+before M95 is wrong; the accurate claim is conditioned on that client
+occupying the primary slot. `lsp-code-action-at-point' and
+`lsp-format-buffer'/`lsp-format-region' are UNCHANGED by any of this --
+they still read `lsp--buffer-client' directly, so they still refuse in
+exactly that lone-secondary-in-an-empty-primary-slot state."
+  (let ((primary (lsp--live-buffer-client)))
+    (or (and (eq (cdr (assoc method lsp-request-preferred-role-alist)) 'secondary)
+             (let (found)
+               (dolist (client (lsp--effective-buffer-clients) found)
+                 (when (and (not found)
+                            (not (eq client primary))
+                            (lsp--client-conn-live-p client)
+                            (lsp--capability-supported-p client key))
+                   (setq found client)))))
+        primary)))
+
 ;; --- Edit sync: textDocument/didChange (M35) ---
 
 (defun lsp--sync-buffer-now ()
-  "If the current buffer has a live client (`lsp--live-buffer-client')
-and has been edited since the tick last synced to the server, send a
-full-text `textDocument/didChange' with the current `buffer-modified-
-tick' as its version and record it as `lsp--last-synced-tick'.
-Otherwise a silent no-op, same \"never signals\" spirit as
-`lsp-process-pending-all': no live client, a buffer not visiting a
-file, or `lsp--last-synced-tick' still nil (this buffer was never
-didOpen'd -- only `lsp' ever sets it, right after didOpen, so a
-didChange before the matching didOpen can't happen) or unchanged are
-all just \"nothing to do\".
+  "For EVERY client attached to the current buffer (M94:
+`lsp--effective-buffer-clients', primary included -- was just the
+primary alone before a buffer could have more than one), if it's live
+and has been edited since the tick last synced to IT (per-client,
+`lsp--client-synced-tick'), send a full-text `textDocument/didChange'
+with the current `buffer-modified-tick' as its version and record it
+via `lsp--set-client-synced-tick'. A client not yet didOpen'd for this
+buffer (no entry at all) is skipped, same as before -- only now that's
+decided per client, not once for the whole buffer. Otherwise a silent
+no-op per client, same \"never signals\" spirit as
+`lsp-process-pending-all'.
 
-Two call sites, both wanting the server to answer against text it has
-actually seen: the idle pump (`lsp-process-pending-all', once over
-every buffer -- typing itself never triggers this, only a later idle
-tick does, a natural debounce) and `lsp-hover-at-point'/
+`lsp--live-buffer-client' is still called first, for its usual
+dead-PRIMARY-clearing side effect -- every other buffer-local client
+reader in this file does the same before looking anywhere else.
+
+Two call sites, both wanting the server(s) to answer against text they
+have actually seen: the idle pump (`lsp-process-pending-all', once
+over every buffer -- typing itself never triggers this, only a later
+idle tick does, a natural debounce) and `lsp-hover-at-point'/
 `lsp-definition-at-point', immediately before sending their request so
 an edit is never left unsynced across a hover/definition round trip
-even if the idle pump hasn't run yet."
-  (let ((client (lsp--live-buffer-client)))
-    (when (and client (lsp--client-p client)
-               (buffer-file-name)
-               lsp--last-synced-tick
-               (/= (buffer-modified-tick) lsp--last-synced-tick))
-      (let ((tick (buffer-modified-tick)))
-        (lsp-did-change client (buffer-file-name) (buffer-string) tick)
-        (setq-local lsp--last-synced-tick tick)))))
+even if the idle pump hasn't run yet.
+
+M94 review Z6: also opportunistically prunes any now-dead client out
+of `lsp--buffer-clients' (and its `lsp--last-synced-tick' entry) while
+it's already here checking every attached client's liveness anyway --
+see the code's own comment just below the sync loop."
+  (lsp--live-buffer-client)
+  (when (buffer-file-name)
+    (let ((tick (buffer-modified-tick)))
+      (dolist (client (lsp--effective-buffer-clients))
+        (when (lsp--client-conn-live-p client)
+          (let ((synced (lsp--client-synced-tick client)))
+            (when (and synced (/= tick synced))
+              (lsp-did-change client (buffer-file-name) (buffer-string) tick)
+              (lsp--set-client-synced-tick client tick)))))))
+  ;; M94 review Z6: opportunistic pruning, not a new sweep -- this
+  ;; function already walks every attached client for liveness on every
+  ;; idle tick, so dropping a now-dead one out of `lsp--buffer-clients'
+  ;; (and its own `lsp--last-synced-tick' entry) here costs nothing
+  ;; extra. Every consumer already re-checks liveness itself, so leaving
+  ;; a corpse in the list was never a correctness bug -- only an
+  ;; unbounded list for the buffer's lifetime, which this bounds.
+  (when lsp--buffer-clients
+    (dolist (client lsp--buffer-clients)
+      (unless (lsp--client-conn-live-p client)
+        (lsp--clear-client-synced-tick client)))
+    (setq-local lsp--buffer-clients
+                (let (live)
+                  (dolist (client lsp--buffer-clients (nreverse live))
+                    (when (lsp--client-conn-live-p client)
+                      (push client live)))))))
 
 ;; --- Save/kill hooks: textDocument/didSave, textDocument/didClose (M40) ---
 
 (defun lsp--on-after-save ()
-  "`after-save-hook' function: if this buffer has a live LSP client and
-has been didOpen'd (`lsp--last-synced-tick' non-nil), gets the server's
-copy caught up via `lsp--sync-buffer-now' -- `lsp-did-save' sends no
-text of its own, so the server must already have the saved content
-from a didChange -- then sends `textDocument/didSave'.
+  "`after-save-hook' function: gets every attached client's copy caught
+up via `lsp--sync-buffer-now' (M94: now every attached client, not
+just the primary) -- `lsp-did-save' sends no text of its own, so the
+server must already have the saved content from a didChange -- then
+sends `textDocument/didSave' to every LIVE, didOpen'd attached client
+(`lsp--effective-buffer-clients').
 
-Wrapped in `condition-case' and a silent no-op on every other path
-(no client, or a buffer never didOpen'd): `save-buffer' runs this on
-every save in every buffer, LSP-connected or not, across this whole
+Wrapped in `condition-case' and a silent no-op on every other path (no
+attached client, or none of them didOpen'd): `save-buffer' runs this
+on every save in every buffer, LSP-connected or not, across this whole
 editor's test suite, so anything else here would spam the echo area
 on an ordinary save."
   (condition-case nil
-      (let ((client (lsp--live-buffer-client)))
-        (when (and client lsp--last-synced-tick (buffer-file-name))
-          (lsp--sync-buffer-now)
-          (lsp-did-save client (buffer-file-name))))
+      (when (buffer-file-name)
+        (lsp--sync-buffer-now)
+        (dolist (client (lsp--effective-buffer-clients))
+          (when (and (lsp--client-synced-tick client)
+                     (lsp--client-conn-live-p client))
+            (lsp-did-save client (buffer-file-name)))))
     (error nil)))
 
 (defun lsp--on-kill-buffer ()
-  "`kill-buffer-hook' function: if this buffer has a live LSP client and
-has been didOpen'd, sends `textDocument/didClose' and drops this
-buffer's URI from the client's diagnostics alist. Same silent-no-op/
+  "`kill-buffer-hook' function: sends `textDocument/didClose' to every
+LIVE, didOpen'd attached client (M94: `lsp--effective-buffer-clients',
+was just the primary alone before) and drops this buffer's URI from
+EACH of their `lsp--client-diagnostics' alists. Same silent-no-op/
 `condition-case' discipline as `lsp--on-after-save' -- every buffer
 kill in the test suite runs this hook, LSP-connected or not."
   (condition-case nil
-      (let ((client (lsp--live-buffer-client)))
-        (when (and client lsp--last-synced-tick (buffer-file-name))
-          (let ((uri (lsp--path-to-uri (buffer-file-name))))
-            (lsp-did-close client (buffer-file-name))
-            (setf (lsp--client-diagnostics client)
-                  (delq (assoc uri (lsp--client-diagnostics client))
-                        (lsp--client-diagnostics client))))))
+      (when (buffer-file-name)
+        (let ((uri (lsp--path-to-uri (buffer-file-name))))
+          (dolist (client (lsp--effective-buffer-clients))
+            (when (and (lsp--client-synced-tick client)
+                       (lsp--client-conn-live-p client))
+              (lsp-did-close client (buffer-file-name))
+              (setf (lsp--client-diagnostics client)
+                    (delq (assoc uri (lsp--client-diagnostics client))
+                          (lsp--client-diagnostics client)))))))
     (error nil)))
 
 ;; --- Auto-attach: reusing a live connection for a newly opened file (M63) ---
@@ -2355,6 +3380,587 @@ this milestone's scope."
 (add-hook 'kill-buffer-hook 'lsp--on-kill-buffer)
 (add-hook 'find-file-hook 'lsp--maybe-auto-attach)
 
+;; --- Autostart: spawning a server on first open, asynchronously (M88) ---
+;;
+;; `lsp-auto-attach' (above) is a pure REUSE mechanism -- it never
+;; spawns, so the first file in a project still needs one real `M-x
+;; lsp' before any of this editor's diagnostic UI (gutter dots,
+;; squiggles, the mode-line count, M87 stage 3's inline diagnostic
+;; rows) ever lights up. This section is what actually starts a server
+;; on its own, driven from the idle tick rather than `find-file-hook'
+;; (see the milestone spec for why the trigger has to be the idle tick
+;; and not a hook: several test files open real Verilog under `demo/'
+;; via `find-file-internal' with a real `verible-verilog-ls' on the
+;; test machine's PATH, and a hook trigger would spawn a real server in
+;; every one of them).
+;;
+;; `lsp-connect' itself is untouched -- this is an ADDITIVE async path
+;; built entirely from primitives that already exist and are already in
+;; daily use: `lsp-request-async' plus the idle pump
+;; (`lsp-process-pending-all') already deliver hover/documentHighlight/
+;; definition without blocking. `initialize' here is just one more
+;; async request, and attaching every buffer the new connection covers
+;; once it completes is just one more call to the existing
+;; `lsp--auto-attach-backfill'.
+;;
+;; No request queue: no buffer is attached to the pending client while
+;; its handshake is in flight (`lsp--attach-current-buffer', which sets
+;; `lsp--buffer-client', is never called until the completion callback
+;; below runs), so there is nothing to queue against it in the
+;; meantime. `didOpen' is sent by backfill at completion time, against
+;; the buffer's text AS IT IS THEN -- an edit made during the wait is
+;; therefore included in the didOpen text, not queued up stale behind
+;; it.
+;;
+;; This is also the single invariant the whole design rests on: a
+;; half-initialized client sits in `lsp--clients' during the wait (so
+;; the existing idle pump can drain its `initialize' reply at all), and
+;; that pump's own buffer walk calls `lsp--sync-buffer-now' against
+;; EVERY buffer, unconditionally, every tick. That's safe here only
+;; because `lsp--buffer-client' is still nil for every buffer this
+;; pending client will eventually cover -- `lsp--sync-buffer-now'
+;; requires a live `lsp--buffer-client' AND a non-nil
+;; `lsp--last-synced-tick' before it will send anything, and neither is
+;; set until `lsp--attach-current-buffer' runs, which only happens
+;; inside the completion callback's call to `lsp--auto-attach-backfill'
+;; -- well after `initialized' has already gone out. So no `didChange'
+;; can ever precede its own `didOpen'.
+;;
+;; Two honest caveats to "nothing on this path blocks", added at
+;; review (M88 fix round):
+;;
+;;  - `lsp-kill' (used to reap a dead-air pending handshake, and by
+;;    `lsp--autostart-cancel-pending' when `M-x lsp' preempts one) is
+;;    `child.kill()' followed by a BLOCKING `child.wait()' with no
+;;    timeout (`crates/elisp/src/lsp.rs'). `SIGKILL' can't be caught or
+;;    blocked by the child, but a process wedged in an uninterruptible
+;;    kernel wait (blocked on a hung filesystem or device, say) would
+;;    still make `wait()' block here regardless. This primitive
+;;    predates M88 -- every prior caller reached it from a deliberately-
+;;    pressed command (`lsp-shutdown', a failed `lsp-connect') -- but
+;;    M88 is the first thing that can reach it from the AMBIENT idle
+;;    tick, with no user action involved at all, in that pathological
+;;    case.
+;;  - The completion closure's `lsp--auto-attach-backfill' sends
+;;    `didOpen' through `lsp-send', whose `write_all' can block on a
+;;    large document with a slow-draining server -- already documented
+;;    as a known v1 gap at `lsp--attach-current-buffer''s own docstring
+;;    (M63 coordinator round 2), and now reachable from autostart
+;;    completion as well as from `M-x lsp'/backfill/`find-file'.
+
+(defvar lsp-autostart t
+  "When non-nil, the idle tick (`lsp--autostart-tick', called once per
+frontend frame/poll from the Rust side) spawns an LSP server on its own
+the first time a buffer with no live connection and no server already
+running for its project is seen, instead of requiring an explicit
+`M-x lsp'. The handshake runs entirely asynchronously (`lsp-request-
+async', never `lsp--await' or anything else that blocks) -- typing is
+never held up waiting for a server, however slow or absent it is.
+
+Coupled to `lsp-auto-attach': autostart is gated on `(and lsp-autostart
+lsp-auto-attach)', because the only thing that ever attaches a buffer
+to an autostarted connection IS the auto-attach machinery
+(`lsp--auto-attach-backfill', run once the handshake completes). With
+`lsp-auto-attach' nil, backfill would attach nothing, so spawning would
+leave a server nobody ever talks to -- pure waste, and one more process
+for the user to wonder about. Set either variable to nil to fall back
+to requiring an explicit `M-x lsp' everywhere.
+
+Every (COMMAND . PROJECT-ROOT) combination is only ever tried once per
+session: `lsp--autostart-tried' (below) permanently remembers a give-up
+(missing binary, or `lsp-autostart-timeout' seconds with no answer),
+and nothing here retries it later. A user who installs the missing
+server mid-session, or fixes whatever was wrong, runs `M-x lsp'
+directly -- unaffected by any of this.")
+
+(defvar lsp-autostart-timeout 10
+  "Seconds `lsp--autostart-tick' gives a pending autostart handshake
+before reaping it (`lsp-kill'-ing the connection and recording the
+attempt in `lsp--autostart-tried' so it's never retried this session).
+
+This is a DEADLINE FOR REAPING A PENDING ENTRY ON A LATER IDLE TICK,
+not a blocking wait -- do not confuse it with `lsp-initialize-timeout',
+which bounds `lsp--await''s synchronous wait inside `lsp-connect'.
+Nothing in the autostart path ever calls `lsp--await' or blocks on
+anything: this variable only controls how many seconds' worth of idle
+ticks a dead-air server gets to answer before this side gives up and
+moves on, with the editor fully responsive the entire time either way.
+
+10 is a generous upper bound for the same reason `lsp-initialize-
+timeout''s docstring gives: real `initialize' round trips measured on
+this machine are single-digit milliseconds to low tens of milliseconds
+(verible-verilog-ls, slang-server, rust-analyzer alike) -- this is
+headroom for a slow machine or a server doing real startup work, not a
+value meant to be tuned for normal use.")
+
+(defvar lsp--autostart-pending nil
+  "Alist of ((COMMAND . ROOT) . (CONN CLIENT DEADLINE)): one entry per
+in-flight autostart handshake, keyed EXACTLY like `lsp--connections' --
+by server command and project root, not by buffer -- so that two
+buffers in the same project, seen on two different idle ticks before
+the first handshake completes, discover the SAME pending entry and
+only ever cause one spawn between them. CONN is the raw connection
+(for `lsp-live-p'/`lsp-kill'), CLIENT is the half-initialized
+`lsp--client' already sitting in `lsp--clients' so the ordinary idle
+pump drains its replies, and DEADLINE is an absolute `float-time'
+deadline (`lsp-autostart-timeout' seconds out from when the spawn was
+started) for `lsp--autostart-tick' to reap it by.")
+
+(defvar lsp--autostart-tried nil
+  "List of (COMMAND . ROOT) pairs autostart has already given up on this
+session -- either the spawn itself failed (missing binary, ...) or the
+handshake never got an answer within `lsp-autostart-timeout' seconds.
+Permanent for the session (M88 v1): nothing here ever retries. A user
+who installs the server or otherwise fixes the problem mid-session runs
+`M-x lsp' directly, which consults neither this list nor
+`lsp--autostart-pending' at all.")
+
+(defvar lsp--autostart-pending-here nil
+  "Buffer-local (M88 D7): list of `(COMMAND . ROOT)' pending autostart
+handshakes THIS buffer would be attached to once each completes, or
+nil if none. Purely a MODE-LINE signal (`redisplay.rs' reads it with
+the same buffer-local-aware `buffer_var_on' it already uses for
+`lsp--buffer-client', truthy on any non-empty list -- no change needed
+there for this to be a list rather than a single cons) -- nothing in
+this file's attach/reuse logic ever consults it; only
+`lsp--buffer-client'/`lsp--buffer-clients' (set by `lsp--attach-
+current-buffer') means a buffer is actually attached.
+
+M94 review AA1: was a SINGLE `(COMMAND . ROOT)' before M94 gave a
+buffer two independently autostarting servers. `lsp--autostart-maybe-
+begin' tries the primary and the secondary in the SAME idle tick, and
+nothing orders which of two independent subprocess `initialize' round
+trips answers first -- with a single slot, marking the second
+unconditionally overwrote the first's key, and if the SECOND handshake
+happened to complete before the first, its completion closure cleared
+the slot by `equal' match while the first was still in flight, leaving
+the mode line showing neither Attached nor Pending. A list fixes both:
+marking conses a new key on (if not already present) instead of
+clobbering, and clearing removes just its own key
+(`lsp--autostart-mark-pending', below), so each handshake's pending
+window is independent and the slot is only ever fully empty when NONE
+are in flight.
+
+Grown for every matching open buffer by `lsp--autostart-begin' at
+spawn time (`lsp--autostart-mark-pending', the same buffer-list scan
+`lsp--auto-attach-backfill' will independently do once the handshake
+completes), and shrunk back -- by the SAME function, called with
+MARKED nil -- from both ways a pending entry can end: the completion
+closure in `lsp--autostart-begin', and `lsp--autostart-reap-one'.")
+
+(defvar lsp--frontend-started nil
+  "Set once by `core::frontend_started' (Rust) after the frontend has
+drawn/painted at least one real frame -- `lsp--autostart-tick' returns
+nil until this is non-nil, so nothing here can spawn a server before
+there is an actual GUI/TUI event loop pumping the idle tick to drain
+it. Exists specifically so a test harness that calls
+`find-file-internal'/`eval-source' directly, never going through
+`run_tui'/`run_gui' at all, can never trigger an autostart spawn no
+matter how many times it might otherwise look like an idle tick ran.")
+
+(defun lsp--autostart-buffer-matches-p (file buf-mode command root mode)
+  "Non-nil if FILE (visited by a buffer in major BUF-MODE) would
+actually be attached by `lsp--auto-attach-backfill' once the pending
+handshake for COMMAND/ROOT/MODE completes -- the SAME exact-mode test
+backfill itself applies (`(eq (major-mode-internal-get) mode)'), not
+just \"any mode whose `lsp-server-alist' entry happens to point at the
+same COMMAND\" (M88 F7 review fix).
+
+Before this fix, this predicate matched on COMMAND alone: with
+`c-mode' and `c++-mode' both mapped to `clangd' in the default
+`lsp-server-alist', a `c++-mode' buffer in the same project as a
+`c-mode' buffer that triggers autostart would get marked `LSP…' in the
+mode line, but backfill -- which DOES require exact mode -- would never
+actually attach it once the handshake completed: the indicator
+promised something that never happened, then silently dropped back to
+blank when the completion cleared every COMMAND-matching marker
+regardless of whether backfill had touched it. Requiring `(eq buf-mode
+mode)' here makes the marker never promise more than backfill will
+actually deliver. (Verilog is unaffected either way -- `verilog-mode'
+is the only mode mapped to `verible-verilog-ls' -- but the fix applies
+generally, not just to Verilog.)
+
+M94 review Z3: also checks `lsp-secondary-server-alist', not just
+`lsp-server-alist' -- this predicate was never updated for M94's
+addition of a second, independently autostarting server. Before this
+fix, a SECONDARY's own handshake (COMMAND matching only the secondary
+table) never matched here at all, so no buffer was ever marked
+pending for it, anywhere, ever -- the mode line's `LSP…' indicator was
+simply dead for the entire secondary autostart window, silently.
+Mirrors `lsp--auto-attach-backfill-matches-p''s own two-table check
+(added at the same review point, for the actual attach rather than
+just this cosmetic marker)."
+  (and file
+       (not (lsp--remote-path-p file))
+       (eq buf-mode mode)
+       (or (equal (car (lsp--server-for-mode buf-mode)) command)
+           (equal (car (lsp--secondary-server-for-mode buf-mode)) command))
+       (equal (lsp--project-root file) root)))
+
+(defun lsp--autostart-mark-pending (command root marked &optional mode)
+  "Add (MARKED non-nil) or remove (MARKED nil) `(COMMAND . ROOT)' in/from
+`lsp--autostart-pending-here''s LIST, on every open buffer (M94 review
+AA1: was a single-slot set/clear before a buffer could have two
+independent handshakes pending at once -- see that variable's own
+docstring for why a list is what fixes it).
+
+Adding (MARKED non-nil, MODE required) scans for buffers
+`lsp--autostart-buffer-matches-p' says backfill will actually attach
+once COMMAND/ROOT's handshake completes, and conses `(COMMAND . ROOT)'
+onto each one's list, unless it's already there.
+
+Removing (MARKED nil, MODE ignored -- M88 F5 review fix) does NOT
+re-run that match test: it instead removes `(COMMAND . ROOT)' from any
+buffer whose CURRENT `lsp--autostart-pending-here' list contains it
+(`equal'), regardless of whether the buffer would still match today. A
+buffer's major mode or visited file can change during the handshake
+window (`M-x' into a different mode, a rename), and re-deriving \"does
+this buffer match\" at removal time would leave a buffer that no
+longer matches stuck showing that key in the mode line PERMANENTLY --
+nothing else ever touches this variable once it's set, so a removal
+that silently skips it is a removal that never happens.
+
+Shared by `lsp--autostart-begin' (add, right after recording the
+pending entry, and remove from its completion closure), `lsp--autostart-
+cancel-pending' (remove, M88 F1), and `lsp--autostart-reap-one'
+(remove). Each buffer's check+set is independently `condition-case'-
+wrapped, same discipline as `lsp--auto-attach-backfill' -- one buffer's
+failure can't stop the rest of the sweep.
+
+CAUTION (G5 review, fix round 3): MODE is `&optional' only because
+elisp requires every clearing call site (which never needs it) to be
+able to omit it -- it is NOT optional in the sense of \"safe to leave
+out.\" Passing MARKED non-nil with MODE nil (or omitted) is silently
+wrong, not signaled: `lsp--autostart-buffer-matches-p''s `(eq buf-mode
+mode)' check compares every buffer's major mode against nil, which is
+never `eq' to any real major-mode symbol, so NO buffer is ever marked
+-- the only symptom is a mode line that never shows `LSP…' for that
+handshake, which no test here would notice, since every existing
+marking call site (`lsp--autostart-begin', the only one there is)
+already supplies a real MODE and always will unless a future call site
+gets this wrong. Any future MARKED-non-nil call site MUST supply the
+connecting buffer's actual major mode."
+  (let ((key (cons command root)))
+    (dolist (buf (buffer-list))
+      (condition-case nil
+          (with-current-buffer buf
+            (if marked
+                (when (and (lsp--autostart-buffer-matches-p
+                            (buffer-file-name) (major-mode-internal-get)
+                            command root mode)
+                           (not (member key lsp--autostart-pending-here)))
+                  (setq-local lsp--autostart-pending-here
+                              (cons key lsp--autostart-pending-here)))
+              (when (member key lsp--autostart-pending-here)
+                (setq-local lsp--autostart-pending-here
+                            (delete key lsp--autostart-pending-here)))))
+        (error nil)))))
+
+(defun lsp--autostart-cancel-pending (command root)
+  "If a pending autostart handshake exists for `(COMMAND . ROOT)',
+cancel it: `lsp-kill' its connection, drop the `lsp--autostart-pending'
+entry, and clear `lsp--autostart-pending-here' on every buffer it had
+marked (M88 F1 review fix).
+
+Called by `lsp' right before it decides whether to reuse or spawn a
+connection for the same key, so an explicit `M-x lsp' always wins a
+race against an in-flight autostart instead of leaving it to complete
+later and silently shadow the user's own connection with a leaked,
+unreachable second server process -- before this fix, `lsp' consulted
+only `lsp--get-connection'/`lsp--connections' and never looked at
+`lsp--autostart-pending' at all, so it would spawn a SECOND server
+through the fully synchronous `lsp-connect' while the async one was
+still in flight; when the async one later completed it unconditionally
+pushed itself onto `lsp--connections', silently shadowing the manual
+connection from every future `assoc' lookup while the manual one's
+process leaked for the rest of the session.
+
+Nothing is attached to a pending autostart yet (I2), so cancelling one
+here loses no state -- the buffer `lsp' is about to attach belongs to
+IT now, not to whatever the autostart would eventually have backfilled.
+
+Deliberately NOT added to `lsp--autostart-tried': this is a preemption,
+not a give-up. `lsp' is about to establish `lsp--connections' for this
+exact key itself, so `lsp--autostart-maybe-begin''s own `lsp--get-
+connection' guard already prevents any future autostart attempt while
+that connection lives; if it later dies, a future autostart SHOULD be
+free to try again, which a permanent `lsp--autostart-tried' entry would
+have wrongly blocked.
+
+The completion closure inside `lsp--autostart-begin' also checks, when
+it fires, whether its own pending entry has disappeared and whether
+`lsp--get-connection' already answers for this key -- but G1 review
+(fix round 2) found the FIRST of those two checks (entry gone) is
+actually unreachable given this function's own behavior: this function
+always `lsp-kill's CONN in the SAME call that removes the pending
+entry, and `lsp-process-pending-all' checks a connection's liveness
+BEFORE draining it, so a connection this function just killed is
+dropped from `lsp--clients' on the very next pump pass without ever
+being polled again -- there is no window left in which the entry is
+gone but the closure still gets to run. See that check's own comment,
+inside `lsp--autostart-begin', for the full explanation; it is kept as
+defense-in-depth against that prune-before-drain ordering changing, not
+because this function can currently produce the race it originally
+described. The SECOND check (`lsp--get-connection' already answering)
+is the one doing real work here and elsewhere: it is what stops a
+duplicate connection if some future caller ever removes a pending entry
+WITHOUT also killing its connection in the same step, unlike this
+function and `lsp--autostart-reap-one', which both currently do."
+  (let ((entry (assoc (cons command root) lsp--autostart-pending)))
+    (when entry
+      (setq lsp--autostart-pending (delq entry lsp--autostart-pending))
+      (lsp--autostart-mark-pending command root nil)
+      (lsp-kill (nth 0 (cdr entry))))))
+
+(defun lsp--autostart-begin (command args root mode)
+  "M88: start COMMAND ARGS as an LSP server for project ROOT
+asynchronously, for a buffer in major MODE. Never blocks -- the only
+synchronous primitive on this path is `(lsp-start command args (and
+(file-directory-p root) root))' itself (M99 added the third CWD
+argument; see this call's own inline comment below), i.e.
+`Command::spawn' returning as soon as fork/exec completes;
+everything the server sends back afterward arrives via the existing
+non-blocking `lsp-poll'-driven idle pump, exactly like every other
+`lsp-request-async' caller in this file.
+
+The whole body is wrapped in `condition-case': a spawn failure (missing
+binary, permission denied, ...) is caught right here, recorded in
+`lsp--autostart-tried' so it's never retried, and reported once via
+`message' -- never left to propagate and disrupt the idle tick that
+called this.
+
+On success: the half-initialized CLIENT is pushed onto `lsp--clients'
+BEFORE the `initialize' request is even sent, so the ordinary idle pump
+(`lsp-process-pending-all') starts draining its replies immediately --
+see this section's header comment for why that's safe despite
+`lsp--buffer-client' not being set anywhere in this function (I2: no
+buffer is attached until the completion closure below runs, so no
+`didChange' can ever precede the `didOpen' backfill sends at
+completion). A `lsp--autostart-pending' entry is recorded last, once
+the request is actually in flight, keyed `(COMMAND . ROOT)' (I3) so a
+second buffer in the same project finds this same entry instead of
+spawning its own server.
+
+The completion closure (M88 F1 review fix) has two defensive `cond'
+branches ahead of the ordinary success path, guarding against a race
+with `M-x lsp'/`lsp--autostart-cancel-pending' -- see their own
+comments below for what each one actually guards against today (G1
+review, fix round 2: the first of the two is currently unreachable
+under this file's own prune-before-drain ordering, kept only as
+defense-in-depth; the second is the one doing real work). On the
+ordinary path it drops the pending entry, stashes `capabilities' on
+CLIENT (mirroring `lsp-connect''s own M54 handling), sends
+`initialized', registers CLIENT under `(COMMAND . ROOT)' in
+`lsp--connections' so it's indistinguishable from a connection `M-x
+lsp' itself made, reports success (naming ROOT explicitly -- D9: when
+no project marker was found, `lsp--project-root' silently falls back to
+the file's own directory, and a server given the wrong root can answer
+every cross-file query with an empty result while still advertising
+full capabilities, so the root actually used has to be visible rather
+than assumed), and finally calls `lsp--auto-attach-backfill', which
+attaches every already-open buffer (the CLI-opened one included) that
+this connection now covers.
+
+M99: ROOT is also passed to `lsp-start' as the server process's cwd,
+guarded the same way and for the same reason as `lsp-connect' -- see
+its doc comment. Only passed when `file-directory-p' confirms ROOT
+exists, so an unusual ROOT can never turn a spawn that would otherwise
+succeed into a failure."
+  (condition-case err
+      (let* ((conn (lsp-start command args
+                              (and (file-directory-p root) root)))
+             (client (make-lsp--client :conn conn :command command)))
+        (setq lsp--clients (cons client lsp--clients))
+        (lsp-request-async
+         client "initialize"
+         (let ((p (make-hash-table)))
+           (puthash "processId" :null p)
+           (puthash "rootUri" (lsp--path-to-uri root) p)
+           (puthash "capabilities" (make-hash-table) p)
+           p)
+         (lambda (result)
+           (let ((entry (assoc (cons command root) lsp--autostart-pending)))
+             (cond
+              ;; G1 review (fix round 2): this branch is UNREACHABLE as
+              ;; the code stands, and deliberately uncovered by any
+              ;; test -- do not go hunting for a repro. Both places
+              ;; that ever remove this entry (`lsp--autostart-cancel-
+              ;; pending' and `lsp--autostart-reap-one') `lsp-kill' the
+              ;; SAME connection in the SAME call that removes the
+              ;; entry, and `lsp-process-pending-all' (the pump that
+              ;; would have to deliver this callback) checks liveness
+              ;; BEFORE draining -- once `lsp-kill' marks CONN dead,
+              ;; the very next pass skips it and drops it from
+              ;; `lsp--clients' before ever polling it again, so a
+              ;; message already sitting in its internal channel is
+              ;; never drained and this callback can never fire a
+              ;; second time. Confirmed by mutation: removing this
+              ;; branch entirely leaves every test in
+              ;; `lsp_autostart_tests.rs' green. Kept anyway as
+              ;; defense-in-depth against that prune-before-drain
+              ;; ordering ever changing -- if draining is ever made to
+              ;; run before the liveness check, this branch is what
+              ;; stops a stale reply from reviving a connection that
+              ;; was supposed to be dead, instead of silently letting
+              ;; a NEW `(not entry)' failure mode go unhandled.
+              ((not entry) (lsp-kill conn))
+              ;; A connection for this exact key already exists --
+              ;; belt-and-suspenders against the same race from the
+              ;; other side (our own pending entry technically still
+              ;; here, but someone else's connection beat us to
+              ;; `lsp--connections' anyway). Never push a duplicate.
+              ((lsp--get-connection command root)
+               (setq lsp--autostart-pending (delq entry lsp--autostart-pending))
+               (lsp--autostart-mark-pending command root nil)
+               (lsp-kill conn))
+              (t
+               (setq lsp--autostart-pending
+                     (delq entry lsp--autostart-pending))
+               (setf (lsp--client-capabilities client)
+                     (and (hash-table-p result) (gethash "capabilities" result)))
+               (lsp--notify client "initialized" (make-hash-table))
+               (push (cons (cons command root) client) lsp--connections)
+               (lsp--autostart-mark-pending command root nil)
+               (message "LSP: autostarted %s for %s" command root)
+               (lsp--auto-attach-backfill mode client))))))
+        (push (cons (cons command root)
+                    (list conn client (+ (float-time) lsp-autostart-timeout)))
+              lsp--autostart-pending)
+        (lsp--autostart-mark-pending command root t mode))
+    (error
+     (push (cons command root) lsp--autostart-tried)
+     (message "LSP autostart: failed to start %s: %s"
+              command (lsp--error-string err)))))
+
+(defun lsp--autostart-reap-one (entry)
+  "Give up on one `lsp--autostart-pending' ENTRY: `lsp-kill' its
+connection, drop it from `lsp--autostart-pending', remember
+`(COMMAND . ROOT)' in `lsp--autostart-tried' so it's never retried this
+session, and `message' once."
+  (let* ((key (car entry))
+         (conn (nth 0 (cdr entry))))
+    (setq lsp--autostart-pending (delq entry lsp--autostart-pending))
+    (push key lsp--autostart-tried)
+    (lsp-kill conn)
+    (lsp--autostart-mark-pending (car key) (cdr key) nil)
+    (message "LSP autostart: %s gave up waiting for %s"
+             (car key) (cdr key))))
+
+(defun lsp--autostart-try-one (entry root mode)
+  "If ENTRY -- a (COMMAND . ARGS) pair, possibly nil -- is non-nil and
+the current buffer has no LIVE client already attached for its COMMAND
+(`lsp--buffer-has-live-client-for-command-p', M94), and there is no
+live connection, pending handshake, or prior give-up for `(COMMAND .
+ROOT)', begin an autostart attempt for it. A silent no-op for ENTRY
+nil (MODE has no `lsp-server-alist'/`lsp-secondary-server-alist' entry
+at all).
+
+Shared by `lsp--autostart-maybe-begin' for BOTH `lsp-server-alist' and
+`lsp-secondary-server-alist' entries (M94) -- the two calls are
+independent, so a live primary never blocks a secondary from
+autostarting, and vice versa."
+  (when entry
+    (let* ((command (car entry))
+           (args (cdr entry))
+           (key (cons command root)))
+      (when (and (not (lsp--buffer-has-live-client-for-command-p command))
+                 (not (lsp--get-connection command root))
+                 (not (assoc key lsp--autostart-pending))
+                 (not (member key lsp--autostart-tried)))
+        (lsp--autostart-begin command args root mode)))))
+
+(defun lsp--autostart-maybe-begin ()
+  "If the current buffer qualifies for autostart -- `lsp-autostart' and
+`lsp-auto-attach' both non-nil, a file-visiting non-remote buffer with
+no live `lsp--buffer-client' already, a mode with an `lsp-server-alist'
+entry, no existing connection or pending handshake for `(COMMAND .
+ROOT)', and that pair not already given up on -- start one via
+`lsp--autostart-begin'. A silent no-op otherwise, same discipline as
+`lsp--maybe-auto-attach'.
+
+M93 fix round (R2): `(not (lsp--live-buffer-client))' is checked
+BEFORE `lsp--project-root' is ever called, not after -- this function
+runs from `lsp--autostart-tick' on every idle tick (every poll
+timeout in the TUI, every frame in the GUI), and an already-attached
+buffer is by far the common steady state once autostart has done its
+job once. `lsp--live-buffer-client' takes no argument and touches
+nothing but the current buffer's own local variable, so checking it
+first costs nothing extra and skips `lsp--project-root''s ancestor-
+directory filesystem walk entirely for that whole common case, instead
+of computing ROOT just to throw it away. (The other three guards below
+-- `lsp--get-connection', the pending-handshake `assoc', and the
+given-up-on `member' -- all key on `(COMMAND . ROOT)' itself, so they
+cannot be reordered ahead of computing ROOT the same way; a buffer
+that autostart has already given up on still pays for one
+`lsp--project-root' call per idle tick, mitigated instead by
+`lsp--nearest-filelist-root-cache' -- see that variable's own
+docstring.)
+
+Reviewer-confirmed, M93 second fix round: this reorder is a pure
+boolean-AND reordering -- `lsp--live-buffer-client' is called exactly
+once either way, and its buffer-local-clearing side effect (see its
+own docstring) is identical regardless of where in the `and' it sits.
+No functional test in this suite can distinguish the old ordering from
+this one: both produce the exact same decision (start / don't start)
+for every input, so nothing here changes what autostart DOES, only how
+much filesystem work it does to decide. The only observable effect is
+speed, measured by hand in the M93 fix-round report (already-attached
+case: 212.59us -> 5.82us per call, `cargo test -p core --test
+lsp_mode_tests', a since-removed scratch benchmark) -- a green test
+run here certifies correctness, not the improvement.
+
+M94 addendum: `(not (lsp--live-buffer-client))' is no longer allowed to
+skip this function ENTIRELY once a SECONDARY is registered for MODE
+(`lsp-secondary-server-alist') -- that was the exact silent-sink bug
+this milestone fixes: the instant the primary attaches, the fast path
+above would otherwise short-circuit forever, and a secondary could
+never autostart for that buffer, for the whole session, with no error
+and no message. The fast path is still taken, and still skips
+`lsp--project-root' entirely, for the common case this M93 note
+describes -- a mode with NO secondary registered, i.e. every mode
+except `verilog-mode' by default -- since `lsp--secondary-server-for-
+mode' is a plain `assq', cheaper even than the buffer-local read this
+docstring already justifies skipping ahead of. Each of PRIMARY and
+SECONDARY is then tried independently via `lsp--autostart-try-one',
+whose own per-command \"already attached\" guard
+(`lsp--buffer-has-live-client-for-command-p') is what actually lets
+one attaching not block the other."
+  (when (and lsp-autostart lsp-auto-attach)
+    (let ((file (buffer-file-name))
+          (mode (major-mode-internal-get)))
+      (when (and file (not (lsp--remote-path-p file)))
+        (let ((secondary (lsp--secondary-server-for-mode mode)))
+          (when (or secondary (not (lsp--live-buffer-client)))
+            (let ((primary (lsp--server-for-mode mode)))
+              (when (or primary secondary)
+                (let ((root (lsp--project-root file)))
+                  (lsp--autostart-try-one primary root mode)
+                  (lsp--autostart-try-one secondary root mode))))))))))
+
+(defun lsp--autostart-tick ()
+  "The idle-tick step (M88) for automatic LSP startup: called once per
+frontend frame/poll from the Rust side (`core::idle_tick'), alongside
+the other pumps. Returns nil, doing nothing at all, until
+`lsp--frontend-started' is set (see its own doc).
+
+First reaps any `lsp--autostart-pending' entry whose connection has
+died or whose `lsp-autostart-timeout' deadline has passed
+(`lsp--autostart-reap-one'), THEN considers starting a new one for the
+current buffer (`lsp--autostart-maybe-begin'). Reaping first matters
+for the same reason `lsp-process-pending-all' already runs before this
+in `core::idle_tick': a reply that arrived this same tick is dispatched
+by that earlier pump before this function ever runs, so a handshake
+that just barely made its deadline is never mistakenly reaped out from
+under a completion that already fired."
+  (when lsp--frontend-started
+    (dolist (entry (copy-sequence lsp--autostart-pending))
+      (let* ((conn (nth 0 (cdr entry)))
+             (deadline (nth 2 (cdr entry))))
+        (when (or (not (lsp-live-p conn)) (> (float-time) deadline))
+          (lsp--autostart-reap-one entry))))
+    (lsp--autostart-maybe-begin))
+  nil)
+
 ;; --- Async hover: C-h . ---
 
 (defun lsp--line-character-at (pos)
@@ -2376,9 +3982,21 @@ applies to the inverse direction in `lsp--pos-at'."
   "Async `textDocument/hover' at point. Returns immediately; when the
 server answers (delivered by the editor's idle pump), the result shows
 via `show-hover-popup' -- a floating popup in the GUI, the echo area
-in the TUI. Typing is never blocked waiting for the answer."
+in the TUI. Typing is never blocked waiting for the answer.
+
+M94: routes via `lsp--capable-client' (\"hoverProvider\") instead of
+reading `lsp--buffer-client' directly, so a buffer with a second
+attached client that supports hover -- and the primary either doesn't,
+or also does (`hoverProvider' was never gated before M94 and still
+isn't; a client whose capabilities are unknown, or that lists the key
+at all regardless of its value, counts as supporting it -- see
+`lsp--capability-supported-p') -- can get an answer from whichever one
+matches first. A buffer with only one attached client (the common
+case, and every case before this milestone) behaves identically:
+`lsp--capable-client' falls back to exactly `lsp--buffer-client' via
+`lsp--effective-buffer-clients'."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--capable-client "hoverProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
@@ -2560,9 +4178,19 @@ however, is no longer stale: it's exactly the filter-as-you-type case
 this milestone adds, so candidates are filtered against whatever is
 typed by the time the answer arrives, not what was typed when the
 request was sent -- `buffer-modified-tick' equality is deliberately no
-longer required, unlike M40-4's original three-way check."
+longer required, unlike M40-4's original three-way check.
+
+M94: routes via `lsp--capable-client' (\"completionProvider\") instead
+of reading `lsp--buffer-client' directly, so a buffer whose PRIMARY
+doesn't advertise completion (verible, the Verilog default) but whose
+SECONDARY does (slang, the Verilog default secondary) still gets an
+answer. A buffer with only one attached client behaves identically:
+`lsp--capable-client' falls back to exactly `lsp--buffer-client' via
+`lsp--effective-buffer-clients', and the SAME `lsp--capability-
+supported-p' gate this function already applied is what it checks
+internally, so \"no such client\" degrades exactly as it always has."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--capable-client "completionProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
@@ -2633,22 +4261,25 @@ out here specifically.")
    mode-specific completion source that may know something no LSP
    server can (M54: see `local-completion-function''s own docstring).
    A non-nil return ends the search here.
-2. `lsp-completion-at-point', when this buffer has a live LSP client
-   AND that client's own advertised capabilities support
+2. `lsp-completion-at-point', when this buffer has an attached LSP
+   client whose own advertised capabilities support
    `textDocument/completion' (`lsp--capability-supported-p', M54) --
    see that function's docstring for the narrow, asymmetric rule this
    checks (an ABSENT `completionProvider' key blocks the request; a
    FALSY one, or capabilities never having been recorded at all, does
-   not).
+   not). M94: checked via `lsp--capable-client', which considers EVERY
+   attached client (primary and secondary), not just the primary --
+   Verilog's default primary (verible) has no `completionProvider' key
+   at all, so without this a secondary that DOES advertise one (slang)
+   would never be reachable through `C-M-i' at all.
 3. `dabbrev-expand' otherwise -- so `C-M-i' still does something useful
    before `M-x lsp' has been run, in a buffer with no server registered
-   for its major mode, or against a server that doesn't support
-   completion at all."
+   for its major mode, or against a server (or servers) that don't
+   support completion at all."
   (interactive)
   (cond
    ((and local-completion-function (funcall local-completion-function)))
-   ((let ((client (lsp--live-buffer-client)))
-      (and client (lsp--capability-supported-p client "completionProvider")))
+   ((lsp--capable-client "completionProvider")
     (lsp-completion-at-point))
    (t (dabbrev-expand))))
 
@@ -2732,9 +4363,21 @@ interpreter) applies here identically -- not repeated a second time.")
    answers, jumps to the first location, pushing the origin onto
    `lsp--marker-stack' first (via `lsp-push-definition-marker') so
    `lsp-pop-definition-stack' (M-,) can return. Typing is never blocked
-   waiting for the answer."
+   waiting for the answer.
+
+M95: step 2 routes via `lsp--preferred-role-client' (\"textDocument/
+definition\", \"definitionProvider\") instead of reading
+`lsp--live-buffer-client' directly, so a capable secondary answers this
+in preference to the primary -- see that variable's own docstring for
+why (verible returns no results at all for a name reached through
+`import PKG::*'). A buffer with only one attached client occupying the PRIMARY slot
+behaves identically to before -- see `lsp--preferred-role-client''s own
+docstring for the one state that is NOT identical (a lone SECONDARY
+sitting in an empty primary slot), which this now answers where it
+previously refused."
   (interactive)
-  (let ((live (lsp--live-buffer-client)))
+  (let ((live (lsp--preferred-role-client "textDocument/definition"
+                                           "definitionProvider")))
    (cond
     ((and local-definition-function (funcall local-definition-function)))
     ((not live)
@@ -2790,16 +4433,19 @@ server shouldn't report stale diagnostics as current) or none have
 arrived yet. Callers that need to tell those two nil cases apart
 (`next-diagnostic', `previous-diagnostic') check
 `lsp--live-buffer-client' themselves first rather than trying to infer
-which case this was from a nil return alone."
+which case this was from a nil return alone.
+
+M99: DIAG ranges over `lsp--diagnostics-for-uri''s union, same as
+`lsp--decorate-buffer' paints and `lsp--diagnostics-at-point' considers
+-- previously this only walked `lsp--buffer-client''s own diagnostics,
+so `next-diagnostic'/`previous-diagnostic' could fail to reach a
+squiggle that was visibly drawn on screen from a secondary client."
   (let ((client (lsp--live-buffer-client))
         (file (buffer-file-name)))
     (when (and client file)
-      (let* ((diags (lsp-diagnostics client file))
-             (n (if diags (length diags) 0))
-             (out nil))
-        (dotimes (idx n)
-          (let* ((d (aref diags idx))
-                 (start (gethash "start" (gethash "range" d)))
+      (let ((out nil))
+        (dolist (d (lsp--diagnostics-for-uri client (lsp--path-to-uri file)))
+          (let* ((start (gethash "start" (gethash "range" d)))
                  (pos (lsp--pos-at (gethash "line" start) (gethash "character" start))))
             (push (cons pos d) out)))
         (sort (nreverse out) (lambda (a b) (< (car a) (car b))))))))
@@ -2942,9 +4588,21 @@ still reports normally; this asymmetry is deliberate. Regardless of
 QUIET, `lsp--idle-highlight-last-point' is updated on the request path
 so a manual invocation also suppresses the next idle tick at the same
 point (otherwise a 300ms-later auto-trigger would silently redo the
-same request)."
+same request).
+
+M95: routes via `lsp--preferred-role-client' (\"textDocument/
+documentHighlight\", \"documentHighlightProvider\") instead of reading
+`lsp--live-buffer-client' directly, so a capable secondary answers this
+in preference to the primary -- see that variable's own docstring for
+why (verible false-positives, merging two unrelated identically-spelled
+identifiers on a wildcard-imported name). A buffer with only one attached client occupying the PRIMARY slot
+behaves identically to before -- see `lsp--preferred-role-client''s own
+docstring for the one state that is NOT identical (a lone SECONDARY
+sitting in an empty primary slot), which this now answers where it
+previously refused."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--preferred-role-client "textDocument/documentHighlight"
+                                             "documentHighlightProvider")))
     (cond
      ((not client)
       (unless quiet
@@ -3009,10 +4667,17 @@ reconnection at that same point *will* auto-trigger a fresh highlight
 request. This is accepted, not a regression -- re-highlighting at
 point after a server restart is reasonable behaviour, and there was
 no live client to suppress an auto-trigger against in the first
-place."
+place.
+
+M95: \"live client\" here means `lsp--preferred-role-client' for
+`documentHighlightProvider' (same as `lsp-highlight-at-point' itself),
+not the raw `lsp--live-buffer-client' -- a dead PRIMARY with a live,
+capable SECONDARY still counts as connected for this purpose, exactly
+as it does for the request path itself."
   (interactive)
   (lsp--clear-highlights)
-  (when (lsp--live-buffer-client)
+  (when (lsp--preferred-role-client "textDocument/documentHighlight"
+                                    "documentHighlightProvider")
     (setq-local lsp--idle-highlight-last-point (point))))
 
 (defun lsp--idle-highlight-tick (quiet-ms)
@@ -3047,11 +4712,17 @@ user: `idle_tick' discards this function's result with `let _ ='.
 Does not consult `buffer-modified-tick': editing text at the same
 point (without moving it) does not re-trigger a request, since the
 position-based `lsp--idle-highlight-last-point' check only compares
-`point'. Known, accepted gap -- see that variable's docstring."
+`point'. Known, accepted gap -- see that variable's docstring.
+
+M95: the liveness check is `lsp--preferred-role-client' for
+`documentHighlightProvider', not the raw `lsp--live-buffer-client' --
+same reasoning as `lsp-highlight-clear''s own M95 note, so a dead
+primary with a live, capable secondary still fires this tick."
   (when (and lsp-idle-highlight-delay-ms
              (>= quiet-ms lsp-idle-highlight-delay-ms))
     (condition-case nil
-        (when (and (lsp--live-buffer-client)
+        (when (and (lsp--preferred-role-client "textDocument/documentHighlight"
+                                                "documentHighlightProvider")
                    (buffer-file-name)
                    (not (eq (point) lsp--idle-highlight-last-point)))
           (lsp-highlight-at-point t))
@@ -3400,9 +5071,21 @@ references\" or a picker the user never finishes -- exactly
 `lsp-definition-at-point''s own discipline, so a \"no definition
 found\"/\"no references found\" answer never perturbs the ring.
 
-Bound to `M-?' (see simple.el), alongside `M-.'/`M-,'."
+Bound to `M-?' (see simple.el), alongside `M-.'/`M-,'.
+
+M95: routes via `lsp--preferred-role-client' (\"textDocument/
+references\", \"referencesProvider\") instead of reading
+`lsp--live-buffer-client' directly, so a capable secondary answers this
+in preference to the primary -- see that variable's own docstring for
+why (verible silently omits the symbol's own declaration and does no
+cross-file lookup at all for a module name). A buffer with only one attached client occupying the PRIMARY slot
+behaves identically to before -- see `lsp--preferred-role-client''s own
+docstring for the one state that is NOT identical (a lone SECONDARY
+sitting in an empty primary slot), which this now answers where it
+previously refused."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((client (lsp--preferred-role-client "textDocument/references"
+                                             "referencesProvider")))
     (cond
      ((not client)
       (message "No LSP server connected in this buffer (M-x lsp first)"))

@@ -58,6 +58,20 @@ learn what the design consists of. Reticle reads the same file for
 its own module lookup, so the editor and the language server agree on
 one list instead of each guessing.
 
+`rtl/.slang/server.json` is the equivalent per-project config file for
+`slang-server`, the other Verilog language server Reticle talks to.
+Without it, slang can't find `rtl/include/soc_defs.svh` from
+`rtl/top/soc_top.sv` and reports a spurious severity-1 error —
+`'soc_defs.svh': No such file or directory` — even though the file is
+right there. `{"flags": "-I include"}` fixes that. Two details worth
+knowing if you're setting this up in your own project: the file name
+must be exactly `server.json` (`config.json` or anything else under
+`.slang/` is silently ignored), and the paths inside `flags` are
+resolved relative to the language server process's own working
+directory, not the workspace root or the config file's location —
+Reticle pins that directory to the project root itself (M99) so this
+works regardless of where the editor was launched from.
+
 ## Verilog-2001 vs SystemVerilog
 
 `rtl-verilog2001/` is plain IEEE 1364 — `reg`/`wire`, `always @(posedge)`,
@@ -138,11 +152,11 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 22 files open in the correct major mode** — 18 in a
+- **All 23 files open in the correct major mode** — 18 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
-  `emacs-lisp-mode`, `org-mode`) and 4 in `fundamental-mode`
-  (`README.md`, `rtl/verible.filelist`,
+  `emacs-lisp-mode`, `org-mode`) and 5 in `fundamental-mode`
+  (`README.md`, `rtl/verible.filelist`, `rtl/.slang/server.json`,
   `rtl-verilog2001/.rules.verible_lint`, `tools/sample_sim.log`).
 - From `rtl/top/soc_top.sv`, **`M-.` on `alu` lands in
   `rtl/core/alu.sv`** and port completion engages inside `u_regfile`'s
@@ -157,17 +171,37 @@ And, driving the editor itself rather than the external toolchains:
   already wants it, so the indentation no longer diffs on save.
   Measured on `rtl/core/alu.sv`, which is what the test asserts.
 
-  Two honest exceptions, both checked rather than assumed.
+  One honest exception, checked rather than assumed.
   `rtl/include/soc_defs.svh` has only 2 indented lines out of 28 —
   below the detector's 5-sample confidence floor, so it keeps the
   4-space mode default; the detector declines to guess rather than
-  guessing from two samples. And a line opened *inside* an
-  instantiation's port-connection list still lands at the enclosing
-  block's depth (column 2 in `rtl/top/soc_top.sv`, where the
-  surrounding `.clk_i (clk_i),` lines are aligned at 6): matching
-  continuation alignment needs the paren-column rule this indent
-  engine has never had (a documented M36 limit, see `indent.el`'s
-  header), and detecting the file's step does not change that.
+  guessing from two samples.
+
+  A line opened *inside* an instantiation's port-connection list, a
+  `#(...)` parameter list, or a wrapped call's argument list — a
+  **hanging** list, where the opening paren is immediately followed by
+  a newline, which is what every instantiation and port list in this
+  directory looks like — lands at the enclosing block's depth **plus a
+  fixed 4-column wrap step** (column 6 in `rtl/top/soc_top.sv`, matching
+  where the file's own `.clk_i (clk_i),` lines are already aligned),
+  not at the opening paren's own column. That fixed step is deliberate,
+  not a gap: it mirrors `verible-verilog-format`'s own two independent
+  flags, `--wrap_spaces` (default 4) versus `--indentation_spaces`
+  (default 2, what this file's own detected 2-column body width
+  matches) — measured by running the formatter at `--indentation_spaces`
+  2/3/4/8, where the continuation delta stayed 4 every time for hanging
+  lists. `indent-wrap-width` (default 4, see `indent.el`) implements
+  this as a second axis alongside the block-depth multiply, decoupled
+  from the buffer's own detected step.
+
+  This is narrower than "verible never aligns to the paren column,"
+  which is false in general: when a wrapped call's own argument is
+  itself a call whose paren is followed by more text on the same line
+  (not a shape this directory happens to contain), verible switches to
+  paren-column alignment instead of the fixed step — a decision that
+  needs line-length lookahead this engine doesn't have, so this editor
+  keeps computing the fixed-step answer there. See `indent.el`'s M90
+  section for the exact shape and the two diverging columns.
 
 The four editor claims above, plus the `C-c C-a` / `C-c C-k` rows of
 the keybinding table, are the ones a test now re-checks on every run:

@@ -93,6 +93,20 @@ fn variant_file_name(base: &str, variant: &str) -> Option<String> {
 /// (or the reverse).
 const BLINK_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// The window icon, embedded at compile time. 256px is the largest size in
+/// `assets/icon/png/` that still stays a trivial number of bytes to bake into
+/// the binary (1024px is the master, but a taskbar/titlebar icon is never
+/// shown anywhere near that large, and `with_icon` rescales down from
+/// whatever it is given anyway).
+///
+/// This drives the window and taskbar icon on Linux and Windows. On macOS the
+/// Dock icon is not sourced from here at all -- it comes from the `.app`
+/// bundle's `Contents/Resources/reticle.icns`, set via `CFBundleIconFile` in
+/// `Info.plist`, so this call is a no-op on that platform. That is why
+/// `dev/make-app-bundle.sh` exists: it is the only thing that actually
+/// changes what a macOS user sees in the Dock.
+const ICON_PNG_BYTES: &[u8] = include_bytes!("../../../assets/icon/png/reticle-256.png");
+
 /// Default window size (M-visual-quality): big enough that a Verilog
 /// module instantiation with a wide port list isn't immediately
 /// scrollbar territory. `min_inner_size` keeps a user-shrunk window from
@@ -102,11 +116,26 @@ const BLINK_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_mil
 /// `NativeOptions` defaults to `true`), so these two numbers are only the
 /// fallback used on first launch or when the store is empty.
 pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Error> {
+    // A failure to decode the embedded icon must not stop the editor from
+    // starting -- it is cosmetic, not functional, so this falls back to no
+    // icon (`with_icon` accepts `None`) rather than propagating an error or
+    // panicking. Library code in this project never unwraps.
+    //
+    // Nothing in the test suite calls `run_gui` -- it opens a real OS
+    // window, which has no headless path here (see `dev/gui-shot.sh`'s doc
+    // comment) -- so this `.ok()` fallback has zero test coverage and no
+    // mutation of it can be caught by `cargo test`. Recorded here rather
+    // than left to look covered.
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG_BYTES).ok();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 780.0])
+        .with_min_inner_size([480.0, 320.0])
+        .with_title("Reticle");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 780.0])
-            .with_min_inner_size([480.0, 320.0])
-            .with_title("Reticle"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -126,6 +155,7 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
                 shape_cache: ShapeCache::default(),
                 glyph_cache: GlyphAtlasCache::default(),
                 last_frame_ms: 0.0,
+                frontend_started: false,
                 drag: None,
             }))
         }),
@@ -352,6 +382,11 @@ struct App {
     /// atlas-identity check that invalidates it wholesale.
     glyph_cache: GlyphAtlasCache,
     last_frame_ms: f32,
+    /// M88: true once `core::frontend_started` has been called -- set at
+    /// the end of the first `update`, deliberately AFTER that frame's
+    /// own `core::idle_tick` call, so the earliest an autostart can fire
+    /// is the frame after something has actually been painted.
+    frontend_started: bool,
     /// Mouse support (task 3): state carried between frames while the
     /// primary button is held, `None` otherwise. Drag-to-select must
     /// tell a plain click (no movement, no mark should be armed) apart
@@ -663,6 +698,68 @@ fn scrollbar_thumb(
     Some((top, len))
 }
 
+// --- Row geometry (M87 stage 3) --------------------------------------
+//
+// `grid.row_scale` (a percentage of the base row height, `100` for an
+// ordinary row, `75` for an inline-diagnostic block row -- see
+// `core::redisplay::Grid::row_scale`'s own doc) means a row's pixel
+// height is no longer a single frame-wide constant, so every
+// `row as f32 * row_h` in this file (both directions: row index -> pixel
+// position, and pixel position -> row index) has to walk cumulative
+// per-row heights instead of doing one multiplication. These three
+// functions are that single source of truth, replacing the old bare
+// `row_h` arithmetic at every call site below.
+//
+// `grid.row_scale` is looked up with `.get(row).copied().unwrap_or(100)`
+// throughout, not indexed directly: the hand-built `Grid`s this module's
+// own tests construct (`test_grid`, `one_window_grid`) leave `row_scale`
+// empty, and treating "no entry" as "ordinary row" keeps every existing
+// pixel-math test passing unchanged -- a real `Grid` from `render()`
+// always has `row_scale.len() == grid.rows`, so the fallback never
+// actually triggers there.
+
+/// Height in pixels of `row`: `row_h` for an ordinary row, less for a
+/// shorter one (currently only `RowKind::Block`, at 75%; see D1 in the
+/// M87 stage 3 spec for why a row is never *taller* than `row_h`).
+fn row_height(grid: &core::redisplay::Grid, row_h: f32, row: usize) -> f32 {
+    row_h * grid.row_scale.get(row).copied().unwrap_or(100) as f32 / 100.0
+}
+
+/// Top edge of `row`, in pixels relative to the grid's own origin (the
+/// caller adds `origin.y`). Equivalent to `row as f32 * row_h` when
+/// every row is the same height; walks the rows before it and sums their
+/// actual heights otherwise.
+fn row_top(grid: &core::redisplay::Grid, row_h: f32, row: usize) -> f32 {
+    let mut y = 0.0f32;
+    for r in 0..row {
+        y += row_height(grid, row_h, r);
+    }
+    y
+}
+
+/// Inverse of `row_top`: which row a grid-relative pixel offset `rel_y`
+/// (`>= 0`) falls inside. `row_h` must already be checked `> 0.0` by the
+/// caller (both call sites below already guard this) -- otherwise this
+/// never terminates. Equivalent to `(rel_y / row_h).floor() as usize`
+/// when every row is the same height.
+fn row_at_y(grid: &core::redisplay::Grid, row_h: f32, rel_y: f32) -> usize {
+    let mut y = 0.0f32;
+    // F4 (M87 stage 3 fix round): both call sites already guard `row_h >
+    // 0.0` before calling this, which is what makes the loop provably
+    // terminate on its own (`y` strictly increases each iteration) --
+    // this cap is defence in depth, not a live bug, for any future
+    // caller that doesn't. Capped at `grid.rows`, returning the last
+    // valid row instead of looping past the end.
+    for row in 0..grid.rows {
+        let h = row_height(grid, row_h, row);
+        if rel_y < y + h {
+            return row;
+        }
+        y += h;
+    }
+    grid.rows.saturating_sub(1)
+}
+
 // --- Mouse support (M-mouse task 3) ---------------------------------
 //
 // Click-to-place-point, drag-to-select, wheel-to-scroll. All three need
@@ -692,7 +789,7 @@ fn pixel_to_buffer_pos(
         return None;
     }
     let col = ((pixel.x - origin.x) / char_w).floor() as usize;
-    let row = ((pixel.y - origin.y) / row_h).floor() as usize;
+    let row = row_at_y(grid, row_h, pixel.y - origin.y);
     for win in &grid.windows {
         let text_left = win.col + win.gutter_cols;
         let text_right = win.col + win.cols;
@@ -721,7 +818,7 @@ fn window_at_pixel(
         return None;
     }
     let col = ((pixel.x - origin.x) / char_w).floor() as usize;
-    let row = ((pixel.y - origin.y) / row_h).floor() as usize;
+    let row = row_at_y(grid, row_h, pixel.y - origin.y);
     grid.windows
         .iter()
         .find(|win| {
@@ -1187,7 +1284,12 @@ impl eframe::App for App {
                 let mut pending_text: Vec<(Vec<shaping::RawGlyphRect>, Color32)> = Vec::new();
 
                 for (row, line) in grid.lines.iter().enumerate() {
-                    let y = origin.y + row as f32 * row_h;
+                    let y = origin.y + row_top(&grid, row_h, row);
+                    // M87 stage 3: this row's own height (shorter for a
+                    // `Block` diagnostic row) -- every use of `row_h`
+                    // below as a *height* (not a multiplier applied to a
+                    // row index) must use this instead.
+                    let rh = row_height(&grid, row_h, row);
                     // Pass 1: backgrounds + underlines (per cell — rect fills
                     // are cheap tessellation, no batching needed).
                     for (col, cell) in line.iter().enumerate() {
@@ -1231,7 +1333,7 @@ impl eframe::App for App {
                             cbg = cursor_bg_color(cbg, target_bg, cursor_alpha);
                             cursor_rounding = 1.5;
                         }
-                        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
+                        let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, rh));
                         // Fix 6d: a non-box cursor (bar/hbar) never
                         // recolors `cbg` above, so for those cursor types
                         // `is_cursor` alone used to force a same-colored
@@ -1249,8 +1351,8 @@ impl eframe::App for App {
                                 let uc = cell.style.underline_color.map(to_color).unwrap_or(cfg);
                                 painter.line_segment(
                                     [
-                                        Pos2::new(x, y + row_h - 1.0),
-                                        Pos2::new(x + cell_w, y + row_h - 1.0),
+                                        Pos2::new(x, y + rh - 1.0),
+                                        Pos2::new(x + cell_w, y + rh - 1.0),
                                     ],
                                     egui::Stroke::new(1.0_f32, uc),
                                 );
@@ -1259,7 +1361,7 @@ impl eframe::App for App {
                                 let uc = cell.style.underline_color.map(to_color).unwrap_or(cfg);
                                 let n = ((cell_w / 2.0).max(2.0)) as usize;
                                 let step = cell_w / n as f32;
-                                let b = y + row_h - 1.5;
+                                let b = y + rh - 1.5;
                                 for k in 0..n {
                                     let x0 = x + k as f32 * step;
                                     let (y0, y1) = if k % 2 == 0 {
@@ -1530,11 +1632,11 @@ impl eframe::App for App {
                             .into_iter()
                             .enumerate()
                         {
-                            let y = origin.y + (win.row + r) as f32 * row_h;
+                            let y = origin.y + row_top(&grid, row_h, win.row + r);
+                            let rh = row_height(&grid, row_h, win.row + r);
                             for col in cols {
                                 let x = origin.x + (text_col0 + col) as f32 * char_w;
-                                let rect =
-                                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, row_h));
+                                let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, rh));
                                 painter.rect_filled(snap_rect(rect, ppp), 0.0, guide_color);
                             }
                         }
@@ -1552,7 +1654,7 @@ impl eframe::App for App {
                     let sep_color = with_alpha(fg, 0.08);
                     if grid.rows >= 1 {
                         let row = grid.rows - 1;
-                        let y = origin.y + row as f32 * row_h;
+                        let y = origin.y + row_top(&grid, row_h, row);
                         let rect = Rect::from_min_size(
                             Pos2::new(origin.x, y - 1.0),
                             Vec2::new(cols as f32 * char_w, 1.0),
@@ -1560,7 +1662,7 @@ impl eframe::App for App {
                         painter.rect_filled(snap_rect(rect, ppp), 0.0, sep_color);
                     }
                     for win in &grid.windows {
-                        let y = origin.y + win.mode_line_row as f32 * row_h;
+                        let y = origin.y + row_top(&grid, row_h, win.mode_line_row);
                         let x0 = origin.x + win.col as f32 * char_w;
                         let rect = Rect::from_min_size(
                             Pos2::new(x0, y - 1.0),
@@ -1590,8 +1692,16 @@ impl eframe::App for App {
                         let total_lines = buf.text.total_lines();
                         let top_line0 = buf.text.line_number(win.window_start).saturating_sub(1);
                         let visible_lines = layout.rows.saturating_sub(1); // exclude mode line
-                        let track_top = origin.y + layout.row as f32 * row_h;
-                        let track_len = visible_lines as f32 * row_h;
+                        let track_top = origin.y + row_top(&grid, row_h, layout.row);
+                        // M87 stage 3: the exact pixel span of the text
+                        // area (top of `layout.row` to top of its mode
+                        // line), not `visible_lines as f32 * row_h` --
+                        // a window showing inline diagnostic rows has
+                        // some of its `visible_lines` budget spent on
+                        // shorter (75%) rows, so the old uniform formula
+                        // would overstate the track's pixel height.
+                        let track_len = row_top(&grid, row_h, layout.mode_line_row)
+                            - row_top(&grid, row_h, layout.row);
                         if let Some((thumb_top, thumb_len)) =
                             scrollbar_thumb(total_lines, visible_lines, top_line0, track_len, 24.0)
                         {
@@ -1617,7 +1727,8 @@ impl eframe::App for App {
                 if cursor_type != "box" {
                     let (crow, ccol) = grid.cursor;
                     let x = origin.x + ccol as f32 * char_w;
-                    let y = origin.y + crow as f32 * row_h;
+                    let y = origin.y + row_top(&grid, row_h, crow);
+                    let crh = row_height(&grid, row_h, crow);
                     let accent_rgb = cursor_face
                         .as_ref()
                         .and_then(|cf| cf.bg.or(cf.fg))
@@ -1639,7 +1750,7 @@ impl eframe::App for App {
                         "bar" => {
                             painter.rect_filled(
                                 snap_rect(
-                                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, row_h)),
+                                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, crh)),
                                     ppp,
                                 ),
                                 1.5,
@@ -1650,7 +1761,7 @@ impl eframe::App for App {
                             painter.rect_filled(
                                 snap_rect(
                                     Rect::from_min_size(
-                                        Pos2::new(x, y + row_h - 2.0),
+                                        Pos2::new(x, y + crh - 2.0),
                                         Vec2::new(char_w, 2.0),
                                     ),
                                     ppp,
@@ -1667,7 +1778,10 @@ impl eframe::App for App {
                 if let Some(text) = popup {
                     let (crow, ccol) = grid.cursor;
                     let px = origin.x + ccol as f32 * char_w;
-                    let py = origin.y + (crow + 1) as f32 * row_h + 2.0;
+                    let py = origin.y
+                        + row_top(&grid, row_h, crow)
+                        + row_height(&grid, row_h, crow)
+                        + 2.0;
                     egui::Area::new(egui::Id::new("hover-popup"))
                         .fixed_pos(Pos2::new(px, py))
                         .order(egui::Order::Foreground)
@@ -1707,6 +1821,16 @@ impl eframe::App for App {
                 }
             });
         self.last_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+
+        // M88: after this frame's own `core::idle_tick` call above (and
+        // after everything drawn this frame has been queued for
+        // painting), tell the autostart machinery a real frame has
+        // happened -- see `frontend_started`'s own doc for why this sits
+        // at the very end rather than alongside the `idle_tick` call.
+        if !self.frontend_started {
+            core::frontend_started(&mut self.interp);
+            self.frontend_started = true;
+        }
     }
 }
 
@@ -2267,11 +2391,20 @@ mod tests {
     ) -> core::redisplay::Grid {
         core::redisplay::Grid {
             cols: 0,
-            rows: 0,
+            // F4 (M87 stage 3 fix round): `row_at_y` now bounds its walk
+            // by `grid.rows` (previously unbounded, relying only on
+            // `row_h > 0.0`) -- this hand-built test grid's rows go
+            // unused by every OTHER test here (none asserts on
+            // `grid.rows` itself), so a generous constant, comfortably
+            // past every pixel position any test below probes, keeps
+            // that new bound from silently truncating them.
+            rows: 100,
             lines: Vec::new(),
             cursor: (0, 0),
             windows,
             runs,
+            row_scale: Vec::new(),
+            row_kind: Vec::new(),
         }
     }
 
@@ -2498,6 +2631,83 @@ mod tests {
                 "char_w={cw} row_h={rh} must not panic and must report no hit"
             );
         }
+    }
+
+    // --- F3 (M87 stage 3 fix round): row geometry with a non-default
+    // `row_scale` -- every test above used `one_window_grid`, whose
+    // `row_scale` is empty (`test_grid`'s default), which only exercises
+    // `row_height`/`row_top`/`row_at_y`'s `unwrap_or(100)` fallback path,
+    // never the actual percentage-scaling arithmetic this milestone
+    // exists to add. Row 2 here is a 75%-scale block row (`RowKind::
+    // Block`); text runs sit on row 0 ("hello") and row 3 ("world"), the
+    // row directly below it. -------------------------------------------
+
+    fn grid_with_block_row() -> core::redisplay::Grid {
+        let mut row_scale = vec![100u8; 8];
+        let mut row_kind = vec![core::redisplay::RowKind::Text; 8];
+        row_scale[2] = 75;
+        row_kind[2] = core::redisplay::RowKind::Block;
+        core::redisplay::Grid {
+            cols: 50,
+            rows: 8,
+            lines: Vec::new(),
+            cursor: (0, 0),
+            windows: vec![test_win(1, 0, 0, 8, 50, 3)],
+            runs: vec![test_run(0, 3, "hello", 0), test_run(3, 3, "world", 100)],
+            row_scale,
+            row_kind,
+        }
+    }
+
+    #[test]
+    fn row_geometry_round_trips_through_a_75_percent_row() {
+        let grid = grid_with_block_row();
+        // First row.
+        assert_eq!(row_at_y(&grid, ROW_H, row_top(&grid, ROW_H, 0) + 1.0), 0);
+
+        // The 75%-scale row itself: rows 0 and 1 are still full height,
+        // so its top edge is 2 * ROW_H, and its own height is 75% of
+        // ROW_H, not ROW_H.
+        let block_top = row_top(&grid, ROW_H, 2);
+        assert_eq!(block_top, 2.0 * ROW_H);
+        let block_h = row_height(&grid, ROW_H, 2);
+        assert_eq!(block_h, 0.75 * ROW_H);
+        assert_eq!(row_at_y(&grid, ROW_H, block_top + 1.0), 2);
+        assert_eq!(row_at_y(&grid, ROW_H, block_top + block_h - 0.1), 2);
+        // Exactly at its bottom edge: that pixel belongs to the NEXT
+        // row's top edge, not "still row 2" (row_at_y's own `rel_y < y +
+        // h` test is strict).
+        assert_eq!(row_at_y(&grid, ROW_H, block_top + block_h), 3);
+
+        // A row after the block row.
+        let after_top = row_top(&grid, ROW_H, 3);
+        assert_eq!(after_top, block_top + block_h);
+        assert_eq!(row_at_y(&grid, ROW_H, after_top + 1.0), 3);
+    }
+
+    #[test]
+    fn pixel_to_buffer_pos_lands_on_the_right_line_below_a_block_row() {
+        let grid = grid_with_block_row();
+        // Hard-coded pixel geometry, NOT derived via `row_top`/
+        // `row_height` again -- a test that re-derives its own expected
+        // y from the same functions under test can't actually catch a
+        // regression in them (self-consistent either way). With
+        // ROW_H == 20.0 and row 2 at 75%: row 0 spans [0, 20), row 1
+        // [20, 40), row 2 (block, 15 tall) [40, 55), row 3 [55, 75).
+        // y == 57.0 is inside row 3 under the REAL scaled geometry.
+        // Two things this specifically rules out: (a) the pre-fix
+        // `row as f32 * row_h` formula, which would floor(57 / 20) == 2
+        // instead; (b) `row_height` ignoring `row_scale` entirely
+        // (treating row 2 as a full 20px row), which would put row 3's
+        // top at 60 instead of 55 and also resolve y == 57.0 to row 2.
+        // Row 2 has no buffer-text run at all, so either wrong answer
+        // comes back `None`, not just a differently-wrong `Some`.
+        let pixel = Pos2::new(5.5 * CHAR_W, 57.0);
+        assert_eq!(
+            pixel_to_buffer_pos(&grid, ORIGIN, CHAR_W, ROW_H, pixel),
+            Some((1, 102)),
+            "click on row 3 (2 chars into \"world\") must resolve using the real (scaled) pixel geometry"
+        );
     }
 
     // --- Mouse support: evil-visual-state entry on drag (`arm_mouse_

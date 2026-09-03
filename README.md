@@ -1,3 +1,5 @@
+<img src="assets/icon/png/reticle-128.png" width="96" height="96" align="left" alt="Reticle icon">
+
 # Reticle
 
 An Emacs-like editor written from scratch in Rust, built for **Verilog and
@@ -228,6 +230,43 @@ A man page is provided at `doc/reticle.1`:
 install -m 644 doc/reticle.1 ~/.local/share/man/man1/
 man reticle
 ```
+
+### App icon
+
+The window/taskbar icon is baked into the `reticle` binary at compile time
+and needs no setup on Linux or Windows. Getting the icon into the *Dock* or
+*desktop launcher*, though, is platform-specific:
+
+- **macOS**: run `dev/make-app-bundle.sh` to assemble `target/Reticle.app`
+  around the release binary. It always ships `assets/icon/reticle.icns`, the
+  hand-lit artwork, as the legacy Dock icon. macOS 26 draws app icons inside
+  a system container unless the bundle also carries the new `.icon` package
+  format (`CFBundleIconName` + a compiled `Assets.car`), so when Xcode's
+  `actool` is present the script additionally compiles
+  `assets/icon/Reticle.icon/` (the same gradient and letter, described
+  parametrically rather than hand-lit) and adds it alongside the `.icns` --
+  macOS 26 prefers it, older macOS falls back to the `.icns`. On a machine
+  without Xcode the script still produces a complete bundle, just without
+  that half. This is the only one of the three platform paths exercised on
+  this machine.
+- **Linux**: the `hicolor` theme finds an icon by exact file name under a
+  per-size directory, not by scanning a flat folder, so the PNGs under
+  `assets/icon/png/` have to be copied to `hicolor`'s `<size>x<size>/apps/`
+  layout and renamed to `reticle.png` on the way in:
+
+  ```sh
+  for px in 16 32 64 128 256 512; do
+      install -Dm644 assets/icon/png/reticle-$px.png \
+          ~/.local/share/icons/hicolor/${px}x${px}/apps/reticle.png
+  done
+  install -Dm644 packaging/linux/reticle.desktop \
+      ~/.local/share/applications/reticle.desktop
+  gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null || true
+  ```
+
+  This path has not been tested on a real desktop environment.
+- **Windows**: `assets/icon/reticle.ico` is provided for use as the
+  executable's icon resource. This path has not been tested either.
 
 ---
 
@@ -468,7 +507,6 @@ Requested, recorded, not yet scoped:
 - **Code formatting with a selectable style.**
 - **Multiple cursors**, in the shape of Magnar Sveen's `multiple-cursors.el`.
 - **`expand-region`**, in the shape of Magnar Sveen's package of that name.
-- **A new app icon** -- a handwritten capital **R**, in GNU Emacs's colours.
 - **Visual design of the GUI**, promoted to second only to Verilog and
   SystemVerilog in priority.
 - **User-selectable font and theme**; a transparent window with a background

@@ -13,6 +13,16 @@
 //! headers + JSON instead of our own 4-byte length prefix + printed
 //! sexps), so it's its own module rather than a forced generalization of
 //! `worker.rs` over two genuinely different protocols.
+//!
+//! M99: `LspConnection::spawn` gained an optional CWD, because some real
+//! servers (slang-server's `.slang/server.json`) resolve their own
+//! per-project config's relative paths against their OWN process cwd,
+//! not against `rootUri` or the config file's location -- see that
+//! function's own doc comment for the POSIX chdir-then-exec ordering
+//! issue this raises for a relative CMD, and how it's handled. Known
+//! gap: CWD only ever comes from the caller in `crates/core/lisp/lsp.el`
+//! (the project root, when it exists on disk); there is no per-server
+//! override for a project that wants a DIFFERENT cwd than its own root.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -91,8 +101,66 @@ pub struct LspConnection {
 }
 
 impl LspConnection {
-    pub fn spawn(cmd: &str, args: &[String]) -> std::io::Result<LspConnection> {
-        let mut child = Command::new(cmd)
+    /// `cwd`: the directory the server process should treat as its
+    /// current directory, or `None` to inherit the editor's own cwd
+    /// (the pre-M99 default). This exists because per-project server
+    /// config files -- e.g. slang-server's `.slang/server.json`, whose
+    /// `flags` entries like `-I include` are relative paths -- are
+    /// resolved relative to the *server process's* cwd, not the
+    /// workspace root and not the config file's own location. Without
+    /// a way to pin the cwd, such a config only works by accident, when
+    /// the user happens to have started the editor from the project
+    /// root.
+    pub fn spawn(cmd: &str, args: &[String], cwd: Option<&str>) -> std::io::Result<LspConnection> {
+        // POSIX only resolves the executable path *after* chdir, so once
+        // we set `current_dir`, a relative CMD containing a path
+        // separator (e.g. "./dev/fake-lsp.py") would silently start
+        // resolving against the NEW cwd instead of the one the caller
+        // meant. Pin it to an absolute path first, using the editor
+        // process's own cwd, so setting a server cwd never changes which
+        // binary gets run. A bare command name (no '/') is left alone:
+        // it's found via PATH search, which isn't cwd-relative anyway.
+        let mut resolved_cmd: std::borrow::Cow<str> = cmd.into();
+        // Tracks what actually gets passed to `current_dir` below --
+        // starts as CWD, but is downgraded to `None` (below) if CMD
+        // can't be safely absolutized, rather than ever setting a cwd
+        // while leaving CMD relative.
+        let mut effective_cwd = cwd;
+        if cwd.is_some() && cmd.contains('/') {
+            match std::env::current_dir() {
+                Ok(here) => {
+                    resolved_cmd = here.join(cmd).to_string_lossy().into_owned().into();
+                }
+                Err(_) => {
+                    // F5 (M99 review): if the editor process's OWN cwd
+                    // can't even be read, CMD cannot be safely
+                    // absolutized -- and setting `current_dir(dir)`
+                    // below while leaving CMD relative would reintroduce
+                    // exactly the hazard this function's own comment
+                    // above describes (CMD silently resolving against
+                    // the NEW cwd instead of the caller's). Better to
+                    // give up the cwd feature for this one spawn than to
+                    // spawn the wrong binary, or one that exists by
+                    // coincidence under the new cwd: fall all the way
+                    // back to pre-M99 semantics (CMD resolved exactly as
+                    // it always was, no `current_dir` call at all).
+                    //
+                    // This fallback has NO test coverage: there is no
+                    // reliable way to make `std::env::current_dir()`
+                    // fail from within a test (it fails only if the
+                    // process's cwd has been deleted out from under it,
+                    // or on some very unusual sandboxes), so this is a
+                    // black box, documented honestly as such rather than
+                    // pretending it's exercised.
+                    effective_cwd = None;
+                }
+            }
+        }
+        let mut command = Command::new(resolved_cmd.as_ref());
+        if let Some(dir) = effective_cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -326,7 +394,11 @@ fn parse_message(interp: &mut Interp, s: &str) -> Result<Value, Flow> {
 }
 
 pub fn register(interp: &mut Interp) {
-    defun(interp, "lsp-start", 1, Some(2), |i, a| {
+    // M99: third optional argument CWD pins the server process's
+    // current directory (see `LspConnection::spawn`'s doc comment for
+    // why -- slang-server's `.slang/server.json` resolves its `flags`
+    // relative paths against it).
+    defun(interp, "lsp-start", 1, Some(3), |i, a| {
         let cmd = need_str(i, &a[0])?;
         let args: Vec<String> = match opt(a, 1) {
             Value::Nil => Vec::new(),
@@ -335,7 +407,11 @@ pub fn register(interp: &mut Interp) {
                 .map(|x| need_str(i, x).map(|s| s.to_string()))
                 .collect::<Result<_, _>>()?,
         };
-        match LspConnection::spawn(&cmd, &args) {
+        let cwd: Option<Rc<String>> = match opt(a, 2) {
+            Value::Nil => None,
+            v => Some(need_str(i, &v)?),
+        };
+        match LspConnection::spawn(&cmd, &args, cwd.as_ref().map(|s| s.as_str())) {
             // LspConnection: process handle / streams / pending-request
             // bookkeeping, no Value.
             Ok(conn) => Ok(Value::Ext(ExtRef::new(LSP_TAG, RefCell::new(conn), None))),

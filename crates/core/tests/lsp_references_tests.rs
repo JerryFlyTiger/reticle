@@ -237,6 +237,46 @@ fn empty_result_verilog_file_no_filelist_verible_command_names_verible_filelist_
 }
 
 #[test]
+fn empty_result_verilog_file_names_the_filelist_ancestor_not_the_nearer_git() {
+    // M93: dir/verible.filelist (outer) plus dir/sub/.git/ (nearer the
+    // buffer). Before M93, `lsp--project-root' stopped at `sub' (the
+    // nearer `.git'), so this message would have named `sub' even
+    // though a real `verible.filelist' exists two directories up --
+    // true but useless, since the file it points at is empty. After
+    // M93 the same function call resolves to `dir', so the message
+    // must name `dir', not `sub'.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("empty_sv_filelist_outranks_git");
+    std::fs::create_dir_all(dir.join("sub/.git")).unwrap();
+    std::fs::write(dir.join("verible.filelist"), "sub/t.sv\n").unwrap();
+    let file = write_file(&dir.join("sub"), "t.sv", "module t; endmodule\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_command(&mut i, "verible-verilog-ls");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+
+    ok(&mut i, "(lsp-references-at-point)");
+    invoke_captured_callback(&mut i, "[]");
+
+    // The buffer's directory (`sub') is a naive nearest-marker walk's
+    // answer; the actually-used root is `dir' itself, and the filelist
+    // lives directly in it -- so verible.filelist WAS found, and the
+    // message must fall back to the plain "No references found", not
+    // the "no verible.filelist in ..." clause (which would be a lie:
+    // the file is right there in the root that was actually used).
+    let msg = run(&mut i, "(car test--messages)");
+    assert_eq!(msg, "\"No references found\"", "got {msg:?}");
+
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
+    assert_eq!(
+        root,
+        dir.to_str().unwrap(),
+        "lsp--project-root should have resolved to the filelist ancestor, not the nearer .git"
+    );
+}
+
+#[test]
 fn empty_result_verilog_file_with_filelist_shows_plain_message() {
     let (mut i, _ed) = setup();
     let dir = scratch_dir("empty_sv_with_filelist");

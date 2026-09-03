@@ -241,6 +241,34 @@
 ;; from the `function_body_declaration'/`task_body_declaration' block
 ;; node, exactly like c's if/compound_statement split).
 ;;
+;; M97 fix round (FF2): `interface_declaration'/`package_declaration'/
+;; `class_declaration' (added to `indent--block-node-types' at M97, see
+;; that variable's own comment) inherit this EXACT quirk, for the exact
+;; same structural reason -- each one's own opening keyword (`interface'/
+;; `package'/`class') is a descendant of the very node whose BODY needs
+;; the extra level, so re-TABbing `package soc_pkg;' (as one line, no
+;; body yet on that same line) also computes one level deeper than ideal,
+;; verified against real content: `demo/rtl/pkg/soc_pkg.sv' line 7,
+;; `package soc_pkg;', computes column 2 against an on-disk column 0.
+;; Same accepted tradeoff as `module_declaration' above, for the same
+;; reason (no separate per-item wrapper node to exclude the header line
+;; via) -- pinned by `verilog_package_interface_and_class_header_lines_
+;; share_the_documented_one_level_indent_quirk' in indent_tests.rs,
+;; alongside the module case rather than as a parallel, separate note.
+;;
+;; NOT fixed, recorded rather than chased (M97 recon, real-file check
+;; against `demo/rtl/pkg/soc_pkg.sv'): 16 of that file's 54 lines -- the
+;; bodies of its `typedef enum logic [...] {...} alu_op_e;' and `typedef
+;; struct packed {...} req_t;' forms -- do not reindent to their on-disk
+;; columns either, TAB or otherwise, because a SystemVerilog enum's
+;; member list and a packed struct's field list have never been in
+;; `indent--block-node-types', neither before nor after this milestone's
+;; addition of `interface_declaration'/`package_declaration'/
+;; `class_declaration'. Pre-existing, out of M97's scope (which was
+;; interface/package/class as BLOCK CONTAINERS, not every node kind that
+;; happens to nest inside one) -- recorded here so it is not mistaken for
+;; new debt this milestone introduced.
+;;
 ;; A wrapped multi-line ANSI port or parameter list (`module foo #(\n
 ;; parameter W = 8\n) (\n input logic clk,\n ...\n);') needs NO extra
 ;; block-type entry at all: `list_of_port_declarations'/
@@ -735,18 +763,136 @@ failing loudly right here. `simple.el''s `goto-line' has this same gap
 ;;          are deliberately EXCLUDED from this list) plus generate_block
 ;;          (the for/if generate's begin/end BODY, a second, separate
 ;;          level -- the same begin/end shape as seq_block, just under a
-;;          different node name).
+;;          different node name). interface_declaration/package_declaration/
+;;          class_declaration (M97): each behaves exactly like
+;;          module_declaration -- its own body, one level, dump-verified
+;;          against `demo/rtl/pkg/soc_pkg.sv' (package) and hand-built
+;;          interface/class snippets, INCLUDING inheriting module_
+;;          declaration's own documented header-line quirk (see this
+;;          file's header, M97 fix round FF2, for the details and the
+;;          pinning test). Absent before M97: a body inside `package
+;;          ... endpackage' (this project's own `soc_pkg.sv' is written
+;;          that way) got ZERO block-depth increment, reproduced by
+;;          `verilog_package_body_indents_one_level_and_endpackage_
+;;          dedents' before this fix landed. See `indent--verilog-closers'
+;;          below for the matching `endinterface'/`endpackage'/`endclass'
+;;          addition.
 (defvar indent--block-node-types
   '((c . ("compound_statement" "field_declaration_list" "enumerator_list" "initializer_list"))
     (cpp . ("compound_statement" "field_declaration_list" "enumerator_list" "initializer_list"))
     (java . ("block" "class_body" "switch_block"))
     (rust . ("block" "declaration_list" "field_declaration_list" "match_block" "enum_variant_list"))
     (elisp . ("list" "special_form" "function_definition" "macro_definition"))
-    (verilog . ("module_declaration" "seq_block" "function_body_declaration"
+    (verilog . ("module_declaration" "interface_declaration" "package_declaration"
+                "class_declaration" "seq_block" "function_body_declaration"
                 "task_body_declaration" "case_item" "loop_generate_construct"
                 "if_generate_construct" "generate_block")))
   "Alist of (LANG-SYMBOL . BLOCK-NODE-TYPE-STRINGS) -- see the comment
 immediately above for how each language's list was determined.")
+
+;; --- M90: a SEPARATE wrap-step axis for wrapped port/parameter/argument ----
+;; lists (verilog only). See this file's header note below for the
+;; reasoning; in short: `verible-verilog-format' -- the tool that produced
+;; `demo/rtl''s committed formatting byte for byte at its default flags --
+;; indents a continuation line inside a wrapped `.port(net)' list, a
+;; `#(...)' parameter list, or an ordinary call's wrapped argument list by a
+;; FIXED 4 columns (`--wrap_spaces', default 4), decoupled from
+;; `--indentation_spaces' (default 2, i.e. this engine's own
+;; `standard-indent-width'): measured at indentation widths 2/3/4/8, the
+;; wrap delta stayed 4 every time, not `standard-indent-width' every time.
+;; A single ancestor-counting `block_depth * standard-indent-width' model
+;; (`indent--block-node-types', above) has no way to express a second,
+;; independently-sized step, so this is a genuinely separate quantity, not
+;; a second block-type list reusing the same multiplier.
+;;
+;; A NARROWER claim than it might look like at first, and the boundary
+;; matters: the fixed step above reproduces verible only for a HANGING
+;; list -- the wrap node's opening paren immediately followed by a
+;; newline, which is what every instantiation in `demo/rtl' and
+;; essentially all real RTL port lists look like (dump-verified: a call
+;; nested inside a wrapped port connection lands at the SAME column, 10,
+;; under both this engine and real verible output). When a call's
+;; argument is ITSELF a call whose own paren is followed by more text on
+;; the SAME line -- e.g. `do_call_with_a_long_name(other_call_with_a_
+;; long_name(\n  arg1, arg2, arg3\n));' -- verible switches to PAREN-
+;; COLUMN alignment for that continuation line (column 29, lining up
+;; under `other_call_with_a_long_name('s own opening paren), while this
+;; engine still computes the fixed-step answer, block 4 + wrap 8 = 12.
+;; Measured on the built binary against real `verible-verilog-format'
+;; output, M90 fix round. NOT chased: verible's conditional switch
+;; depends on line-length lookahead (does the nested call's own opening
+;; line still fit?) this engine has no mechanism for -- the exact same
+;; gap that already rules out enabling this axis for c/clang-format,
+;; below -- and the shape does not occur anywhere in `demo/rtl'. Pinned,
+;; not fixed, by `verilog_nested_call_inside_wrapped_call_diverges_from_
+;; verible_paren_alignment_a_documented_scope_decision' in
+;; indent_tests.rs.
+(defvar indent-wrap-width 4
+  "Number of columns a continuation line inside a wrapped port/parameter/
+argument list (see `indent--wrap-node-types') indents by, ON TOP OF its
+enclosing block depth's own `standard-indent-width' columns. Deliberately
+NOT derived from `standard-indent-width' -- this mirrors
+`verible-verilog-format''s own two independent flags,
+`--wrap_spaces' (default 4, what this variable's default matches) versus
+`--indentation_spaces' (default 2, what `standard-indent-width' typically
+is for a verible-formatted file): a real file indented at 2 columns per
+block level still gets its wrapped continuation lines at +4, not +2,
+because verible's own formatter -- the tool that produced `demo/rtl''s
+committed formatting byte for byte -- does exactly that. Global, not
+buffer-local; unlike `standard-indent-width', nothing in this file
+attempts to detect it from a file's own content.")
+
+;; Node-type list, parallel to `indent--block-node-types': node types whose
+;; CONTENTS (a continuation line inside them, one ancestor-walk step) get
+;; ONE `indent-wrap-width' step rather than one `standard-indent-width'
+;; block level. Verilog only for now (see this file's header) -- real-parse
+;; dump-verified (M90, `(insert \"module top;\\n  sub_module #(\\n
+;; .W(8),\\n .D(4)\\n ) u_sub (\\n .clk(clk),\\n .rst(rst)\\n );\\n
+;; initial begin\\n do_call(\\n a,\\n b\\n );\\n end\\nendmodule\\n\")'
+;; followed by `(treesit-node-string root)'): `list_of_parameter_value_
+;; assignments' sits inside `parameter_value_assignment' (the `#(...)'
+;; form), `list_of_port_connections' sits inside `hierarchical_instance',
+;; and `list_of_arguments' sits inside `tf_call' -- in every case the
+;; list node's own parens are SIBLINGS emitted by the grammar rule that
+;; wraps it (`hierarchical_instance', `parameter_value_assignment',
+;; `tf_call'), not children of the list node itself, so a continuation
+;; line (a descendant of the list node) gets exactly one wrap step and the
+;; closing `)'/`);' line (a sibling of the list node, not a descendant)
+;; gets none -- no separate closer-list entry needed for this. Does NOT
+;; separately list `let_list_of_arguments'/`property_list_of_arguments'/
+;; `sequence_list_of_arguments' -- real-parse dump-verified (M90 fix
+;; round) that this grammar does not actually need them: `assert
+;; (my_let(x,y));' (a `let'-flavored call) parses through the ORDINARY
+;; `tf_call'/`list_of_arguments' path with no `let_list_of_arguments'
+;; node appearing anywhere, so it already gets the wrap step through the
+;; entry above; and both `assert property (my_prop(x,y));' AND `cover
+;; property (my_seq(x,y));' route through `sequence_list_of_arguments',
+;; with no distinct `property_list_of_arguments' node observed in either
+;; dump -- so of the three names this defvar's earlier version claimed
+;; were aliases, `let_list_of_arguments' was verified NOT to occur at
+;; all (the ordinary path already covers that call shape) and
+;; `property_list_of_arguments' was verified NOT to occur either
+;; (`sequence_list_of_arguments' covers both property and sequence
+;; calls); `sequence_list_of_arguments' itself was confirmed to occur
+;; but is still left out of this list, deliberately, because a property/
+;; sequence call's argument list is not RTL-critical -- can be added the
+;; same way if a real file needs it. All three claims verified by real
+;; parse, not read off `grammar.js' alone.
+(defvar indent--wrap-node-types
+  '((verilog . ("list_of_port_connections" "list_of_parameter_value_assignments"
+                "list_of_arguments")))
+  "Alist of (LANG-SYMBOL . WRAP-NODE-TYPE-STRINGS) -- see the comment
+immediately above. Only verilog has an entry: c/c++/java/rust are
+deliberately NOT given one. `rustfmt' always uses a fixed hanging step
+like verible, but `clang-format' CONDITIONALLY aligns a wrapped argument
+list to the opening paren's own column when the first argument still fits
+on the opening line, falling back to a hanging step only when it doesn't
+-- a decision that depends on line-length lookahead this engine has no
+mechanism for (it only ever looks at ancestor node types, never column
+positions or line lengths). Enabling a single fixed-step rule for c would
+therefore be wrong in one of clang-format's two modes, and there is no
+measurement here (unlike verilog's verible check, above) to justify
+picking either one.")
 
 (defconst indent--c-like-closers '(")" "}" "]")
   "Tokens that dedent a line by one level when they are its own first
@@ -759,13 +905,19 @@ so the same mechanism also fits Verilog's multi-character WORD closers
   "Like `indent--c-like-closers', for emacs-lisp-mode (parens only --
 see this file's header on elisp vectors).")
 
-(defconst indent--verilog-closers '("end" "endmodule" "endfunction" "endtask")
+(defconst indent--verilog-closers
+  '("end" "endmodule" "endfunction" "endtask" "endinterface" "endpackage" "endclass")
   "Like `indent--c-like-closers', for verilog-mode -- WHOLE-WORD closers
 rather than single characters (dump-verified plain anonymous leaf
 tokens, no wrapper node, same `treesit-node-type' == own-literal-text
 shape as a brace language's `}'). Deliberately excludes `endcase'/
 `endgenerate' -- see this file's header for why those two must NOT be
-treated as dedent triggers here.")
+treated as dedent triggers here. `endinterface'/`endpackage'/`endclass'
+(M97) pair with the `interface_declaration'/`package_declaration'/
+`class_declaration' entries added to `indent--block-node-types' at the
+same time -- each is the SOLE block-type node their own body sits
+inside (dump-verified same shape as `module_declaration'/`endmodule'),
+so they dedent exactly one level, symmetric with `endmodule'.")
 
 (defun indent--block-depth (node block-types)
   "Count of nodes among NODE and its ancestors (via `treesit-node-parent',
@@ -814,34 +966,56 @@ that makes a MULTI-character word closer possible at all, since a bare
 `char-after' can only ever compare a single character.)"
   (member (treesit-node-type node) closers))
 
-(defun indent--query-pos-and-depth (lang-sym block-types closers)
-  "(QUERY-POS . DEPTH) for the current line under LANG-SYM, or nil if a
-tree-sitter ERROR node is encountered. QUERY-POS is the position
-actually queried: the current line's own first non-blank character, or
--- when the line is blank -- the nearest real character before it (see
-this file's header, the MISSING-token trap). DEPTH already has the
-closing-token dedent applied, based on the tree-sitter NODE at
-QUERY-POS -- uniformly: whether QUERY-POS is this line's own leading
-closer or the last real character of a PRECEDING line that happens to
-END with one, either way it marks the end of a block, and content at or
-after it belongs one level out. (This is what makes a genuinely blank
-line between two top-level closing braces correctly compute 0, not 1:
-its fallback query position IS that previous closer, and the same
-dedent rule applies to it.) The dedent only fires when QUERY-POS's own
-tree-sitter NODE literally IS one of CLOSERS (`indent--closer-token-
-at-p') -- not just when the buffer text happens to match -- so a
-closing token's ordinary TEXT appearance inside a comment or string
-literal never falsely triggers it."
+(defun indent--query-pos-and-depth (lang-sym block-types closers &optional wrap-types)
+  "(QUERY-POS DEPTH WRAP-DEPTH) for the current line under LANG-SYM, or
+nil if a tree-sitter ERROR node is encountered. QUERY-POS is the
+position actually queried: the current line's own first non-blank
+character, or -- when the line is blank -- the nearest real character
+before it (see this file's header, the MISSING-token trap). DEPTH
+already has the closing-token dedent applied, based on the tree-sitter
+NODE at QUERY-POS -- uniformly: whether QUERY-POS is this line's own
+leading closer or the last real character of a PRECEDING line that
+happens to END with one, either way it marks the end of a block, and
+content at or after it belongs one level out. (This is what makes a
+genuinely blank line between two top-level closing braces correctly
+compute 0, not 1: its fallback query position IS that previous closer,
+and the same dedent rule applies to it.) The dedent only fires when
+QUERY-POS's own tree-sitter NODE literally IS one of CLOSERS
+(`indent--closer-token-at-p') -- not just when the buffer text happens
+to match -- so a closing token's ordinary TEXT appearance inside a
+comment or string literal never falsely triggers it.
+
+WRAP-DEPTH (M90) is `indent--block-depth' of the SAME NODE against
+WRAP-TYPES (`indent--wrap-node-types'), computed independently of DEPTH
+and never given the closer dedent -- a wrapped list's closing `)'/`);'
+line is a SIBLING of the list node, not a descendant (see
+`indent--wrap-node-types'' comment), so it is simply never counted by
+this walk in the first place; no dedent rule is needed for it. 0 when
+WRAP-TYPES is nil (the caller's language has no wrap-node-type list) or
+absent, without walking the tree a second time for languages that don't
+need it. This `(and depth wrap-types ...)' short-circuit is true by
+inspection but UNWATCHED BY THE TEST SUITE: for any language whose
+WRAP-TYPES is nil, `indent--block-depth' called directly on an empty
+type list already returns 0 by itself (nothing ever matches
+`member'), so deleting the short-circuit would still compute the
+correct answer for those five languages -- no test can distinguish
+`(and depth wrap-types (indent--block-depth ...))' from an
+unconditional call here, because both produce the same observable
+column. The short-circuit exists purely to skip a wasted ancestor
+walk, not to change any language's answer; that performance claim is
+not covered by mutation testing and is recorded as such rather than
+implied to be."
   (let* ((line-pos (indent--first-non-blank-pos))
          (blank (= line-pos (line-end-position)))
          (query-pos (if blank (or (indent--prev-nonblank-char-pos) line-pos) line-pos))
          (parser (treesit-parser-create lang-sym))
          (node (treesit-node-at query-pos parser))
-         (depth (indent--block-depth node block-types)))
+         (depth (indent--block-depth node block-types))
+         (wrap-depth (and depth wrap-types (indent--block-depth node wrap-types))))
     (when depth
       (when (indent--closer-token-at-p node closers)
         (setq depth (max 0 (1- depth))))
-      (cons query-pos depth))))
+      (list query-pos depth (or wrap-depth 0)))))
 
 (defvar indent-treesit-max-chars 300000
   "Buffers larger than this many characters skip the tree-sitter block-
@@ -861,12 +1035,20 @@ is still fast enough to be worth keeping smart indentation for.")
   "Target column for the current line under LANG-SYM using the block-
 depth heuristic, or nil (caller falls back to `indent--copy-previous-
 indentation') on an ERROR tree or an oversized buffer -- see
-`indent--query-pos-and-depth' and `indent-treesit-max-chars'."
+`indent--query-pos-and-depth' and `indent-treesit-max-chars'. M90:
+`block_depth * standard-indent-width + wrap_depth * indent-wrap-width'
+-- two independently-sized axes (see `indent--wrap-node-types'), not
+one; WRAP-DEPTH is always 0 for a language with no
+`indent--wrap-node-types' entry, so this is unchanged from before M90
+for every language except verilog."
   (if (> (point-max) indent-treesit-max-chars)
       nil
     (let* ((block-types (cdr (assq lang-sym indent--block-node-types)))
-           (r (indent--query-pos-and-depth lang-sym block-types closers)))
-      (when r (* (cdr r) standard-indent-width)))))
+           (wrap-types (cdr (assq lang-sym indent--wrap-node-types)))
+           (r (indent--query-pos-and-depth lang-sym block-types closers wrap-types)))
+      (when r
+        (+ (* (nth 1 r) standard-indent-width)
+           (* (nth 2 r) indent-wrap-width))))))
 
 (defun c-indent-line ()
   (or (indent--treesit-depth-column 'c indent--c-like-closers)

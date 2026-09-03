@@ -1,0 +1,40 @@
+{
+  "color-space-for-untagged-svg-colors": "display-p3",
+  "fill": {
+    "linear-gradient": [
+      "srgb:0.51373,0.50196,0.76863,1.00000",
+      "srgb:0.56078,0.26667,0.74118,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "fill": "automatic",
+          "image-name": "R.svg",
+          "name": "R",
+          "position": {
+            "scale": 1.0,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.5
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

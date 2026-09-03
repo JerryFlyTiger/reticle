@@ -141,13 +141,14 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 22] = [
+    const TABLE: [(&str, &str); 23] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
         ("rtl-verilog2001/.rules.verible_lint", "fundamental-mode"),
         ("rtl-verilog2001/fifo_sync.v", "verilog-mode"),
         ("rtl-verilog2001/fifo_sync_tb.v", "verilog-mode"),
+        ("rtl/.slang/server.json", "fundamental-mode"),
         ("rtl/bus/axi4_lite_arbiter.sv", "verilog-mode"),
         ("rtl/core/alu.sv", "verilog-mode"),
         ("rtl/core/regfile.sv", "verilog-mode"),
