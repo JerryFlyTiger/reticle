@@ -2066,3 +2066,323 @@ fn user_hook_setq_local_wins_over_detection() {
     );
     assert_eq!(run(&mut i, "standard-indent-width"), "9");
 }
+
+// --- M100: enum member / struct field lines were dedenting by one level ---
+// (see indent.el's `indent--block-node-types' comment and its M100 note
+// alongside the M97 discussion for the fix and the node shapes it relies
+// on). `enum_name_declaration'/`struct_union_member' are each SELF-
+// REFERENTIAL nodes -- exactly like `case_item', already accepted above --
+// so adding them adds exactly one level to the one line each starts on,
+// without touching ordinary (non-enum/struct) declarations, whose leading
+// token is also a `data_type' descendant but NOT under either of these two
+// new node types.
+
+/// M100: a package-level enum member line is now package-depth (1) plus
+/// its own `enum_name_declaration' (1) = 2 levels, matching the real
+/// showcase file's on-disk formatting at its own 2-column width.
+#[test]
+fn verilog_package_enum_member_line_indents_to_four_at_two_column_width() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package p;\ntypedef enum logic [3:0] {\nAluAdd = 4'h0,\nAluSub = 4'h1\n} e;\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"AluAdd\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "M100: enum member line is package-depth (1) plus its own \
+         enum_name_declaration (1) = 2 levels at this file's 2-column width"
+    );
+}
+
+/// M100: same shape, a packed struct's field line.
+#[test]
+fn verilog_package_struct_field_line_indents_to_four_at_two_column_width() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package p;\ntypedef struct packed {\nlogic a;\nlogic b;\n} req_t;\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic a;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "M100: struct field line is package-depth (1) plus its own \
+         struct_union_member (1) = 2 levels at this file's 2-column width"
+    );
+}
+
+/// M100: the enum/struct closing `}' line is NOT itself an
+/// `enum_name_declaration'/`struct_union_member' (those are its
+/// SIBLINGS under `data_type', not its ancestors), so it must stay
+/// unaffected by this milestone's addition -- still one level (the
+/// enclosing `package_declaration' alone), matching real-file column 2.
+#[test]
+fn verilog_enum_and_struct_closing_brace_lines_unaffected_still_two() {
+    for body in [
+        "package p;\ntypedef enum logic [3:0] {\nAluAdd = 4'h0,\nAluSub = 4'h1\n} e;\nendpackage\n",
+        "package p;\ntypedef struct packed {\nlogic a;\nlogic b;\n} req_t;\nendpackage\n",
+    ] {
+        let (mut i, _ed) = setup();
+        run(&mut i, "(verilog-mode)");
+        run(&mut i, "(set-indent-width 2)");
+        run(&mut i, &format!("(insert {:?})", body));
+        run(&mut i, "(goto-char (point-min))");
+        run(&mut i, "(search-forward \"}\")");
+        run(&mut i, "(beginning-of-line)");
+        assert_eq!(
+            run(&mut i, "(verilog-indent-line)"),
+            "2",
+            "closing `}}' line of {:?} must stay at one level, unaffected by M100",
+            body
+        );
+    }
+}
+
+/// M100: the `typedef enum ... {'/`typedef struct packed {' OPENING line
+/// itself is also not one of the two new node types (it is the sibling
+/// `data_type' node's own start, not an item under it) -- still one
+/// level, matching real-file column 2.
+#[test]
+fn verilog_enum_and_struct_opening_line_unaffected_still_two() {
+    for (needle, body) in [
+        (
+            "typedef enum",
+            "package p;\ntypedef enum logic [3:0] {\nAluAdd = 4'h0,\nAluSub = 4'h1\n} e;\nendpackage\n",
+        ),
+        (
+            "typedef struct",
+            "package p;\ntypedef struct packed {\nlogic a;\nlogic b;\n} req_t;\nendpackage\n",
+        ),
+    ] {
+        let (mut i, _ed) = setup();
+        run(&mut i, "(verilog-mode)");
+        run(&mut i, "(set-indent-width 2)");
+        run(&mut i, &format!("(insert {:?})", body));
+        run(&mut i, "(goto-char (point-min))");
+        run(&mut i, &format!("(search-forward {:?})", needle));
+        run(&mut i, "(beginning-of-line)");
+        assert_eq!(
+            run(&mut i, "(verilog-indent-line)"),
+            "2",
+            "`{}' opening line must stay at one level, unaffected by M100",
+            needle
+        );
+    }
+}
+
+/// M100 regression guard: this is what the DO-NOT-add-`data_type' comment
+/// in indent.el warns about. Ordinary (non-enum/non-struct) declarations
+/// share the same `data_type' ancestor as enum members/struct fields, but
+/// must NOT gain an extra level from this milestone -- neither a plain
+/// signal declaration inside a package function body (package_declaration
+/// + function_body_declaration = 2 levels, unchanged) nor an ordinary
+///   module-level signal declaration (module_declaration alone = 1 level,
+///   unchanged).
+#[test]
+fn verilog_ordinary_declarations_unaffected_by_the_new_enum_struct_node_types() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package p;\nfunction automatic void f();\nlogic [7:0] mask;\nendfunction\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic [7:0] mask;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "an ordinary declaration inside a package function body stays at 2 levels (4 \
+         columns), not 3, even though its leading token is also a `data_type' descendant"
+    );
+
+    let (mut i2, _ed2) = setup();
+    run(&mut i2, "(verilog-mode)");
+    run(&mut i2, "(set-indent-width 2)");
+    run(
+        &mut i2,
+        &format!("(insert {:?})", "module m;\nlogic [3:0] foo;\nendmodule\n"),
+    );
+    run(&mut i2, "(goto-char (point-min))");
+    run(&mut i2, "(search-forward \"logic [3:0] foo;\")");
+    run(&mut i2, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i2, "(verilog-indent-line)"),
+        "2",
+        "an ordinary module-level signal declaration stays at 1 level (2 columns), \
+         unaffected by the enum/struct-only node types added at M100"
+    );
+}
+
+/// M100's strongest guard: every non-blank line of the real showcase file,
+/// `demo/rtl/pkg/soc_pkg.sv', reindented at this file's own 2-column
+/// width, must compute the SAME column it already has on disk -- except
+/// line 7, `package soc_pkg;', which keeps the separate, already-pinned
+/// M97 header-line quirk (computes 2 against on-disk 0; see
+/// `verilog_soc_pkg_sv_package_header_line_computes_one_level_deep_
+/// against_its_own_on_disk_column', above). Before M100, this failed on
+/// 16 lines -- the enum's 10 member lines and the two structs' 6 field
+/// lines (each of which had been computing 2 against on-disk 4).
+#[test]
+fn verilog_soc_pkg_sv_full_file_reindents_to_its_own_on_disk_columns_except_the_documented_package_header_quirk(
+) {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../demo/rtl/pkg/soc_pkg.sv");
+    let src = std::fs::read_to_string(path).expect("demo/rtl/pkg/soc_pkg.sv must exist");
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(&mut i, &format!("(insert {:?})", src));
+    run(&mut i, "(goto-char (point-min))");
+
+    let mut mismatches: Vec<(usize, usize, String, String)> = Vec::new();
+    for (idx, line) in src.lines().enumerate() {
+        let lineno = idx + 1;
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && line != "package soc_pkg;" {
+            let expected = line.len() - trimmed.len();
+            run(&mut i, "(beginning-of-line)");
+            let actual_s = run(&mut i, "(verilog-indent-line)");
+            let actual: usize = actual_s.parse().unwrap_or_else(|_| {
+                panic!(
+                    "line {}: (verilog-indent-line) returned non-numeric {:?} for {:?}",
+                    lineno, actual_s, line
+                )
+            });
+            if actual != expected {
+                mismatches.push((lineno, expected, actual_s.clone(), line.to_string()));
+            }
+        }
+        run(&mut i, "(forward-line 1)");
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "soc_pkg.sv lines that don't reindent to their own on-disk column \
+         (line, expected, actual, text): {:#?}\n\
+         NOTE: this test hardcodes the string \"package soc_pkg;\" to skip the \
+         one known, separately-pinned header-line quirk (see \
+         verilog_soc_pkg_sv_package_header_line_computes_one_level_deep_against_\
+         its_own_on_disk_column, above). If the mismatch above is on the package \
+         header line and the file's package was renamed, this comparison and \
+         that string constant are both stale, not a real regression -- update \
+         both to the new package name.",
+        mismatches
+    );
+}
+
+/// F4 (reviewer follow-up): `struct_union_member' is the SAME production
+/// used for `union' fields, not just `struct' fields -- so a packed
+/// union's field lines must indent identically to a packed struct's.
+#[test]
+fn verilog_package_union_field_line_indents_to_four_at_two_column_width() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package p;\ntypedef union packed {\nlogic [31:0] w;\nlogic [3:0][7:0] b;\n} u_t;\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic [31:0] w;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "union field line is package-depth (1) plus its own struct_union_member \
+         (1) = 2 levels at this file's 2-column width, same production as struct"
+    );
+}
+
+/// F4 (reviewer follow-up): a struct nested inside another struct. The
+/// outer field (an anonymous struct type named `inner') is itself a
+/// `struct_union_member' whose SPAN covers the whole nested block, so an
+/// inner field's own `struct_union_member' stacks on top of it. Computed
+/// by hand before writing the assertion (see the F4 spec): three ancestor
+/// nodes match the block-type list on the way up from an inner field
+/// (package_declaration, the outer struct_union_member for the `inner'
+/// field, and the inner struct_union_member for `a'/`b' itself), so 3
+/// levels, column 6 at this file's 2-column width; the outer struct's own
+/// sibling field `c' (not inside the nested block) stays at 2 levels,
+/// column 4, same as any ordinary flat struct field.
+#[test]
+fn verilog_nested_struct_inner_field_stacks_two_extra_levels() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "package p;\ntypedef struct packed {\nstruct packed {\nlogic a;\nlogic b;\n} inner;\nlogic c;\n} outer_t;\nendpackage\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic a;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "inner struct field line: package_declaration (1) + outer struct_union_member \
+         for the `inner' field (1) + inner struct_union_member for `a' (1) = 3 levels"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic c;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "outer struct's own sibling field `c' (not inside the nested block) stays at \
+         2 levels (package_declaration + its own struct_union_member), same as any \
+         ordinary flat struct field"
+    );
+}
+
+/// F4 (reviewer follow-up): the same depth arithmetic holds under a
+/// different outer wrapper -- a `typedef struct' inside a `module', not a
+/// `package'. module_declaration (1) + struct_union_member (1) = 2
+/// levels = column 4, same shape as the package case.
+#[test]
+fn verilog_module_level_typedef_struct_field_line_indents_to_four_at_two_column_width() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module m;\ntypedef struct packed {\nlogic a;\nlogic b;\n} req_t;\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"logic a;\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "module-level typedef struct field line is module-depth (1) plus its own \
+         struct_union_member (1) = 2 levels at this file's 2-column width"
+    );
+}

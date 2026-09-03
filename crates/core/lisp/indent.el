@@ -1,5 +1,13 @@
 ;;; indent.el --- M36: language-aware auto-indentation -*- lexical-binding: t -*-
 ;;; M38 extends the tree-sitter block-depth engine to Verilog.
+;;; M100 adds enum-member/struct-field lines to the verilog block-node-type
+;;; list (see `indent--block-node-types''s own comment, and the M100 note
+;;; near the M97 discussion below, for the fix and for the node shapes it
+;;; relies on). Known gap still open after M100: the documented one-level-
+;;; too-deep quirk on `module'/`interface'/`package'/`class' HEADER lines
+;;; (e.g. `package soc_pkg;' computes column 2 against an on-disk column 0)
+;;; is unchanged -- it is a different, already-pinned tradeoff, not part of
+;;; this milestone's scope.
 
 ;; Before this file, TAB only ever inserted a literal tab character (no
 ;; buffer had an indentation engine at all) -- the single biggest gap in
@@ -256,18 +264,21 @@
 ;; share_the_documented_one_level_indent_quirk' in indent_tests.rs,
 ;; alongside the module case rather than as a parallel, separate note.
 ;;
-;; NOT fixed, recorded rather than chased (M97 recon, real-file check
-;; against `demo/rtl/pkg/soc_pkg.sv'): 16 of that file's 54 lines -- the
-;; bodies of its `typedef enum logic [...] {...} alu_op_e;' and `typedef
-;; struct packed {...} req_t;' forms -- do not reindent to their on-disk
-;; columns either, TAB or otherwise, because a SystemVerilog enum's
-;; member list and a packed struct's field list have never been in
-;; `indent--block-node-types', neither before nor after this milestone's
-;; addition of `interface_declaration'/`package_declaration'/
-;; `class_declaration'. Pre-existing, out of M97's scope (which was
+;; FIXED at M100 (was recorded, not chased, at M97): the same real-file
+;; check against `demo/rtl/pkg/soc_pkg.sv' had found 16 of that file's 54
+;; lines -- the bodies of its `typedef enum logic [...] {...} alu_op_e;'
+;; and `typedef struct packed {...} req_t;' forms -- reindenting to 2
+;; columns instead of their on-disk 4, because a SystemVerilog enum's
+;; member list and a packed struct's field list were not in
+;; `indent--block-node-types' at M97 (that milestone's scope was
 ;; interface/package/class as BLOCK CONTAINERS, not every node kind that
-;; happens to nest inside one) -- recorded here so it is not mistaken for
-;; new debt this milestone introduced.
+;; happens to nest inside one). M100 closes this by adding
+;; `enum_name_declaration'/`struct_union_member' to the verilog list --
+;; see that variable's own comment, immediately above, for the node
+;; shapes and for why the tempting alternative (`data_type' itself) is
+;; wrong. Pinned by the whole-file comparison test in indent_tests.rs
+;; that walks every non-blank line of `demo/rtl/pkg/soc_pkg.sv' against
+;; its on-disk column.
 ;;
 ;; A wrapped multi-line ANSI port or parameter list (`module foo #(\n
 ;; parameter W = 8\n) (\n input logic clk,\n ...\n);') needs NO extra
@@ -786,7 +797,41 @@ failing loudly right here. `simple.el''s `goto-line' has this same gap
     (verilog . ("module_declaration" "interface_declaration" "package_declaration"
                 "class_declaration" "seq_block" "function_body_declaration"
                 "task_body_declaration" "case_item" "loop_generate_construct"
-                "if_generate_construct" "generate_block")))
+                "if_generate_construct" "generate_block"
+                ;; M100: an enum's member list and a packed struct's field
+                ;; list have no dedicated "body" wrapper node in this
+                ;; grammar -- `enum_name_declaration'/`struct_union_member'
+                ;; sit directly under `data_type' (dump-verified: `typedef
+                ;; enum logic [3:0] { OP_A, OP_B } alu_op_e;' parses as
+                ;; `(data_declaration (type_declaration (data_type
+                ;; (enum_base_type ...) (enum_name_declaration ...)
+                ;; (enum_name_declaration ...)) type_name: ...)))'). Adding
+                ;; each ITEM's own node type (not `data_type' itself) works
+                ;; the same way `case_item' already does above: the shared
+                ;; property is that the item's own node IS the body -- no
+                ;; separate wrapper node exists to add instead, so counting
+                ;; the item node itself "inclusive of the starting node"
+                ;; (see `indent--block-depth') is how it gets its +1 at
+                ;; all. Like `case_item', this is NOT limited to one line:
+                ;; a member/field that wraps (`AluAdd = 4'h0 +\n
+                ;; SOME_OFFSET,' as one `enum_name_declaration', or a
+                ;; folded struct field declaration) has its node's span
+                ;; cover every one of those lines, and `indent--block-
+                ;; depth' walks up from wherever point sits, so each
+                ;; wrapped continuation line gets the same +1 too -- that
+                ;; is the point of reusing a self-referential node instead
+                ;; of a fixed per-line rule.
+                ;;
+                ;; DO NOT add "data_type" itself here -- it is tempting
+                ;; because it is the actual parent, but it is also the
+                ;; parent of every ORDINARY declaration's leading token
+                ;; (dump-verified: `logic [3:0] foo;' parses as
+                ;; `(data_declaration (data_type_or_implicit (data_type
+                ;; (integer_vector_type) (packed_dimension ...))) ...)').
+                ;; Adding `data_type' would make every port and signal
+                ;; declaration in the file indent one level too deep, not
+                ;; just enum/struct members.
+                "enum_name_declaration" "struct_union_member")))
   "Alist of (LANG-SYMBOL . BLOCK-NODE-TYPE-STRINGS) -- see the comment
 immediately above for how each language's list was determined.")
 
