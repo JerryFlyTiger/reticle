@@ -51,7 +51,27 @@ that breaks naive tooling. Open `rtl/top/soc_top.sv` and:
 | `C-c C-k` | deletes the expansion again | no |
 
 `u_alu` is shown already expanded so the file reads as finished RTL;
-`u_arbiter` is left unexpanded so there is something to try.
+`u_arbiter` is left unexpanded so there is something to try. The
+`AUTO_TEMPLATE` block above `u_arbiter` is required, not decorative —
+the arbiter's own port names don't match this module's signal names,
+and AUTOINST without a template still wires up same-named nets, which
+here means wiring to names that don't exist in this module. Try
+deleting the template and re-expanding: the result doesn't compile —
+the language server reports undeclared identifiers where the connected
+signals should be, plus a batch of implicit nets papering over them.
+
+This is checkable by eye through the mode-line, not just by reading the
+comment: open `rtl/top/soc_top.sv` and the language server reports 17
+warnings, 0 errors, 14 of them from `u_arbiter`'s still-unexpanded
+ports. Run `M-x verilog-auto` (or `C-c C-a`) and the server's count
+drops to 3 — all three honest (an intentional empty connection and two
+signals that are assigned but never read), none suppressed. What the
+mode-line itself shows is a different, smaller pair of numbers: its
+`!N` counts *lines that carry a diagnostic*, not diagnostics, and one
+line can carry several (u_arbiter's own instantiation line accounts
+for 9 of the 17 by itself). So the 17 land on 9 lines and the 3 land
+on 3 lines — the mode-line reads `!9`, then `!3` after the expansion.
+Both number pairs are correct; they're just counting different things.
 
 `rtl/verible.filelist` is the file list `verible-verilog-ls` reads to
 learn what the design consists of. Reticle reads the same file for

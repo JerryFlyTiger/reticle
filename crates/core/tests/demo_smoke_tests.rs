@@ -359,6 +359,33 @@ fn regfile_instantiation_offers_all_nine_port_names() {
 // 5. C-c C-a / C-c C-k on u_arbiter's /*AUTOINST*/
 // ============================================================
 
+/// Slices out just the u_arbiter *instantiation* -- from `u_arbiter (`
+/// to the first `);` that follows it -- and nothing else.
+///
+/// This is required, not cosmetic: `soc_top.sv` carries an
+/// `AUTO_TEMPLATE` comment directly above `u_arbiter` (added so
+/// AUTOINST connects arbiter's oddly-named ports to this module's own
+/// signal names instead of leaving them unconnected). That comment's
+/// text deliberately contains the same port-name substrings the
+/// expansion produces (`.req_ready_o(host_req_ready_o),` and friends).
+/// If the assertions below searched the *whole buffer* instead of just
+/// this instantiation, every one of them would pass even if AUTOINST
+/// expanded nothing at all -- the template comment alone would satisfy
+/// them. Slicing to the instantiation keeps the template out of the
+/// region under test, so these assertions can actually fail.
+fn arbiter_instance_segment(buffer: &str) -> &str {
+    let start_marker = "u_arbiter (";
+    let start = buffer
+        .find(start_marker)
+        .expect("u_arbiter instantiation must be present in soc_top.sv")
+        + start_marker.len();
+    let rest = &buffer[start..];
+    let end = rest
+        .find(");")
+        .expect("u_arbiter instantiation must be closed with ');'");
+    &rest[..end]
+}
+
 #[test]
 fn arbiter_autoinst_expands_then_deletes() {
     let (mut i, _ed) = setup();
@@ -380,6 +407,7 @@ fn arbiter_autoinst_expands_then_deletes() {
     );
 
     let expanded = ok(&mut i, "(buffer-string)");
+    let expanded_instance = arbiter_instance_segment(&expanded);
     for port in [
         ".req_ready_o",
         ".gnt_valid_o",
@@ -392,24 +420,25 @@ fn arbiter_autoinst_expands_then_deletes() {
         ".gnt_ready_i",
     ] {
         assert!(
-            expanded.contains(port),
-            "expanded u_arbiter must connect {}: buffer does not contain it",
+            expanded_instance.contains(port),
+            "expanded u_arbiter instantiation must connect {}: instance text does not contain it",
             port
         );
     }
     assert!(
-        expanded.contains("// Outputs"),
+        expanded_instance.contains("// Outputs"),
         "expanded AUTOINST must have an // Outputs header"
     );
     assert!(
-        expanded.contains("// Inputs"),
+        expanded_instance.contains("// Inputs"),
         "expanded AUTOINST must have an // Inputs header"
     );
 
     ok(&mut i, "(verilog-delete-auto)");
     let deleted = ok(&mut i, "(buffer-string)");
+    let deleted_instance = arbiter_instance_segment(&deleted);
     assert!(
-        !deleted.contains(".req_ready_o"),
+        !deleted_instance.contains(".req_ready_o"),
         "verilog-delete-auto must remove the expanded connections"
     );
     assert!(

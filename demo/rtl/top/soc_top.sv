@@ -11,10 +11,27 @@
 //     completion list is regfile's own port names, read out of
 //     core/regfile.sv.
 //   * `M-x verilog-auto' expands the /*AUTOINST*/ in u_arbiter into a
-//     full port list, the way GNU verilog-mode's AUTO macros do.
+//     full port list, the way GNU verilog-mode's AUTO macros do. The
+//     AUTO_TEMPLATE above u_arbiter is not decoration -- arbiter's own
+//     port names (req_valid_i, gnt_req_o, ...) don't match the signal
+//     names in this module, and AUTOINST without a template still
+//     wires each port to a same-named signal, and none exist here, so
+//     the expansion doesn't compile: undeclared identifiers, plus a
+//     batch of implicitly created nets papering over them. The
+//     template is what makes the expansion compile at all.
 //
 // u_alu below is shown ALREADY expanded so the file reads as finished
-// RTL; u_arbiter is left unexpanded so there is something to try.
+// RTL; u_arbiter is left unexpanded so there is something to try. Open
+// this file and the language server reports 17 warnings, 0 errors --
+// 14 of those come from u_arbiter's unexpanded ports (and the gnt_req /
+// gnt_valid / gnt_idx signals they leave never driven). Those 17 land
+// on 9 distinct lines (u_arbiter's instantiation alone accounts for 9
+// of the 17), and the mode-line's `!N' counts LINES with a diagnostic,
+// not diagnostics themselves, so what you actually see there is `!9'.
+// Run `M-x verilog-auto' and the server drops to 3 diagnostics on 3
+// lines, so the mode-line reads `!3' -- all three honest: `.gnt_o ()`
+// is an intentional empty connection, and alu_zero / gnt_idx are
+// assigned but never read. Nothing is being suppressed.
 
 `include "soc_defs.svh"
 
@@ -85,6 +102,15 @@ module soc_top
   );
 
   // --- bus arbiter ---------------------------------------------------
+  /* axi4_lite_arbiter AUTO_TEMPLATE (
+      .req_valid_i(host_req_valid_i),
+      .req_ready_o(host_req_ready_o),
+      .req_i      (host_req_i),
+      .gnt_valid_o(gnt_valid),
+      .gnt_ready_i(1'b1),
+      .gnt_req_o  (gnt_req),
+      .gnt_idx_o  (gnt_idx),
+      ); */
   // Left unexpanded on purpose: run `M-x verilog-auto' here.
   axi4_lite_arbiter #(
       .NumMasters(NumMasters)
