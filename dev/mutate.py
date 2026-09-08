@@ -130,10 +130,31 @@ The config file is a Python file defining `MUTATIONS` (list of dict), fields:
     expect expected result, default "FAIL"; "hang" means the observable
            consequence of this guard is a hang
     timeout cap in seconds for this item, overrides --timeout
+    needs_rebuild default True; set False for a file the test reads at RUN
+           time rather than one compiled into the binary (`demo/*.sv', a
+           `verible.filelist', a shell script). For those, "cargo rebuilt
+           nothing" is the normal case, not the danger case, and the NOBUILD
+           guard below would report an untrustworthy verdict for an item
+           whose mutation demonstrably did reach the test. Added on M122,
+           whose list is the first to mutate demo material; before it, such
+           an entry's verdict depended on whether the PREVIOUS item happened
+           to restore a compiled source and so force a rebuild — which is
+           luck, not evidence, in both directions.
 
-Optional `PACKAGE` / `TEST_TARGET` string variables act as defaults; command
-line arguments take precedence. The config file is executed (`exec`), so only
-put your own files there.
+Optional `PACKAGE` / `TEST_TARGET` string variables act as defaults, and an
+individual entry may override either with its own `"package"` /
+`"test_target"` key when one fix's guard lives in a different test binary
+from the rest of the list. Before that override existed, such a key was
+silently ignored and the entry ran against the wrong binary — `tests_actually_ran`
+caught it as an invocation error rather than a fake verdict, but only because
+the test name happened not to exist there. Precedence runs entry key >
+command line > config default: an entry that names its own target is
+describing where its guard actually lives, so `--test-target` cannot
+override it (that is what lets one invocation run a list whose entries
+span two binaries). Note the fallback is on the key being *absent* --
+writing `"package": None` explicitly means "no -p", not "use the
+default". The config file is executed (`exec`), so only put your own
+files there.
 """
 
 import argparse
@@ -281,23 +302,34 @@ def main():
         if not mutations:
             sys.exit("--only did not match any items")
 
+    # One baseline per distinct (package, target) the list actually uses.
+    # A single baseline over the default pair would leave any entry that
+    # overrides them unbaselined, which is the same "every conclusion is
+    # fake" hole lesson 2 is about, just narrower.
+    pairs = []
+    for m in mutations:
+        pair = (m.get("package", package), m.get("test_target", target))
+        if pair not in pairs:
+            pairs.append(pair)
+
     if not args.skip_baseline:
-        print("=== baseline (unmodified state) ===")
-        code, out = cargo_test(package, target, timeout=args.timeout)
-        print(tail_of_interest(out, 3))
-        if code == TIMEOUT:
-            sys.exit(f"\n!! baseline did not finish within {args.timeout}s. "
-                     "Confirm the tests themselves are healthy before running mutations.")
-        if code != 0:
-            sys.exit("\n!! baseline is not green. Fix it before running mutations — "
-                     "otherwise every item will \"FAIL as expected\" and every conclusion "
-                     "is fake (see header lesson 2).")
-        if not tests_actually_ran(out):
-            sys.exit(f"\n!! not a single test ran this round for the baseline (package={package!r}, "
-                     f"target={target!r}). This workspace's root directory is itself a "
-                     "package, so leaving `-p` blank only runs it — when a list spans "
-                     "multiple crates, run it in separate passes each with its own -p "
-                     "(see header lesson 6).")
+        for bpkg, btgt in pairs:
+            print(f"=== baseline (unmodified state) — package={bpkg!r} target={btgt!r} ===")
+            code, out = cargo_test(bpkg, btgt, timeout=args.timeout)
+            print(tail_of_interest(out, 3))
+            if code == TIMEOUT:
+                sys.exit(f"\n!! baseline did not finish within {args.timeout}s. "
+                         "Confirm the tests themselves are healthy before running mutations.")
+            if code != 0:
+                sys.exit("\n!! baseline is not green. Fix it before running mutations — "
+                         "otherwise every item will \"FAIL as expected\" and every conclusion "
+                         "is fake (see header lesson 2).")
+            if not tests_actually_ran(out):
+                sys.exit(f"\n!! not a single test ran this round for the baseline (package={bpkg!r}, "
+                         f"target={btgt!r}). This workspace's root directory is itself a "
+                         "package, so leaving `-p` blank only runs it — when a list spans "
+                         "multiple crates, run it in separate passes each with its own -p "
+                         "(see header lesson 6).")
 
     backup_dir = tempfile.mkdtemp(prefix="mutate-backup-")
     results = []
@@ -318,7 +350,9 @@ def main():
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(src.replace(m["old"], m["new"]))
                 t0 = time.monotonic()
-                code, out = cargo_test(package, target, m.get("test"),
+                code, out = cargo_test(m.get("package", package),
+                                       m.get("test_target", target),
+                                       m.get("test"),
                                        timeout=m.get("timeout", args.timeout))
                 elapsed = time.monotonic() - t0
                 built = rebuilt_crates(out)
@@ -326,12 +360,17 @@ def main():
                     verdict = "HANG"
                 elif code != 0:
                     verdict = "FAIL"
-                elif not built:
+                elif not built and m.get("needs_rebuild", True):
                     # No rebuild = this mutation never made it into the binary
                     # under test, so **no** verdict is trustworthy (including
                     # "FAILed as expected" — that could be failing for an
                     # unrelated reason). So this check comes first, not only
                     # checked for SURVIVED. See header lesson 7.
+                    #
+                    # `needs_rebuild: False' opts an item out, and only that:
+                    # a file the test opens at run time (demo material, a
+                    # filelist, a shell script) reaches the test whether or
+                    # not cargo did anything.
                     verdict = "NOBUILD"
                 elif not tests_actually_ran(out):
                     # The invocation is wrong (usually -p / --test-target

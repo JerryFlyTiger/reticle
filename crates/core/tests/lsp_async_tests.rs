@@ -289,3 +289,129 @@ fn symbol_alist_disambiguates_repeated_names_and_each_resolves_to_its_own_positi
     assert_eq!(run(&mut i, "(cdr (assoc \"foo (2)\" alist))"), "20");
     assert_eq!(run(&mut i, "(cdr (assoc \"bar\" alist))"), "30");
 }
+
+/// M123 Part A: a message carrying BOTH `id` and `method` is a
+/// server-initiated REQUEST (slang-server's real
+/// `client/registerCapability`, id 0, per the spec's own measurement),
+/// and must be answered inline with `{"result": null}` rather than
+/// stashed into `lsp--client-pending` (the old defect: it would have
+/// sat there forever, since only `lsp--await` ever removes an entry,
+/// and only for an id THIS client itself allocated). `lsp-send` is
+/// shadowed to capture what would have gone over the wire, same
+/// convention as `message` above -- CLIENT's `conn` is nil here so the
+/// real builtin would error trying to write to it.
+#[test]
+fn server_request_with_registered_method_is_answered_null_and_never_stashed() {
+    let mut i = setup();
+    run(
+        &mut i,
+        "(setq lsp--test-sent nil)
+         (defun lsp-send (conn msg) (push msg lsp--test-sent) t)",
+    );
+    run(&mut i, "(setq client (make-lsp--client :conn nil))");
+    run(
+        &mut i,
+        "(lsp--dispatch client (json-parse-string
+           \"{\\\"id\\\":0,\\\"method\\\":\\\"client/registerCapability\\\",\\\"params\\\":{}}\"))",
+    );
+    // Never stashed: the whole point of distinguishing REQUEST from
+    // RESPONSE is that a request never reaches `lsp--client-pending`.
+    assert_eq!(run(&mut i, "(lsp--client-pending client)"), "nil");
+    assert_eq!(run(&mut i, "(length lsp--test-sent)"), "1");
+    assert_eq!(
+        run(&mut i, "(gethash \"jsonrpc\" (car lsp--test-sent))"),
+        "\"2.0\""
+    );
+    assert_eq!(run(&mut i, "(gethash \"id\" (car lsp--test-sent))"), "0");
+    assert_eq!(
+        run(&mut i, "(gethash \"result\" (car lsp--test-sent))"),
+        ":null"
+    );
+    assert_eq!(
+        run(&mut i, "(gethash \"method\" (car lsp--test-sent) 'absent)"),
+        "absent"
+    );
+}
+
+/// M123 Part A: a server-initiated request whose method this client
+/// does not recognize gets a JSON-RPC `MethodNotFound` (-32601) error
+/// response, per spec, rather than either silence or a bare `nil`
+/// result that would misrepresent success.
+#[test]
+fn server_request_with_unknown_method_gets_method_not_found_error() {
+    let mut i = setup();
+    run(
+        &mut i,
+        "(setq lsp--test-sent nil)
+         (defun lsp-send (conn msg) (push msg lsp--test-sent) t)",
+    );
+    run(&mut i, "(setq client (make-lsp--client :conn nil))");
+    run(
+        &mut i,
+        "(lsp--dispatch client (json-parse-string
+           \"{\\\"id\\\":5,\\\"method\\\":\\\"workspace/nonexistentThing\\\",\\\"params\\\":{}}\"))",
+    );
+    assert_eq!(run(&mut i, "(lsp--client-pending client)"), "nil");
+    assert_eq!(run(&mut i, "(length lsp--test-sent)"), "1");
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"code\" (gethash \"error\" (car lsp--test-sent)))"
+        ),
+        "-32601"
+    );
+    assert_eq!(run(&mut i, "(gethash \"id\" (car lsp--test-sent))"), "5");
+}
+
+/// M123 Part A: an ordinary notification (`method`, no `id`, not
+/// `publishDiagnostics`) is UNCHANGED by this milestone -- still
+/// silently dropped, no send, no pending entry, no error. This pins
+/// the "deliberately not fixed" half of the file header's own claim.
+#[test]
+fn plain_notification_without_id_is_still_silently_dropped() {
+    let mut i = setup();
+    run(
+        &mut i,
+        "(setq lsp--test-sent nil)
+         (defun lsp-send (conn msg) (push msg lsp--test-sent) t)",
+    );
+    run(&mut i, "(setq client (make-lsp--client :conn nil))");
+    let r = run(
+        &mut i,
+        "(lsp--dispatch client (json-parse-string
+           \"{\\\"method\\\":\\\"$/progress\\\",\\\"params\\\":{}}\"))",
+    );
+    assert!(!r.starts_with("ERROR"), "dispatch errored: {}", r);
+    assert_eq!(run(&mut i, "lsp--test-sent"), "nil");
+    assert_eq!(run(&mut i, "(lsp--client-pending client)"), "nil");
+}
+
+/// M123 Part A: `lsp--client-pending` is bounded at
+/// `lsp--client-pending-limit` -- past the cap the OLDEST entry (the
+/// last id ever dispatched, since new entries are consed onto the
+/// front) is dropped rather than retained forever. Fires
+/// `lsp--client-pending-limit` + 5 distinct unclaimed responses through
+/// dispatch and checks the length never exceeds the cap, and that the
+/// very first id sent (the oldest) is the one that fell off.
+#[test]
+fn pending_list_is_capped_and_drops_the_oldest_entry() {
+    let mut i = setup();
+    run(&mut i, "(setq client (make-lsp--client :conn nil))");
+    let total = 205; // lsp--client-pending-limit (200) + 5
+    for id in 0..total {
+        run(
+            &mut i,
+            &format!(
+                "(lsp--dispatch client (json-parse-string \"{{\\\"id\\\":{id},\\\"result\\\":1}}\"))"
+            ),
+        );
+    }
+    assert_eq!(run(&mut i, "(length (lsp--client-pending client))"), "200");
+    // id 0 (the very first, oldest) must have been dropped.
+    assert_eq!(run(&mut i, "(assq 0 (lsp--client-pending client))"), "nil");
+    // The most recent id (204) must still be present.
+    assert_eq!(
+        run(&mut i, "(if (assq 204 (lsp--client-pending client)) t nil)"),
+        "t"
+    );
+}

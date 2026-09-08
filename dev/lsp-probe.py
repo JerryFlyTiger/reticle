@@ -240,6 +240,7 @@ class LspProbe:
         self.pout = self.proc.stdout
         self.root = root
         self.next_id = 1
+        self.server_requests = []
 
     def send(self, obj):
         body = json.dumps(obj).encode()
@@ -322,6 +323,14 @@ class LspProbe:
                 return None  # EOF: the server died, this is not a timeout
             if "id" in msg and "method" in msg:
                 # server -> client request: must reply, or it may just stop there
+                #
+                # M123: print it. Whether a given server EVER initiates a
+                # request decides whether an unbounded-retention bug in the
+                # client's pending table is a live defect or a latent one,
+                # and this probe was auto-replying so quietly that the
+                # question could not be answered from its output at all.
+                self.server_requests.append((msg["id"], msg["method"]))
+                print(f"  <- server request id={msg['id']} method={msg['method']}")
                 self.send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
                 continue
             if want_id is not None and msg.get("id") == want_id:
@@ -550,7 +559,7 @@ def sweep(probe, uri, caps, args, doc_lines=0):
     print(" yet never responds to formatting at all). TIMEOUT and error are **different** answers.")
 
 
-def probe_completion(probe, uri, line, char, wait, trigger):
+def probe_completion(probe, uri, line, char, wait, trigger, resolve_all=False):
     """Dedicated completion flow: wait for indexing -> send the request
     (retrying if needed) -> tally the field distribution -> send
     `completionItem/resolve` on the first item, printing the diff between
@@ -608,6 +617,27 @@ def probe_completion(probe, uri, line, char, wait, trigger):
         print(f"  has {field:<20}: {sum(1 for it in items if it.get(field))}/{n}")
     print("\n--- first 3 items (before resolve) ---")
     print(json.dumps(items[:3], indent=2, ensure_ascii=False))
+
+    if resolve_all:
+        # M123: `slang-server' sends NO `insertTextFormat' in the completion
+        # list itself -- the field only appears after `completionItem/resolve'.
+        # So a tally taken on the list above answers a different question than
+        # "what would a user actually get on accepting this item", and the
+        # snippet items are invisible to it. Resolving every item is the only
+        # way to see them.
+        after_fmt, snippets = {}, []
+        for it in items:
+            r = probe.request_pumped("completionItem/resolve", it, 20)
+            got = (r or {}).get("result") or {}
+            key = got.get("insertTextFormat")
+            after_fmt[key] = after_fmt.get(key, 0) + 1
+            if key == 2:
+                snippets.append((got.get("label"), got.get("insertText")))
+        print(f"\n=== after resolving all {n} items ===")
+        print(f"insertTextFormat distribution (2=Snippet, 1/None=PlainText): {after_fmt}")
+        print(f"snippet items: {len(snippets)}/{n}")
+        for label, text in snippets:
+            print(f"  {label!r} -> insertText {text!r}")
 
     target = next((it for it in items if not it.get("documentation")), items[0])
     resolved = probe.request_pumped("completionItem/resolve", target, 20)
@@ -775,6 +805,22 @@ def main():
     )
     ap.add_argument("--trigger-char", help="completion's triggerCharacter, e.g. . or :")
     ap.add_argument(
+        "--bare-caps",
+        action="store_true",
+        help="with --completion: declare NO completion capabilities, i.e. exactly what "
+        "reticle sends today (an empty capabilities object). Use it to answer 'would "
+        "this client see the snippets at all', which is a different question from "
+        "'does the server have them'.",
+    )
+    ap.add_argument(
+        "--resolve-all",
+        action="store_true",
+        help="with --completion: send completionItem/resolve for EVERY item and tally "
+        "insertTextFormat afterwards. Needed because a server may send the field only "
+        "on resolve, which makes the pre-resolve tally silently answer a different "
+        "question (measured on slang-server 0.2.9, M123).",
+    )
+    ap.add_argument(
         "--call-hierarchy",
         action="store_true",
         help="dedicated callHierarchy flow: prepareCallHierarchy to get an item, then send "
@@ -833,7 +879,7 @@ def main():
             },
             "rename": {"prepareSupport": True},
         }
-        if args.completion:
+        if args.completion and not args.bare_caps:
             text_document_caps["completion"] = {
                 "contextSupport": True,
                 "completionItem": {
@@ -935,7 +981,8 @@ def main():
             print("(client has declared snippetSupport / resolveSupport -- this is "
                   "\"the most it can possibly give\",")
             print(" not what reticle currently receives while declaring empty capabilities)")
-            probe_completion(probe, uri, args.line, args.char, args.wait, args.trigger_char)
+            probe_completion(probe, uri, args.line, args.char, args.wait, args.trigger_char,
+                             resolve_all=args.resolve_all)
             return
 
         if not args.method:

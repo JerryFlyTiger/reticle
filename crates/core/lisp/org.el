@@ -7,16 +7,11 @@
 
 (defvar org-mode-hook nil)
 
-(defun org--set-faces ()
-  (set-face 'org-level-1 :foreground "#61afef" :weight 'bold)
-  (set-face 'org-level-2 :foreground "#c678dd" :weight 'bold)
-  (set-face 'org-level-3 :foreground "#98c379")
-  (set-face 'org-level-4 :foreground "#e5c07b")
-  (set-face 'org-todo :foreground "#e06c75" :weight 'bold)
-  (set-face 'org-done :foreground "#98c379")
-  (set-face 'org-table :foreground "#56b6c2")
-  (set-face 'org-date :foreground "#d19a66")
-  (set-face 'org-link :foreground "#61afef" :underline t))
+;; M112: org's nine faces used to be set here, hard-coded to one dark
+;; palette regardless of the active theme, by a now-deleted
+;; `org--set-faces' that `org-mode' used to call below. They are now
+;; set per-theme in themes.el alongside every other face -- see that
+;; file's top-of-file comment.
 
 (defun org-mode ()
   "Major mode for editing org files."
@@ -32,7 +27,6 @@
     (define-key map "C-c ." 'org-time-stamp)
     (define-key map "C-c C-o" 'org-open-at-point)
     (use-local-map map))
-  (org--set-faces)
   (org--fontify-buffer)
   (setq-local post-command-hook (list 'org--post-command))
   (run-hooks 'org-mode-hook))

@@ -443,6 +443,22 @@ fn scenario_scroll(out: &mut String) {
 /// than the window under line 5 (truncated with `…`, never wrapped).
 /// `display-line-numbers` is on, so the gutter-dot/modeline-count path
 /// (unaffected by this milestone, D7) is visible in the same capture.
+/// Scenario 5 (M102): an asymmetric split, pinning the exact cell where
+/// the divider lands so a regression in `split_lengths`'s frac math (or
+/// its minimum-size clamp) shows up as a golden-file diff instead of
+/// silently drifting. `(split-window-below 4)` gives the top window
+/// exactly 4 rows out of the 20-row window area; `(enlarge-window-
+/// horizontally 10)` (M102) then pushes the LEFT/right divider of a
+/// nested side-by-side split by 10 columns.
+fn scenario_asymmetric_split(out: &mut String) {
+    let (mut i, ed) = setup(90, 20);
+    find_file(&mut i, "rtl/core/alu.sv");
+    run(&mut i, "(split-window-below 4)");
+    run(&mut i, "(split-window-right)");
+    run(&mut i, "(enlarge-window-horizontally 10)");
+    capture(&i, &ed, "asymmetric_split", out);
+}
+
 fn scenario_inline_diagnostics(out: &mut String) {
     let (mut i, ed) = setup(40, 16);
     run(
@@ -474,6 +490,7 @@ fn build_golden() -> String {
     scenario_gutter_off_and_on(&mut out);
     scenario_vertical_split(&mut out);
     scenario_horizontal_split(&mut out);
+    scenario_asymmetric_split(&mut out);
     scenario_tabs(&mut out);
     scenario_cjk(&mut out);
     scenario_control_chars(&mut out);

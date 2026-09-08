@@ -736,14 +736,27 @@ if it can't be found anywhere."
 ;; --- Port extraction: ANSI and non-ANSI headers --------------------------
 
 (defun verilog-auto--port-direction-of (node)
-  "'input/'output/'inout from the port_direction descendant of NODE, or
-'input as a best-effort fallback if NODE has none (an ANSI port that
-omits its own direction inherits the previous port's per the LRM; v1
-doesn't track that carry-over, so this documented fallback stands in
--- not exercised by any v1 test, every ANSI port here declares its own
-direction)."
-  (let ((pd (verilog-auto--find-first-of-type node "port_direction")))
-    (if pd (intern (treesit-node-text pd)) 'input)))
+  "'input/'output/'inout from the port_direction descendant of NODE;
+'interface (M124) if NODE has an `interface_port_header' descendant
+instead -- an interface-typed ANSI port
+(`interface_port_header interface_name: ... modport_name: ...',
+dump-verified against the real `demo/verif/axi4_lite_monitor.sv' shape)
+structurally never carries a `port_direction' node at all (of the three
+ANSI port-header kinds, `net_port_header'/`variable_port_header' both
+can, `interface_port_header' never can), so this is a positive
+detection, not the fallback below firing on an absence. Falls back to
+'input as a best-effort guess only for the remaining case, an ANSI port
+that omits its own direction and so inherits the previous port's per
+the LRM; v1 doesn't track that carry-over, so this documented fallback
+stands in for it -- not exercised by any v1 test, every ANSI port here
+declares its own direction. Left UNCHANGED from before M124: this
+fallback is a different, still-open gap, not something this milestone
+touches."
+  (cond
+   ((verilog-auto--find-first-of-type node "interface_port_header") 'interface)
+   ((verilog-auto--find-first-of-type node "port_direction")
+    (intern (treesit-node-text (verilog-auto--find-first-of-type node "port_direction"))))
+   (t 'input)))
 
 (defun verilog-auto--range-text-of (node)
   (let ((pdim (verilog-auto--find-first-of-type node "packed_dimension")))
@@ -853,18 +866,37 @@ OVERRIDES' own order at all."
           (setq pos me)))
       (concat out (substring text pos)))))
 
-;; --- Shared Outputs/Inouts/Inputs grouping and line formatting -----------
+;; --- Shared Interfaces/Outputs/Inouts/Inputs grouping and line formatting -
 
 (defun verilog-auto--group-by-direction (ports)
-  "PORTS (a list of (NAME DIRECTION RANGE) triples) split into three
-lists (OUTPUTS INOUTS INPUTS), each preserving PORTS' own relative
-order -- the grouping both AUTOINST and AUTOARG use."
-  (let (outputs inouts inputs)
+  "PORTS (a list of (NAME DIRECTION RANGE) triples) split into four
+lists (INTERFACES OUTPUTS INOUTS INPUTS), each preserving PORTS' own
+relative order -- the grouping both AUTOINST and AUTOARG use.
+
+M124: added the INTERFACES bucket (`verilog-auto--port-direction-of'
+now returns 'interface for an interface-typed ANSI port). AUTOARG's own
+port source, `verilog-auto--nonansi-port-info', only ever classifies
+input_declaration/output_declaration/inout_declaration body items (an
+interface can't be one of those), so this bucket is unconditionally
+empty for AUTOARG and `verilog-auto--grouped-lines' below contributes no
+header or lines for an empty group -- AUTOARG's own three-category
+output is therefore unchanged by this addition, pinned by
+`autoarg_output_unchanged_by_the_interfaces_bucket' in
+verilog_auto_tests.rs. Reference: real GNU Emacs 30.2's own
+`verilog-mode.el' AUTOARG (`verilog-auto-arg', :12124-12143) has NO
+interfaces category at all -- only AUTOINST's `verilog-auto-inst'
+(:12852-12862) does, from a dedicated `verilog-decls-get-interfaces'
+call GNU never threads through AUTOARG. Sharing this one grouping
+function (rather than forking AUTOARG a second, near-identical copy) is
+therefore only safe because the bucket is structurally always empty on
+that path, not because AUTOARG is meant to grow a fourth category."
+  (let (interfaces outputs inouts inputs)
     (dolist (p ports)
-      (cond ((eq (nth 1 p) 'output) (push p outputs))
+      (cond ((eq (nth 1 p) 'interface) (push p interfaces))
+            ((eq (nth 1 p) 'output) (push p outputs))
             ((eq (nth 1 p) 'inout) (push p inouts))
             (t (push p inputs))))
-    (list (nreverse outputs) (nreverse inouts) (nreverse inputs))))
+    (list (nreverse interfaces) (nreverse outputs) (nreverse inouts) (nreverse inputs))))
 
 (defun verilog-auto--pad-to-column (s col &optional offset)
   "S with trailing spaces so it reaches column COL, measuring S as
@@ -875,14 +907,20 @@ added."
   (concat s (make-string (max 1 (- col (+ (or offset 0) (length s)))) ?\s)))
 
 (defun verilog-auto--grouped-lines (groups indent format-fn)
-  "GROUPS is (OUTPUTS INOUTS INPUTS); FORMAT-FN maps one port triple to
-its own un-indented, uncomma'd text. Returns the finished list of lines
--- an INDENT + \"// Outputs\"/\"// Inouts\"/\"// Inputs\" header before
-each non-empty group (a group with zero members contributes no header
-and no lines at all), then INDENT + (FORMAT-FN PORT) + \",\" per
+  "GROUPS is (INTERFACES OUTPUTS INOUTS INPUTS) (M124: extended with the
+leading INTERFACES bucket -- see `verilog-auto--group-by-direction's own
+doc); FORMAT-FN maps one port triple to its own un-indented, uncomma'd
+text. Returns the finished list of lines -- an INDENT +
+\"// Interfaces\"/\"// Outputs\"/\"// Inouts\"/\"// Inputs\" header
+before each non-empty group (a group with zero members contributes no
+header and no lines at all), then INDENT + (FORMAT-FN PORT) + \",\" per
 member -- except the very last connection line overall, which gets no
 comma. Shared by AUTOINST and AUTOARG, whose grouping/comma/empty-group
-rules are identical.
+rules are identical; the INTERFACES header is unreachable from AUTOARG
+in practice (see `verilog-auto--group-by-direction's M124 note) but the
+label is listed here regardless so a future AUTOARG source that DID
+supply an interface-typed entry would still print a correctly-labelled
+group rather than silently mislabeling it as an input.
 
 Note on the comma strip below: this deliberately does NOT use GNU's
 own idiom `(setcar (last list) ...)' -- this interpreter's `last'
@@ -891,7 +929,7 @@ the original (unlike real Emacs), so `setcar' on its result wouldn't
 touch LINES at all. Stripping the first element of the STILL-REVERSED
 accumulator (which is exactly the last line in final order, since it
 was the most recently `push'ed) sidesteps that entirely."
-  (let ((labels '("// Outputs" "// Inouts" "// Inputs"))
+  (let ((labels '("// Interfaces" "// Outputs" "// Inouts" "// Inputs"))
         (gs groups)
         (lines nil))
     (while gs

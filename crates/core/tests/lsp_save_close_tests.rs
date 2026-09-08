@@ -16,6 +16,17 @@ use elisp::Interp;
 fn setup() -> (Interp, Rc<RefCell<Editor>>) {
     let mut interp = elisp::new_interp();
     let ed = core::init_editor(&mut interp);
+    // M104 fix round: these tests assert an EXACT sequence of LSP
+    // frames around `save-buffer'. M104's `format-on-save' defaults to
+    // `t', and the fake `cat' server here never returns real
+    // capabilities, which the asymmetric `lsp--capability-supported-p'
+    // policy then treats as "supported" -- so without this, saving
+    // would try to run `lsp-format-buffer', inserting an extra sync
+    // `didChange' plus a `textDocument/formatting' frame into every
+    // exact-sequence assertion below. This file tests didSave/didClose
+    // wiring, not formatting, so it opts out unconditionally.
+    let r = interp.eval_source("(setq format-on-save nil)");
+    assert!(r.is_ok(), "setq format-on-save nil failed");
     (interp, ed)
 }
 

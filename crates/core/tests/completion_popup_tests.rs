@@ -845,6 +845,7 @@ fn completion_popup_key_defends_the_minibuffer_even_if_a_popup_is_forced_open() 
             insert: "A".to_string(),
             start: 1,
             filter: "a".to_string(),
+            payload: None,
         }],
         prefix_start: 1,
         selected: 0,
@@ -1300,13 +1301,26 @@ fn electric_pair_auto_close_still_works_and_closes_the_popup_via_refilter() {
 //     over insertText.
 // ------------------------------------------------------------
 
+// M123 Part B renamed/extended this test: v1 inserted ALL snippet
+// syntax literally, no matter what `insertTextFormat` said. Now
+// `insertTextFormat` decides -- absent/1 stays literal (the ORIGINAL
+// assertion this test pinned, kept verbatim below), 2 expands via
+// `lsp--expand-snippet`. `client` here is still the `'fake-client'
+// plain-symbol convention (`setup_connected`), so `lsp--resolve-
+// provider-p' is nil and both cases go through the INLINE
+// (non-resolve) expand path in `lsp--completion-item-insert-payload' --
+// exactly the case a hypothetical server with `insertTextFormat: 2` in
+// its LIST reply but no `resolveProvider' would hit.
 #[test]
-fn snippet_syntax_in_new_text_is_inserted_literally() {
+fn literal_insertion_when_not_a_snippet_expansion_when_it_is() {
     let (mut i, ed, _dir) = setup_connected("");
     ok(&mut i, "(goto-char (point-max))");
     stub_capture(&mut i);
     feed(&mut i, &ed, "C-M-i");
 
+    // Not a snippet: `insertTextFormat' absent -- newText must still
+    // win over insertText, and it is inserted VERBATIM including its
+    // `${1:name}' syntax (the original pinned assertion, unchanged).
     ok(
         &mut i,
         r#"(funcall (nth 3 test--captured)
@@ -1317,7 +1331,37 @@ fn snippet_syntax_in_new_text_is_inserted_literally() {
     assert_eq!(
         bs(&mut i),
         "fn ${1:name}() {}",
-        "snippet syntax must be inserted as literal text (v1), and newText must win over insertText"
+        "insertTextFormat absent (not a snippet) must stay literal, and newText must win over insertText"
+    );
+}
+
+// Companion case for the rename above: `insertTextFormat: 2' (a
+// snippet) must be EXPANDED, not inserted literally -- `${1:name}'
+// becomes just `name' (its default text), and `$0' places point right
+// after `(' rather than at the end of the inserted text.
+#[test]
+fn insert_text_format_2_expands_the_snippet_and_places_point_at_the_dollar_zero() {
+    let (mut i, ed, _dir) = setup_connected("");
+    ok(&mut i, "(goto-char (point-max))");
+    stub_capture(&mut i);
+    feed(&mut i, &ed, "C-M-i");
+
+    ok(
+        &mut i,
+        r#"(funcall (nth 3 test--captured)
+               (json-parse-string "[{\"label\":\"fn\",\"insertTextFormat\":2,\"insertText\":\"fn ${1:name}($0) {}\"}]"))"#,
+    );
+    assert_eq!(run(&mut i, "(completion-popup-active-p)"), "t");
+    feed(&mut i, &ed, "RET");
+    assert_eq!(
+        bs(&mut i),
+        "fn name() {}",
+        "insertTextFormat 2 (a snippet) must be expanded -- placeholder to its default, dollar-zero removed"
+    );
+    assert_eq!(
+        pt(&mut i),
+        "fn name(".len() as i64 + 1,
+        "point must land where $0 was (right after the opening paren), not at the end of the text"
     );
 }
 
@@ -1467,5 +1511,619 @@ fn malformed_item_in_the_reply_is_skipped_not_fatal_to_the_whole_list() {
         row_text(&i, &ed, row0 + 1).contains("foo"),
         "row1: {:?}",
         row_text(&i, &ed, row0 + 1)
+    );
+}
+
+// ============================================================
+// M123 Part B: accept-time `completionItem/resolve' (the "r"-kind
+// marker `lsp--completion-item-insert-payload' produces when a
+// client's `completionProvider.resolveProvider' is truthy -- measured
+// true for `slang-server', 2026-09-08). These tests build the marker
+// and registry directly rather than driving the full `C-M-i' request
+// (already covered above), and shadow the SYNCHRONOUS `lsp--request'/
+// `lsp--await' pair `lsp--resolve-and-render-completion' calls --
+// resolving happens on the accept keystroke itself, not via
+// `lsp-request-async''s idle-tick delivery, so this is the same
+// isolation discipline as `lsp-hover-at-point''s own tests, not
+// `stub_capture''s.
+// ============================================================
+
+/// Builds a real (non-`'fake-client') `lsp--client' struct advertising
+/// `completionProvider.resolveProvider: t', and stashes it as
+/// `lsp--completion-registry-client' alongside a one-item
+/// `lsp--completion-registry' -- the state `lsp--resolve-and-render-
+/// completion' reads. Returns the elisp source clients can `ok'/`run'
+/// after this to also shadow `lsp--request'/`lsp--await'.
+fn setup_resolve_registry(interp: &mut Interp, raw_item_json: &str) {
+    ok(
+        interp,
+        "(setq test--cp (make-hash-table))
+         (puthash \"resolveProvider\" t test--cp)
+         (setq test--caps (make-hash-table))
+         (puthash \"completionProvider\" test--cp test--caps)
+         (setq test--client (make-lsp--client :conn nil :capabilities test--caps))",
+    );
+    ok(
+        interp,
+        &format!(
+            "(setq lsp--completion-registry (vector (json-parse-string {:?})))
+             (setq lsp--completion-registry-client test--client)",
+            raw_item_json
+        ),
+    );
+}
+
+#[test]
+fn resolve_payload_sends_resolve_and_inserts_the_resolved_text() {
+    let (mut i, ed) = setup();
+    ok(&mut i, "(insert \"x\")");
+    ok(&mut i, "(goto-char (point-max))");
+    setup_resolve_registry(&mut i, "{\"label\":\"sram_bank\"}");
+    ok(
+        &mut i,
+        "(setq test--resolve-calls nil)
+         (fset 'lsp--request
+               (lambda (client method params)
+                 (setq test--resolve-calls (cons (list client method params) test--resolve-calls))
+                 1))
+         (fset 'lsp--await
+               (lambda (client id &optional timeout)
+                 (json-parse-string \"{\\\"insertText\\\":\\\"resolved text\\\"}\")))",
+    );
+    // The 5th item element (M123 review round: `PopupItem::payload',
+    // its own dedicated field -- see `editor.rs' -- not a hidden
+    // sentinel folded into `insert') is "resolve:0"; `insert' itself is
+    // the FALLBACK text, used only if the resolve call below fails.
+    ok(
+        &mut i,
+        r#"(show-completion-popup (list (list "sram_bank" "fallback" (point) "sram_bank" "resolve:0")) (point))"#,
+    );
+    assert_eq!(run(&mut i, "(completion-popup-active-p)"), "t");
+    feed(&mut i, &ed, "RET");
+    assert_eq!(bs(&mut i), "xresolved text");
+    assert_eq!(
+        run(&mut i, "(length test--resolve-calls)"),
+        "1",
+        "completionItem/resolve must have been sent exactly once, at accept time"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (car test--resolve-calls))"),
+        "\"completionItem/resolve\""
+    );
+}
+
+#[test]
+fn resolve_payload_expands_a_snippet_from_the_resolved_reply() {
+    let (mut i, ed) = setup();
+    ok(&mut i, "(insert \"x\")");
+    ok(&mut i, "(goto-char (point-max))");
+    setup_resolve_registry(&mut i, "{\"label\":\"always_ff\"}");
+    ok(
+        &mut i,
+        "(fset 'lsp--request (lambda (client method params) 1))
+         (fset 'lsp--await
+               (lambda (client id &optional timeout)
+                 (json-parse-string \"{\\\"insertText\\\":\\\"always_ff @($0) begin\\\\n\\\\nend\\\",\\\"insertTextFormat\\\":2}\")))",
+    );
+    ok(
+        &mut i,
+        r#"(show-completion-popup (list (list "always_ff" "fallback" (point) "always_ff" "resolve:0")) (point))"#,
+    );
+    feed(&mut i, &ed, "RET");
+    assert_eq!(bs(&mut i), "xalways_ff @() begin\n\nend");
+    assert_eq!(
+        pt(&mut i),
+        "xalways_ff @(".len() as i64 + 1,
+        "point must land where $0 was, right after the opening paren"
+    );
+}
+
+/// A resolve round trip that fails (here: `lsp--await' signals, the
+/// same shape a real timeout/error takes) must never lose the
+/// candidate -- `lsp--resolve-and-render-completion''s own
+/// `condition-case' falls back to rendering the UNRESOLVED list item,
+/// and if that item itself carries nothing usable, to the FALLBACK
+/// text carried in the item's own `insert' field (its "fallback"
+/// meaning when `payload' is `"resolve:N"'). Here the registry item
+/// has nothing at all (`{}'), so the fallback text is what must land
+/// in the buffer.
+#[test]
+fn resolve_failure_falls_back_to_the_items_own_fallback_text() {
+    let (mut i, ed) = setup();
+    ok(&mut i, "(insert \"x\")");
+    ok(&mut i, "(goto-char (point-max))");
+    setup_resolve_registry(&mut i, "{}");
+    ok(
+        &mut i,
+        "(fset 'lsp--request (lambda (client method params) 1))
+         (fset 'lsp--await (lambda (client id &optional timeout) (error \"lsp: timed out\")))",
+    );
+    ok(
+        &mut i,
+        r#"(show-completion-popup (list (list "x" "fallback text" (point) "x" "resolve:0")) (point))"#,
+    );
+    feed(&mut i, &ed, "RET");
+    assert_eq!(
+        bs(&mut i),
+        "xfallback text",
+        "a resolve failure must not lose the completion -- the marker's own fallback text must still be inserted"
+    );
+}
+
+// ============================================================
+// M123 fix round (cold review): a completion can silently vanish. A
+// snippet whose RAW `insertText' is a bare, unnamed tab stop with no
+// default (`"$1"', length 2, non-empty) expands to the EMPTY STRING
+// once `lsp--expand-snippet' strips it -- accepting such a candidate
+// used to delete the typed prefix and insert NOTHING, with no error.
+// The empty-text guard (`lsp--completion-item-render' for the resolve
+// path, `lsp--completion-item-insert-payload' for the inline path) now
+// measures the EXPANDED text, not the raw pre-expansion one, on BOTH
+// paths.
+// ============================================================
+
+/// Inline (non-resolve) path: `lsp--completion-item-insert-payload'
+/// itself computes the expansion (no `completionItem/resolve' round
+/// trip involved -- `'fake-client' via `setup_connected' has no
+/// advertised `resolveProvider'). Deletion question: revert the guard
+/// in `lsp--completion-item-insert-payload' to check raw `insertText'
+/// instead of the expanded TEXT, and this test's own `assert_eq!' on
+/// `bs' goes from `"foo"' to `""' (nothing inserted at all -- this
+/// test starts from an EMPTY buffer, unlike its resolve-path
+/// neighbour below, whose own `"x"' prefix is that test's own, not
+/// this one's).
+#[test]
+fn insert_text_format_2_bare_placeholder_expanding_to_empty_falls_back_to_the_label() {
+    let (mut i, ed, _dir) = setup_connected("");
+    ok(&mut i, "(goto-char (point-max))");
+    stub_capture(&mut i);
+    feed(&mut i, &ed, "C-M-i");
+
+    ok(
+        &mut i,
+        r#"(funcall (nth 3 test--captured)
+               (json-parse-string "[{\"label\":\"foo\",\"insertTextFormat\":2,\"insertText\":\"$1\"}]"))"#,
+    );
+    assert_eq!(run(&mut i, "(completion-popup-active-p)"), "t");
+    feed(&mut i, &ed, "RET");
+    assert_eq!(
+        bs(&mut i),
+        "foo",
+        "a snippet that expands to the empty string must fall back to the item's own \
+         label, never insert nothing at all"
+    );
+}
+
+/// Resolve path: the RESOLVED reply's `insertText' is the one that
+/// expands to empty; `lsp--completion-item-render''s guard must catch
+/// it post-expansion and fall back to FALLBACK (the marker's own
+/// `insert' field, `"fallback text"' here) -- same shape as
+/// `resolve_failure_falls_back_to_the_items_own_fallback_text' above,
+/// but the resolve call SUCCEEDS this time; it just resolves to
+/// something that renders empty.
+#[test]
+fn resolve_reply_expanding_to_empty_falls_back_to_the_markers_fallback_text() {
+    let (mut i, ed) = setup();
+    ok(&mut i, "(insert \"x\")");
+    ok(&mut i, "(goto-char (point-max))");
+    setup_resolve_registry(&mut i, "{\"label\":\"foo\"}");
+    ok(
+        &mut i,
+        "(fset 'lsp--request (lambda (client method params) 1))
+         (fset 'lsp--await
+               (lambda (client id &optional timeout)
+                 (json-parse-string \"{\\\"insertText\\\":\\\"$1\\\",\\\"insertTextFormat\\\":2}\")))",
+    );
+    ok(
+        &mut i,
+        r#"(show-completion-popup (list (list "foo" "fallback text" (point) "foo" "resolve:0")) (point))"#,
+    );
+    feed(&mut i, &ed, "RET");
+    assert_eq!(
+        bs(&mut i),
+        "xfallback text",
+        "a RESOLVED reply that expands to the empty string must fall back to the \
+         marker's own fallback text, never insert nothing at all"
+    );
+}
+
+// ============================================================
+// M123 fix round (cold review): the resolve-capability DECISION itself
+// -- `lsp--resolve-provider-p', consulted by `lsp--completion-item-
+// insert-payload' -- was untested end to end. Every resolve test above
+// hand-supplies a `"resolve:0"' payload straight to `show-completion-
+// popup', bypassing `lsp--completion-items'/`lsp--completion-item-
+// insert-payload'/`lsp--resolve-provider-p' entirely: hardcoding that
+// predicate to `nil' would leave every test above green while silently
+// disabling the mechanism this whole milestone was built around. These
+// two drive the REAL path: a genuine `lsp--client' struct with real
+// advertised capabilities, through `lsp-completion-at-point' itself.
+// ============================================================
+
+/// A resolve-capable server (`completionProvider.resolveProvider: t')
+/// whose LIST reply omits `insertText' altogether (measured shape of
+/// `slang-server', see the M123 spec) must produce a POPUP ITEM
+/// carrying a `"resolve:0"' payload -- proof that `lsp--completion-
+/// items' -> `lsp--completion-item-insert-payload' ->
+/// `lsp--resolve-provider-p' really did read this client's own
+/// capabilities and decide "defer to resolve", not that this test
+/// engineered the payload by hand. Deletion question: hardcode
+/// `lsp--resolve-provider-p' to always return nil, and this goes from
+/// `Some("resolve:0")' to `None'.
+#[test]
+fn resolve_provider_capability_drives_a_real_completion_reply_to_a_resolve_payload() {
+    let (mut i, ed, _dir) = setup_connected("");
+    ok(&mut i, "(goto-char (point-max))");
+    ok(
+        &mut i,
+        "(setq test--cp (make-hash-table))
+         (puthash \"resolveProvider\" t test--cp)
+         (setq test--caps (make-hash-table))
+         (puthash \"completionProvider\" test--cp test--caps)
+         (setq-local lsp--buffer-client
+                     (make-lsp--client :conn nil :capabilities test--caps))",
+    );
+    stub_capture(&mut i);
+    ok(&mut i, "(lsp-completion-at-point)");
+    ok(
+        &mut i,
+        r#"(funcall (nth 3 test--captured)
+               (json-parse-string "[{\"label\":\"sram_bank\"}]"))"#,
+    );
+    assert_eq!(run(&mut i, "(completion-popup-active-p)"), "t");
+    let payload = ed.borrow().completion_popup.as_ref().unwrap().items[0]
+        .payload
+        .clone();
+    assert_eq!(
+        payload.as_deref(),
+        Some("resolve:0"),
+        "a resolve-capable server's own client capabilities must drive a real \
+         `\"resolve:N\"' payload through the actual production path: {:?}",
+        payload
+    );
+}
+
+/// The negative case, same real path: a client whose capabilities
+/// advertise `completionProvider' WITHOUT `resolveProvider' (a
+/// hash-table present, just missing that key) must produce an ordinary
+/// LITERAL item -- no payload at all (a 4-element item, `insert' is the
+/// item's own literal text).
+#[test]
+fn no_resolve_provider_capability_produces_a_plain_literal_item_not_a_resolve_payload() {
+    let (mut i, ed, _dir) = setup_connected("");
+    ok(&mut i, "(goto-char (point-max))");
+    ok(
+        &mut i,
+        "(setq test--cp (make-hash-table))
+         (setq test--caps (make-hash-table))
+         (puthash \"completionProvider\" test--cp test--caps)
+         (setq-local lsp--buffer-client
+                     (make-lsp--client :conn nil :capabilities test--caps))",
+    );
+    stub_capture(&mut i);
+    ok(&mut i, "(lsp-completion-at-point)");
+    ok(
+        &mut i,
+        r#"(funcall (nth 3 test--captured)
+               (json-parse-string "[{\"label\":\"sram_bank\",\"insertText\":\"sram_bank\"}]"))"#,
+    );
+    assert_eq!(run(&mut i, "(completion-popup-active-p)"), "t");
+    let (insert, payload) = {
+        let e = ed.borrow();
+        let item = &e.completion_popup.as_ref().unwrap().items[0];
+        (item.insert.clone(), item.payload.clone())
+    };
+    assert_eq!(insert, "sram_bank");
+    assert_eq!(
+        payload, None,
+        "no resolveProvider -> a plain literal item, never a resolve payload: {:?}",
+        payload
+    );
+}
+
+// ============================================================
+// M123 fix round (cold review): `lsp--client-capabilities-payload'
+// (the `capabilities' object sent in every `initialize' request) had
+// no test at all -- reverting it to `(make-hash-table)' (an empty
+// object, its own pre-M123 shape) turned nothing red anywhere in this
+// suite. Pure function, no buffer/server/client needed.
+// ============================================================
+
+#[test]
+fn client_capabilities_payload_declares_snippet_and_resolve_support() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"snippetSupport\"
+                (gethash \"completionItem\"
+                  (gethash \"completion\"
+                    (gethash \"textDocument\" (lsp--client-capabilities-payload)))))"
+        ),
+        "t",
+        "must declare snippetSupport so a resolve-capable server knows this client \
+         understands insertTextFormat 2"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"properties\"
+                 (gethash \"resolveSupport\"
+                   (gethash \"completionItem\"
+                     (gethash \"completion\"
+                       (gethash \"textDocument\" (lsp--client-capabilities-payload))))))"
+        ),
+        "[\"documentation\" \"detail\" \"additionalTextEdits\"]",
+        "must declare exactly the three resolveSupport properties this client's own \
+         resolve handling actually deals with"
+    );
+}
+
+// ============================================================
+// M123 Part B: `lsp--expand-snippet' pure unit tests -- a string in, a
+// (TEXT . OFFSET) cons out, no buffer, no server, no client.
+// ============================================================
+
+#[test]
+fn expand_snippet_dollar_zero_sets_offset_and_removes_the_placeholder() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(
+            &mut i,
+            "(lsp--expand-snippet \"always_ff @($0) begin\\nend\")"
+        ),
+        "(\"always_ff @() begin\\nend\" . 12)"
+    );
+}
+
+// M123 fix round (cold review): `$0' carrying its OWN default text is a
+// shape the docstring used to leave undocumented and no test pinned --
+// see `lsp--expand-snippet''s own docstring for the decision (point
+// lands BEFORE the default text, not after -- the TextMate/VS Code
+// "final stop pre-selects its default" convention). Deletion question:
+// swap the `when (eq kind 'final) (setq offset (length out))' line to
+// run AFTER `(setq out (concat out text))' instead of before, and this
+// goes from `("foo(bar)baz" . 4)' to `("foo(bar)baz" . 7)'.
+#[test]
+fn expand_snippet_dollar_zero_with_a_default_places_point_before_the_default_text() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"foo(${0:bar})baz\")"),
+        "(\"foo(bar)baz\" . 4)",
+        "point must land right BEFORE the inserted default text \"bar\" (offset 4, \
+         right after \"foo(\"), not after it"
+    );
+}
+
+#[test]
+fn expand_snippet_default_text_and_no_dollar_zero_leaves_offset_nil() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"fn ${1:name}() {}\")"),
+        "(\"fn name() {}\")"
+    );
+}
+
+#[test]
+fn expand_snippet_bare_numbered_placeholders_are_removed() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"a$1b${2}c\")"),
+        "(\"abc\")"
+    );
+}
+
+#[test]
+fn expand_snippet_choice_placeholder_takes_the_first_choice() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"${1|red,green,blue|}\")"),
+        "(\"red\")"
+    );
+}
+
+#[test]
+fn expand_snippet_escaped_dollar_is_literal() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"cost: \\\\$5\")"),
+        "(\"cost: $5\")"
+    );
+}
+
+// M123 fix round (cold review): the expander used to only unescape
+// `\$' -- `\\' (a literal backslash) and `\}' were both left AS-IS
+// (two characters, backslash + the next one, both surviving into the
+// output), which is wrong per the LSP/TextMate grammar and, in
+// particular, made `verilog-complete--snippet-escape's own doubling of
+// a literal `\' (for a SystemVerilog escaped identifier used as a
+// port/module name) come back out STILL DOUBLED rather than restored
+// to a single `\'. Deletion question: revert the `memq' back to
+// checking only `?$', and `expand_snippet_escaped_backslash_is_a_
+// literal_backslash' goes from `("a\\b")' (one backslash) to
+// `("a\\\\b")' (two, i.e. the escape survives unexpanded).
+#[test]
+fn expand_snippet_escaped_backslash_is_a_literal_backslash() {
+    let (mut i, _ed) = setup();
+    // The SNIPPET argument's own elisp string VALUE contains "a", TWO
+    // literal backslash characters, then "b" -- i.e. `a\\b' as LSP/
+    // TextMate snippet source text, which must expand down to ONE
+    // backslash: `a\b'.
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"a\\\\\\\\b\")"),
+        "(\"a\\\\b\")",
+        "`\\\\\\\\' (two literal backslash chars in the snippet source) must expand to \
+         ONE literal backslash, not survive doubled"
+    );
+}
+
+#[test]
+fn expand_snippet_escaped_close_brace_is_a_literal_brace() {
+    let (mut i, _ed) = setup();
+    // SNIPPET's own elisp string VALUE is `a\}b' (backslash then `}')
+    // -- the escape that lets a literal `}' appear where it would
+    // otherwise look like it closes a `${...}' construct. This is the
+    // PLAIN-TEXT position (outside any `${...}' construct) -- see
+    // `expand_snippet_escaped_close_brace_inside_a_default_is_a_literal_brace'
+    // below for the position `\}' actually exists for.
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"a\\\\}b\")"),
+        "(\"a}b\")"
+    );
+}
+
+// M123 fix round (trailing cold review): the plain-text case above is
+// NOT the position `\}' matters for -- it exists so a literal `}' can
+// appear INSIDE a `${N:default}'/`${N|...|}' construct without
+// prematurely closing it. `lsp--snippet-find-close-brace' used to count
+// every raw `{'/`}' with no notion of a preceding backslash, so
+// `${1:a\}b}' found the WRONG closing brace (the escaped one) and left
+// a stray `\' in the default text and a stray `b}' outside the
+// construct entirely -- exactly the repro this test pins.
+#[test]
+fn expand_snippet_escaped_close_brace_inside_a_default_is_a_literal_brace() {
+    let (mut i, _ed) = setup();
+    // SNIPPET's own elisp string VALUE is `${1:a\}b}' -- the escaped
+    // `}' must NOT close the construct; the real closing `}' is the
+    // LAST character, and the default text must come out as `a}b',
+    // not `a\}' with a stray `b}' left over.
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"${1:a\\\\}b}\")"),
+        "(\"a}b\")"
+    );
+}
+
+/// End-to-end round trip through the ACTUAL producer, `verilog-
+/// complete--snippet-escape' (verilog-complete.el) -- not just the
+/// expander in isolation above. Pins the specific defect the fix-round
+/// spec named: a SystemVerilog escaped identifier containing a literal
+/// `\' used to come out of the full escape-then-expand round trip with
+/// the backslash DOUBLED, because the escaper's own doubling (correct)
+/// had no expander-side counterpart (the bug just fixed) to undo it.
+#[test]
+fn snippet_escape_and_expand_round_trip_a_backslash_bearing_identifier() {
+    let (mut i, _ed) = setup();
+    // `verilog-complete--snippet-escape' on a 3-character NAME
+    // containing one literal backslash ("a\b", elisp value) must
+    // double it; feeding THAT straight to `lsp--expand-snippet' must
+    // then restore the original 3-character text exactly.
+    assert_eq!(
+        run(
+            &mut i,
+            "(lsp--expand-snippet (verilog-complete--snippet-escape \"a\\\\b\"))"
+        ),
+        "(\"a\\\\b\")",
+        "escape-then-expand must round-trip a backslash-bearing identifier back to \
+         its original text, not leave it doubled"
+    );
+}
+
+#[test]
+fn expand_snippet_unterminated_brace_is_left_as_literal_text() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"a${1:bc\")"),
+        "(\"a${1:bc\")"
+    );
+}
+
+#[test]
+fn expand_snippet_nested_placeholder_is_left_verbatim_not_recursively_expanded() {
+    let (mut i, _ed) = setup();
+    // Spec: nested placeholders are NOT supported -- the inner
+    // `${2:x}' must survive verbatim inside the outer's default text,
+    // not be expanded down to just `x'.
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"${1:${2:x}}\")"),
+        "(\"${2:x}\")"
+    );
+}
+
+/// The real `sram_bank' instantiation snippet quoted in the M123 spec
+/// (measured against the real `slang-server', 2026-09-08) -- pins the
+/// expander's output against genuine server text, not a hand-typed
+/// approximation.
+#[test]
+fn expand_snippet_real_sram_bank_instantiation_from_slang() {
+    let (mut i, _ed) = setup();
+    let snippet = "sram_bank #(\\n\\t.NumBanks (${1:NumBanks /* default 4 */}),\\n\\t.AddrWidth(${2:AddrWidth /* default 12 */})\\n ) ${3:sram_bank} (\\n\\t.clk_i     (${4:clk_i}),\\n\\t.rst_ni    (${5:rst_ni}),\\n);";
+    let src = format!("(car (lsp--expand-snippet \"{snippet}\"))");
+    // Evaluated directly (not through `run`'s `prin1-to-string') so the
+    // real characters -- `*'/`/'/`('/`)' included -- can be checked with
+    // plain Rust `.contains()' rather than an elisp REGEXP, which would
+    // have to escape every one of those regex metacharacters first.
+    let out = match i.eval_source(&src) {
+        Ok(Value::Str(s)) => (*s).clone(),
+        other => panic!("expander didn't return a string: {:?}", other.is_ok()),
+    };
+    assert!(
+        !out.contains('$'),
+        "no `$' should survive anywhere in the expanded text: {:?}",
+        out
+    );
+    for expect in [
+        "NumBanks /* default 4 */",
+        "AddrWidth /* default 12 */",
+        "sram_bank",
+        "clk_i",
+        "rst_ni",
+    ] {
+        assert!(
+            out.contains(expect),
+            "expected {:?} in expanded text: {:?}",
+            expect,
+            out
+        );
+    }
+}
+
+// ============================================================
+// M123 fix round (cold review): a choice list whose own choice text
+// contains a `:' (a Verilog bit range, e.g. `[7:0]', is exactly this
+// shape) used to be misread as `${N:default}' syntax instead of
+// `${N|...|}', because the OLD `lsp--expand-snippet-braced' picked
+// whichever of `:'/`|' occurred EARLIER in the whole string, and a
+// `:' inside the choice text itself can easily sit before the closing
+// `|'. Fixed by deciding the shape from the SINGLE character right
+// after N's own digits, which is where the LSP/TextMate grammar
+// actually places the discriminator.
+// ============================================================
+
+#[test]
+fn expand_snippet_choice_list_containing_a_colon_is_not_misread_as_a_default() {
+    let (mut i, _ed) = setup();
+    // Deletion question: revert the fix (put the `cond' back to
+    // checking `colon' before `pipe') and this goes from `("a:b")' to
+    // `("b|" . 0)' -- the exact garbled repro quoted in the fix-round
+    // spec.
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"${1|a:b|}\")"),
+        "(\"a:b\")",
+        "the single choice \"a:b\" must survive whole, not be split at the `:'"
+    );
+}
+
+#[test]
+fn expand_snippet_choice_list_with_verilog_bit_ranges_picks_the_first_choice_intact() {
+    let (mut i, _ed) = setup();
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"${1|[7:0],[15:0]|}\")"),
+        "(\"[7:0]\")",
+        "the FIRST choice, `:' and all, must be taken verbatim -- the comma splits \
+         choices, `:' never does"
+    );
+}
+
+#[test]
+fn expand_snippet_dollar_zero_choice_with_a_colon_still_sets_offset() {
+    let (mut i, _ed) = setup();
+    // The SAME colon-inside-choice hazard, but for tab stop 0 -- a
+    // `:' misread as introducing a default would also corrupt
+    // `string-to-number's parse of N, mistaking a `plain' stop for the
+    // `final' one (or vice versa) exactly as the fix-round spec's own
+    // repro showed for `${1|a:b|}' (misread as N=0).
+    assert_eq!(
+        run(&mut i, "(lsp--expand-snippet \"x${0|[7:0]|}y\")"),
+        "(\"x[7:0]y\" . 1)"
     );
 }

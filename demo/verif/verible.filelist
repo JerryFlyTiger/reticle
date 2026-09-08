@@ -1,0 +1,16 @@
+# verible.filelist -- file list for the demo/verif/ testbenches.
+#
+# demo/rtl/verible.filelist deliberately does not include anything
+# under demo/verif/ (it lists synthesizable design sources only), so
+# this is a second, separate list rooted here. Paths are relative to
+# THIS directory, same convention as demo/rtl/verible.filelist and read
+# the same way by crates/core/lisp/verilog-auto.el.
+
+../rtl/pkg/soc_pkg.sv
+../rtl/core/clk_gate.sv
+../rtl/mem/sram_wrapper.sv
+../rtl/mem/sram_bank.sv
+../rtl/bus/axi4_lite_if.sv
+axi4_lite_monitor.sv
+soc_verif_pkg.sv
+sram_bank_tb.sv

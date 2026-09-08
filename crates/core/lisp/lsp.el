@@ -15,9 +15,44 @@
 ;;    for a client simple enough to fit this milestone. A fully async
 ;;    version (register a callback, keep editing, dispatch later via
 ;;    `lsp-process-pending`) is a natural follow-up, not a correctness gap.
-;;  - Server-to-client requests other than the ones we send responses to
-;;    (e.g. `window/workDoneProgress/create`) are silently dropped rather
-;;    than answered. Real servers tolerate an unanswered optional request.
+;;  - Server-to-client requests (M123, closing both gaps this note used
+;;    to describe as open): `lsp--dispatch` now distinguishes a message
+;;    carrying BOTH `id` and `method` (a server-initiated REQUEST) from
+;;    one carrying `id` alone (a RESPONSE to a request WE sent) before
+;;    it ever looks at `lsp--client-pending`, so the two can no longer
+;;    collide on the same code path -- this also closes the id-collision
+;;    hazard the previous version of this note described as
+;;    hypothetical: there is no longer any way for a server REQUEST to
+;;    be handed to `lsp--await` as if it were our own RESPONSE, because
+;;    a request never reaches `lsp--client-pending` at all. A request is
+;;    answered immediately, from `lsp--dispatch` itself
+;;    (`lsp--respond-to-request`): `client/registerCapability` and
+;;    `window/workDoneProgress/create` get `{"result": null}` (accepting
+;;    a no-op, which is all this client's own capabilities ever promise
+;;    to do with either); anything else gets a JSON-RPC
+;;    `MethodNotFound` (-32601) error response, per spec -- a server
+;;    request is now NEVER left unanswered.
+;;
+;;    Measured 2026-09-08 (`dev/lsp-probe.py --sweep`): `slang-server`
+;;    sends `client/registerCapability` with id 0 during an ordinary
+;;    session; `verible-verilog-ls` sends no server-initiated request at
+;;    all. So the request branch above is exercised by one of this
+;;    project's two configured servers today, not a hypothetical.
+;;
+;;    What remains, deliberately: a plain NOTIFICATION (`method`, no
+;;    `id`, and not `publishDiagnostics`) is still silently dropped --
+;;    unchanged by M123, and not a bug: a notification has no id to
+;;    answer and nothing here consumes it, matching the M46-era default
+;;    for every notification type this client doesn't specifically
+;;    handle.
+;;
+;;    A RESPONSE with no registered callback (typically `lsp--await`
+;;    having already timed out on it, or a caller that fired the
+;;    request via a path with no waiter at all) still lands in
+;;    `lsp--client-pending`, exactly as before -- but that list is now
+;;    bounded at `lsp--client-pending-limit` entries (M123), dropping
+;;    the OLDEST entry once the cap is hit, rather than growing without
+;;    limit for the connection's lifetime.
 ;;  - `textDocument/didChange` (M35) syncs the WHOLE buffer text on every
 ;;    change -- `contentChanges` is a single entry with no `range`, which
 ;;    the spec defines as "replace the entire document", legal under any
@@ -822,10 +857,84 @@ this function runs, so `lsp--diagnostics-for-uri' sees it."
                   (setq gutter (cons (cons (gethash "line" start) (cons sev msg)) gutter))))
               (lsp--set-buffer-diagnostics buf gutter))))))))
 
+(defconst lsp--client-pending-limit 200
+  "Maximum number of RESPONSE messages `lsp--dispatch' will hold in
+`lsp--client-pending' waiting for an `lsp--await' that never comes
+(most concretely: an `lsp--await' call that already hit its own
+`lsp-initialize-timeout' and gave up, leaving no waiter behind to ever
+claim the answer). Past this many entries the OLDEST is dropped to make
+room for the newest (M123) rather than growing without bound for the
+rest of the connection's lifetime.
+
+200 is deliberately generous, not tuned: ordinary use produces at most
+a handful of these (one per timed-out request), so this cap is a
+backstop against a pathological server, not a budget anyone should
+expect to bump against in normal editing.")
+
+(defconst lsp--server-request-null-result-methods
+  '("client/registerCapability" "client/unregisterCapability"
+    "window/workDoneProgress/create")
+  "Server-to-client request METHODs this client answers with
+`{\"result\": null}' (M123) -- accepting a no-op. Every one of these is
+a request whose only content is \"the server would like to register/
+create something with the client\"; this client tracks none of them
+(no dynamic capability registration, no work-done progress UI), so
+acknowledging with a null result is honest: it says \"received, no
+objection\" without claiming to have done anything with it. Any OTHER
+server-initiated request method gets a JSON-RPC `MethodNotFound' error
+instead, via `lsp--respond-to-request'.")
+
+(defun lsp--send-response (client id result)
+  "Send a JSON-RPC RESPONSE for request ID with a `result' of RESULT --
+never itself a `method' key, unlike every message `lsp--send-message'
+builds; a JSON-RPC response is `{jsonrpc, id, result}', with no
+`method' at all."
+  (let ((h (make-hash-table)))
+    (puthash "jsonrpc" "2.0" h)
+    (puthash "id" id h)
+    (puthash "result" result h)
+    (lsp-send (lsp--client-conn client) h)))
+
+(defun lsp--send-error-response (client id code message)
+  "Send a JSON-RPC error RESPONSE for request ID: `{jsonrpc, id, error:
+{code, message}}'."
+  (let ((h (make-hash-table))
+        (e (make-hash-table)))
+    (puthash "code" code e)
+    (puthash "message" message e)
+    (puthash "jsonrpc" "2.0" h)
+    (puthash "id" id h)
+    (puthash "error" e h)
+    (lsp-send (lsp--client-conn client) h)))
+
+(defun lsp--respond-to-request (client id method)
+  "Answer a server-to-client REQUEST (a message carrying both ID and
+METHOD) -- M123. METHOD is looked up in
+`lsp--server-request-null-result-methods'; a match gets `{\"result\":
+null}' (accepting a no-op), anything else gets a JSON-RPC
+`MethodNotFound' (-32601) error, per spec. Either way, the request is
+answered here and now: it is never consed onto `lsp--client-pending'
+-- that list holds only RESPONSES, waiting for `lsp--await'."
+  (if (member method lsp--server-request-null-result-methods)
+      (lsp--send-response client id :null)
+    (lsp--send-error-response
+     client id -32601 (format "Unhandled method: %s" method))))
+
 (defun lsp--dispatch (client msg)
   "Handle one parsed JSON-RPC message: fold a `publishDiagnostics`
-notification into CLIENT, deliver an async response to its registered
-callback, or stash it under its id for `lsp--await` to pick up.
+notification into CLIENT, answer a server-to-client REQUEST inline
+(M123, `lsp--respond-to-request'), deliver an async RESPONSE to its
+registered callback, or stash a RESPONSE under its id for `lsp--await`
+to pick up.
+
+M123: a message carrying BOTH `id' and `method' is a server-initiated
+REQUEST (per the JSON-RPC/LSP spec, a RESPONSE never carries `method')
+and is handled by its own cond clause, ahead of the plain-`id' clause
+below -- so it can never be mistaken for a response to one of OUR own
+requests, closing both the \"server requests are retained forever\" and
+the \"id collision\" gaps this file's header used to describe as open.
+A plain NOTIFICATION (`method', no `id', not `publishDiagnostics') is
+still silently dropped -- unchanged, and intentional (see the header).
 
 M46: if MSG carries an `\"error\"` key (a JSON-RPC error response --
 unknown method, malformed params, ...), announce it via `message` first
@@ -845,6 +954,8 @@ callback receives."
       (let ((params (gethash "params" msg)))
         (lsp--merge-diagnostics
          client (gethash "uri" params) (gethash "diagnostics" params))))
+     ((and id method)
+      (lsp--respond-to-request client id method))
      (id
       (let ((cb (assq id (lsp--client-callbacks client))))
         (if cb
@@ -852,8 +963,17 @@ callback receives."
               (setf (lsp--client-callbacks client)
                     (delq cb (lsp--client-callbacks client)))
               (funcall (cdr cb) (gethash "result" msg)))
-          (setf (lsp--client-pending client)
-                (cons (cons id msg) (lsp--client-pending client)))))))))
+          (progn
+            (setf (lsp--client-pending client)
+                  (cons (cons id msg) (lsp--client-pending client)))
+            ;; M123: bound retention -- drop the OLDEST entry (the tail
+            ;; of this alist, since new entries are consed onto the
+            ;; front) once past the cap. No `butlast' in this elisp
+            ;; subset, so reverse/cdr/reverse does the same job.
+            (when (> (length (lsp--client-pending client))
+                     lsp--client-pending-limit)
+              (setf (lsp--client-pending client)
+                    (nreverse (cdr (reverse (lsp--client-pending client)))))))))))))
 
 (defun lsp-request-async (client method params callback)
   "Send METHOD as a request; CALLBACK is called with the response's
@@ -974,6 +1094,42 @@ sync."
           (with-current-buffer-internal buf (lambda () (lsp--sync-buffer-now)))
         (error nil)))))
 
+(defun lsp--client-capabilities-payload ()
+  "The `capabilities' object this client sends in every `initialize'
+request (M123, Part B) -- previously an empty hash table. Declares
+exactly the two things M123 makes this client actually honour:
+`textDocument.completion.completionItem.snippetSupport' (true --
+`lsp--expand-snippet' now understands `insertTextFormat' 2) and
+`.resolveSupport.properties' (a `completionItem/resolve' reply may fill
+in any of these fields beyond what the list item already had --
+`documentation'/`detail' are purely informational and unused by this
+client today, `additionalTextEdits' is declared honestly even though
+this client's own v1 scope still never applies them, per this file's
+own header note, because declaring support for a field this client
+then ignores would be worse than not declaring it at all).
+
+Measured 2026-09-08: `slang-server' returns the identical 11-snippet-
+out-of-16 resolve behaviour whether this object is empty (as it was
+pre-M123) or populated like this, so nothing here is required to make
+that server work -- it is the other half of the protocol (declaring
+what a caller can safely assume this client will do with a resolved
+reply), which matters for a DIFFERENT server that gates its own
+behaviour on the caller's declared capabilities."
+  (let* ((resolve-support (make-hash-table))
+         (completion-item (make-hash-table))
+         (completion (make-hash-table))
+         (text-document (make-hash-table))
+         (caps (make-hash-table)))
+    (puthash "properties"
+             (vector "documentation" "detail" "additionalTextEdits")
+             resolve-support)
+    (puthash "snippetSupport" t completion-item)
+    (puthash "resolveSupport" resolve-support completion-item)
+    (puthash "completionItem" completion-item completion)
+    (puthash "completion" completion text-document)
+    (puthash "textDocument" text-document caps)
+    caps))
+
 (defun lsp-connect (command &optional args root-path)
   "Start COMMAND (ARGS) as an LSP server and perform the initialize
 handshake. Returns a `lsp--client'.
@@ -1023,7 +1179,7 @@ that fails outright."
                     (let ((p (make-hash-table)))
                       (puthash "processId" :null p)
                       (puthash "rootUri" (if root-path (lsp--path-to-uri root-path) :null) p)
-                      (puthash "capabilities" (make-hash-table) p)
+                      (puthash "capabilities" (lsp--client-capabilities-payload) p)
                       p)))
                (result (lsp--await client id)))
           (setf (lsp--client-capabilities client)
@@ -3776,7 +3932,7 @@ succeed into a failure."
          (let ((p (make-hash-table)))
            (puthash "processId" :null p)
            (puthash "rootUri" (lsp--path-to-uri root) p)
-           (puthash "capabilities" (make-hash-table) p)
+           (puthash "capabilities" (lsp--client-capabilities-payload) p)
            p)
          (lambda (result)
            (let ((entry (assoc (cons command root) lsp--autostart-pending)))
@@ -4034,17 +4190,487 @@ character (or at `point-min'), i.e. an empty prefix. Same shape as
     p))
 
 (defun lsp--completion-item-label (item)
+  ;; Recorded, not fixed (trailing cold review, M123 fix round): a
+  ;; spec-violating item with no `label' at all makes this nil, which
+  ;; is then used as the popup LABEL and the empty-text FALLBACK --
+  ;; that one candidate silently vanishes from the popup rather than
+  ;; ever inserting anything, LSP protocol violation notwithstanding.
   (gethash "label" item))
 
 (defun lsp--completion-item-insert-text (item)
-  "ITEM's insert text (M44-3): `textEdit.newText' when ITEM carries a
+  "ITEM's RAW insert text (M44-3): `textEdit.newText' when ITEM carries a
 `textEdit', else `insertText', else `label'. `additionalTextEdits' are
-never applied (v1, documented in the file header). Snippet syntax
-inside `newText' (e.g. \"${1:x}\") is inserted as literal text -- v1
-does not parse or expand snippets, also documented in the file header."
+never applied (v1, documented in the file header). This is the text
+BEFORE any snippet expansion -- callers that need the FINAL text a user
+should see inserted want `lsp--completion-item-expanded-insert-text'
+(M123) instead, which is this function plus `lsp--expand-snippet' when
+ITEM's `insertTextFormat' says it needs it."
   (let* ((edit (gethash "textEdit" item))
          (new-text (and (hash-table-p edit) (gethash "newText" edit))))
     (or new-text (gethash "insertText" item) (gethash "label" item))))
+
+;; --- M123 Part B: snippet expansion --------------------------------
+
+(defun lsp--snippet-digit-p (c)
+  (and (>= c ?0) (<= c ?9)))
+
+(defun lsp--snippet-index (s c)
+  "First index of character C in string S, or nil if absent -- this
+elisp subset has no `string-search'/`cl-position', so `lsp--expand-
+snippet''s own helpers get this hand-rolled linear scan instead."
+  (let ((len (length s)) (i 0) found)
+    (while (and (< i len) (not found))
+      (when (eq (aref s i) c) (setq found i))
+      (setq i (1+ i)))
+    found))
+
+(defun lsp--snippet-find-close-brace (s start)
+  "Index (into S) of the `}' matching the `{' whose contents begin at
+START -- START is the position right after the OPENING `{'. Tracks
+nested `{'/`}' pairs so a DEFAULT/CHOICES text that itself contains
+balanced braces doesn't close the construct early; returns nil if S
+ends before a matching `}' is found (an unterminated construct --
+`lsp--expand-snippet-tabstop' treats that as malformed, falling back to
+literal text for its caller).
+
+M123 fix round (trailing cold review): a `\\{' or `\\}' inside
+DEFAULT/CHOICES text used to be counted as an ordinary, unescaped
+brace -- wrong, since the whole point of that escape is to let a
+literal `}' (or `{') appear without closing (or opening) a nesting
+level it was never meant to. `${1:a\\}b}' used to compute `a\\}' with a
+stray `b}' left over. Fixed the same way `lsp--expand-snippet' already
+treats a top-level `\\$': a backslash consumes (skips, without
+inspecting for brace-counting purposes) exactly the ONE character
+after it, so `\\{'/`\\}' can never be mistaken for a real nesting
+brace. Correct extraction alone is not the whole fix -- see
+`lsp--expand-snippet-braced''s own docstring for the matching
+unescape pass this enables on the DEFAULT/CHOICES text it returns."
+  (let ((len (length s)) (i start) (depth 1) found)
+    (while (and (< i len) (not found))
+      (let ((c (aref s i)))
+        (cond
+         ((and (eq c ?\\) (< (1+ i) len))
+          (setq i (1+ i)))
+         ((eq c ?{) (setq depth (1+ depth)))
+         ((eq c ?})
+          (setq depth (1- depth))
+          (when (= depth 0) (setq found i)))))
+      (setq i (1+ i)))
+    found))
+
+(defun lsp--snippet-unescape-inner (s)
+  "S with `\\$', `\\\\', `\\}' resolved to their own literal character --
+applied to the DEFAULT/CHOICES text `lsp--expand-snippet-braced'
+extracts, now that `lsp--snippet-find-close-brace' correctly SKIPS an
+escaped brace when finding where that text ends but does not itself
+strip the escaping backslash back out of the substring it returns.
+Without this, `${1:a\\}b}' would extract the right span (`a\\}b') but
+still render the escaping backslash literally, `a\\}b', not the
+intended `a}b'.
+
+Deliberately UNRELATED to \"nested placeholders are not recursively
+expanded\" (`lsp--expand-snippet''s own header): a backslash escape is
+never a tab stop, and always resolves to plain text; a nested
+`${2:x}' is a structurally different construct (an unescaped `$'
+followed by digits) that stays verbatim on purpose, and this function
+does not touch it -- `${1:${2:x}}' still comes out with the inner
+`${2:x}' untouched, since no `\\' precedes it anywhere."
+  (let ((out "") (i 0) (len (length s)))
+    (while (< i len)
+      (let ((c (aref s i)))
+        (if (and (eq c ?\\) (< (1+ i) len)
+                 (memq (aref s (1+ i)) '(?$ ?\\ ?})))
+            (progn
+              (setq out (concat out (char-to-string (aref s (1+ i)))))
+              (setq i (+ i 2)))
+          (progn
+            (setq out (concat out (char-to-string c)))
+            (setq i (1+ i))))))
+    out))
+
+(defun lsp--expand-snippet-braced (inner next)
+  "Parse INNER -- the text strictly between a tab stop's `${' and its
+matching `}' (already located by `lsp--snippet-find-close-brace') --
+into (KIND TEXT NEXT): INNER is one of `N', `N:default', or
+`N|a,b,c|'. KIND is `final' for tab stop 0 (`$0'/`${0}', the one
+cursor position this client actually surfaces), `plain' for any other
+N. Deliberately does NOT recursively expand DEFAULT/CHOICES text --
+see `lsp--expand-snippet''s own docstring for why nested placeholders
+are left as literal text rather than expanded again.
+
+M123 fix round: which of the three shapes INNER is used to be decided
+by asking \"does `:' or `|' occur EARLIER in the whole string\" --
+wrong, because DEFAULT/CHOICES text is free-form and can legally
+contain either character as part of its own content (a Verilog bit
+range like `${1|[7:0],[15:0]|}' has a `:' inside the choice list
+itself, well after the `|' that actually introduces it). The LSP/
+TextMate grammar disambiguates positionally, not by \"whichever
+delimiter appears first\": right after N's own digits comes either `|'
+(choice list) or `:' (default) or neither (bare `${N}'), and that
+SINGLE character is the only one asked about here -- whatever `:' or
+`|' shows up later, inside the default/choices text itself, is already
+past that decision point and is therefore correctly left as literal
+content.
+
+M123 fix round (trailing cold review): DEFAULT (the `:' branch) and
+FIRST-CHOICE (the `|' branch) are both passed through
+`lsp--snippet-unescape-inner' before being returned -- see that
+function's own docstring for why this is NOT the same thing as
+recursively expanding a nested tab stop (which this function still
+never does): `\\}'/`\\$'/`\\\\' inside either one are literal escapes,
+never tab-stop syntax, and must always resolve to plain text for the
+construct's own closing `}' (now correctly found even past an escaped
+one, see `lsp--snippet-find-close-brace') to have been worth finding
+correctly in the first place."
+  (let ((i 0) (len (length inner)))
+    (while (and (< i len) (lsp--snippet-digit-p (aref inner i)))
+      (setq i (1+ i)))
+    (let ((n (string-to-number (substring inner 0 i)))
+          (kind-of (lambda (n) (if (= n 0) 'final 'plain))))
+      (cond
+       ((and (< i len) (eq (aref inner i) ?|))
+        ;; `N|a,b,c|' -- INNER excludes the OUTER `}' but still includes
+        ;; the trailing `|' before it, since the brace scan that found
+        ;; INNER only tracks `{'/`}' nesting, not `|' pairs. Strip that
+        ;; trailing `|' to get the comma-separated CHOICES list, THEN
+        ;; split on the FIRST comma to get the first choice -- the two
+        ;; `|' characters are only the delimiters around the whole
+        ;; list, not per-choice separators (that's what the comma is
+        ;; for); any `:' inside CHOICES (a bit range, say) is never
+        ;; consulted again past this point.
+        (let* ((rest (substring inner (1+ i)))
+               (close-pipe (lsp--snippet-index rest ?|))
+               (choices (if close-pipe (substring rest 0 close-pipe) rest))
+               (comma (lsp--snippet-index choices ?,))
+               (first-choice (if comma (substring choices 0 comma) choices)))
+          (list (funcall kind-of n) (lsp--snippet-unescape-inner first-choice) next)))
+       ((and (< i len) (eq (aref inner i) ?:))
+        (list (funcall kind-of n)
+              (lsp--snippet-unescape-inner (substring inner (1+ i)))
+              next))
+       (t
+        (list (funcall kind-of n) "" next))))))
+
+(defun lsp--expand-snippet-tabstop (snippet pos)
+  "Helper for `lsp--expand-snippet': parses the tab-stop construct
+starting at POS (SNIPPET's own index right after the `$' introducing
+it). Returns (KIND TEXT NEXT) -- see `lsp--expand-snippet-braced' for
+what KIND/TEXT mean -- or nil if POS doesn't actually start a
+well-formed tab stop (a bare `$' with nothing recognizable after it,
+or an unterminated `${'), which the caller falls back to treating as
+a literal `$'."
+  (let ((len (length snippet)))
+    (cond
+     ;; `$N' -- bare digits, no braces.
+     ((and (< pos len) (lsp--snippet-digit-p (aref snippet pos)))
+      (let ((j pos))
+        (while (and (< j len) (lsp--snippet-digit-p (aref snippet j)))
+          (setq j (1+ j)))
+        (let ((n (string-to-number (substring snippet pos j))))
+          (list (if (= n 0) 'final 'plain) "" j))))
+     ;; `${...}'
+     ((and (< pos len) (eq (aref snippet pos) ?{))
+      (let ((close (lsp--snippet-find-close-brace snippet (1+ pos))))
+        (and close
+             (lsp--expand-snippet-braced (substring snippet (1+ pos) close)
+                                          (1+ close)))))
+     (t nil))))
+
+(defun lsp--expand-snippet (snippet)
+  "Expand LSP/TextMate snippet syntax in SNIPPET (`insertTextFormat' 2,
+see `lsp--completion-item-expanded-insert-text') into (TEXT . OFFSET),
+OFFSET nil meaning \"point belongs at the end of TEXT\" -- a NAMED
+cursor stop, `$0'/`${0}', sets it explicitly to where that stop landed
+in the OUTPUT; with no `$0' anywhere in SNIPPET, point simply lands
+after the last character inserted, same as an ordinary literal
+completion always has.
+
+Handles, per the LSP/TextMate snippet grammar's core subset (measured
+against `slang-server''s own real replies, quoted in the M123 spec --
+`sram_bank''s full instantiation template and `always_ff @($0) begin\\n
+end'):
+  `\\$', `\\\\', `\\}' -> a literal `$', `\\', `}' respectively -- the
+                      three escapes the LSP/TextMate snippet grammar
+                      actually defines (M123 fix round: this used to
+                      handle `\\$' only, which meant `verilog-complete.
+                      el''s own `verilog-complete--snippet-escape' --
+                      whose whole job is to double a literal `\\' in
+                      LITERAL text, such as a SystemVerilog escaped
+                      identifier, so this expander can never misread it
+                      as introducing an escape of its own -- had no
+                      counterpart to undo that doubling: a `\\\\' it
+                      emitted came back out as `\\\\' STILL DOUBLED,
+                      not `\\'. Handling all three here is what makes
+                      that escaper's own docstring claim (\"the exact
+                      inverse of what this undoes\") actually true).
+  `$N', `${N}'     -> removed entirely (an unnamed tab stop this
+                      client has no multi-stop editing UI for, so
+                      nothing is inserted for it -- the SAME removal
+                      `$0' gets, just without setting OFFSET).
+  `${N:default}'   -> DEFAULT's own text, inserted as-is.
+  `${N|a,b,c|}'    -> the FIRST choice, `a', inserted as-is.
+  `$0', `${0}'     -> removed, and OFFSET is recorded as the output
+                      length at this point.
+  `${0:default}'   -> DEFAULT's own text is inserted (same as the
+                      ordinary `${N:default}' case above), and OFFSET
+                      is recorded BEFORE that text, i.e. at its START,
+                      not its end (M123 fix round: this combination --
+                      a NAMED final stop that ALSO carries default
+                      text -- was previously undocumented and unpinned;
+                      the behavior itself was already exactly this, an
+                      accident of `offset' being set ahead of `text'
+                      being appended for every stop, `plain' or `final'
+                      alike, with no special-casing for `final' ever
+                      having non-empty text of its own -- decided here,
+                      deliberately, to KEEP that placement: it matches
+                      the TextMate/VS Code convention of a final stop's
+                      default text arriving pre-selected, ready to be
+                      typed over, which needs point to start BEFORE the
+                      default text, not after it). A real reply that
+                      exercises this shape: this client has no field-
+                      selection UI to actually highlight DEFAULT, so
+                      the visible effect is only that point lands at
+                      the start of the inserted default rather than at
+                      its end -- still a deliberate, useful landing
+                      spot (immediately ready to delete-forward and
+                      retype), not a bug.
+  anything malformed, or missing its closing `}' (an unterminated
+  `${') -> passed through as a literal `$' and scanning resumes right
+  after it, rather than raising an error or losing the rest of the
+  snippet -- a construct too weird for this client to parse should
+  degrade to \"looks a little odd\" over \"the completion vanishes\"
+  or \"signals\".
+
+Nested placeholders (`${1:${2:x}}') are NOT supported: DEFAULT/CHOICES
+text is taken completely literally by `lsp--expand-snippet-braced', so
+a nested `${2:x}' inside it is emitted VERBATIM (as the six characters
+`${2:x}', not as `x') rather than expanded again -- documented here
+per the M123 spec's own instruction to say plainly what happens
+instead of pretending nesting is handled.
+
+Pure and independently testable: a string in, a cons out, no buffer,
+no server, no client."
+  (let ((len (length snippet)) (i 0) (out "") offset)
+    (while (< i len)
+      (let ((c (aref snippet i)))
+        (cond
+         ((and (eq c ?\\) (< (1+ i) len)
+               (memq (aref snippet (1+ i)) '(?$ ?\\ ?})))
+          (setq out (concat out (char-to-string (aref snippet (1+ i)))))
+          (setq i (+ i 2)))
+         ((eq c ?$)
+          (let ((res (lsp--expand-snippet-tabstop snippet (1+ i))))
+            (if (not res)
+                (progn (setq out (concat out "$")) (setq i (1+ i)))
+              (let ((kind (nth 0 res)) (text (nth 1 res)) (next (nth 2 res)))
+                (when (eq kind 'final)
+                  (setq offset (length out)))
+                (setq out (concat out text))
+                (setq i next)))))
+         (t
+          (setq out (concat out (char-to-string c)))
+          (setq i (1+ i))))))
+    (cons out offset)))
+
+(defun lsp--completion-item-expanded-insert-text (item)
+  "ITEM's insert TEXT and cursor OFFSET as (TEXT . OFFSET), expanding
+snippet syntax (`lsp--expand-snippet') when ITEM's `insertTextFormat'
+is 2, otherwise identical to the old M44-3 behaviour -- ITEM's raw
+`lsp--completion-item-insert-text', OFFSET nil (point at the end)."
+  (let ((text (lsp--completion-item-insert-text item)))
+    (if (eq (gethash "insertTextFormat" item) 2)
+        (lsp--expand-snippet text)
+      (cons text nil))))
+
+(defvar lsp--completion-registry nil
+  "Vector of raw CompletionItem hash-tables for the currently open
+completion popup (M123) -- index N here is exactly the index a
+`\"resolve:N\"' `PopupItem' payload (`lsp--completion-item-insert-
+payload', `editor.rs''s `PopupItem::payload') names for the item at
+that position, so `lsp--resolve-and-render-completion' can look the raw
+item back up at ACCEPT time (only then, not at popup-open time, is a
+single item singled out for the extra `completionItem/resolve' round
+trip -- see the M123 spec's own reasoning for why the whole list is
+never eagerly resolved). Rebuilt wholesale every time `lsp-completion-
+at-point' gets a fresh answer; a payload from an already-closed popup
+can't be accepted (there is nothing left to press RET on), so there is
+no staleness window to defend against beyond `lsp--resolve-and-render-
+completion''s own out-of-range bounds check.")
+
+(defvar lsp--completion-registry-client nil
+  "The CLIENT `lsp--completion-registry''s items came from -- resolve
+must ask the SAME server that offered them, never whichever client
+happens to be attached to the buffer by the time RET is pressed.")
+
+(defun lsp--resolve-provider-p (client)
+  "Non-nil only when CLIENT is a real `lsp--client' struct whose
+advertised `completionProvider.resolveProvider' is truthy (measured
+true for `slang-server', 2026-09-08).
+
+Deliberately the OPPOSITE default from `lsp--capability-supported-p'
+(which trusts an unknown capability, per its own M46/M54 finding):
+`completionItem/resolve' is an EXTRA network round trip this client
+never sent before M123, not a request whose absence merely degrades
+gracefully to no answer -- guessing \"supported\" for an unknown or
+fake client would fire a real request through every test using the
+`'fake-client' convention (`lsp--live-buffer-client' tolerates a plain
+symbol standing in for a client -- see its own doc comment) or through
+a server that never advertised it, neither of which this milestone
+intends. So: CLIENT not `lsp--client-p', capabilities unknown,
+`completionProvider' absent or not a hash table, or `resolveProvider'
+itself falsy (absent, nil, or `:false') all answer nil; only a
+genuinely truthy `resolveProvider' opts in.
+
+Known tradeoff, noted here rather than left implicit (fix-round cold
+review): opting in makes ACCEPTING any completion from a resolve-
+capable server a SYNCHRONOUS round trip (`lsp--resolve-and-render-
+completion' uses `lsp--request'+`lsp--await', not `lsp-request-async',
+per that function's own docstring) that blocks this single-threaded
+editor for its duration -- even for a candidate whose LIST entry
+already carried everything needed to insert it, where resolving learns
+nothing new. This client has no cheap way to tell that case apart from
+one that genuinely needs the round trip (a server may put fields
+ONLY in the resolve reply, never the list, entirely at its own
+discretion), so the tradeoff is accepted wholesale rather than
+half-guessed at per item. Deliberate for the one server this was
+measured against: `slang-server' omits `insertText'/`insertTextFormat'
+from every list item and only fills them in on resolve, so for THAT
+server the round trip is never wasted -- it is always the only way to
+get real insert text at all, not an optional nicety."
+  (and (lsp--client-p client)
+       (let ((caps (lsp--client-capabilities client)))
+         (and (hash-table-p caps)
+              (let ((cp (gethash "completionProvider" caps)))
+                (and (hash-table-p cp)
+                     (let ((rp (gethash "resolveProvider" cp)))
+                       (and rp (not (eq rp :false))))))))))
+
+(defun lsp--completion-item-insert-payload (item idx client fallback)
+  "Returns (INSERT . PAYLOAD) for one candidate -- INSERT is the STRING
+`lsp--completion-items' stores as the candidate's `insert' field
+(always literal, final, or fallback text -- see below); PAYLOAD is nil
+(this candidate needs no special accept-time handling: exactly the
+pre-M123 shape, byte-identical) or a string `PopupItem::payload' can
+carry as-is (M123 review round: this used to be a Private-Use-Area-
+prefixed convention folded into the single INSERT string;
+`PopupItem::payload' is now its own field for the reasons given on its
+doc comment -- overloading `insert' meant a hidden convention only one
+comment in this file knew about, and no structural distinction between
+an LSP item and a `verilog-complete.el' item). FALLBACK (M123 fix
+round; the caller passes ITEM's own LABEL) is what INSERT becomes if
+the computed text would otherwise be empty -- see below.
+
+`\"resolve:N\"' (N a decimal index into `lsp--completion-registry')
+when CLIENT's `completionProvider.resolveProvider' is truthy
+(`lsp--resolve-provider-p') -- because a resolve-capable server may put
+`insertText'/`insertTextFormat' ONLY in the resolve reply (measured
+against `slang-server': the list item carries neither), so accept-time
+resolve is the only way to even tell such an item apart from a
+plain-text one; INSERT is the FALLBACK to use if that resolve fails
+(`lsp--resolve-and-render-completion' has its own, later empty-text
+guard for the resolved reply itself, via `lsp--completion-item-render').
+
+Otherwise, INSERT is ITEM's own already-expanded text
+(`lsp--completion-item-expanded-insert-text', which expands inline when
+ITEM already carries `insertTextFormat' 2 without needing any resolve
+round trip -- a hypothetical OTHER server that puts snippet syntax
+directly in the list -- and is identical to the old M44-3 literal text
+otherwise), and PAYLOAD is `\"offset:N\"' (N the cursor offset) when
+that expansion produced a non-end OFFSET (a `$0' in the snippet), or
+nil when it didn't -- an ordinary literal completion has PAYLOAD nil
+and INSERT the plain text, exactly the pre-M123 shape.
+
+M123 fix round: a snippet like a bare `\"$1\"' (an unnamed tab stop
+with no default text) is non-empty RAW (`insertText' length 2) but
+expands to the EMPTY STRING once `lsp--expand-snippet' strips the
+placeholder -- accepting such a candidate used to delete the typed
+prefix and insert nothing at all, silently. The guard checking for
+emptiness has to run AFTER expansion, on TEXT, not on the raw
+`insertText' the old code never re-examined post-expansion; on empty,
+INSERT falls back to FALLBACK and PAYLOAD is forced to nil (an offset
+computed against the now-discarded expanded text would point into text
+that no longer exists)."
+  (if (lsp--resolve-provider-p client)
+      (cons (lsp--completion-item-insert-text item)
+            (format "resolve:%d" idx))
+    (let* ((expanded (lsp--completion-item-expanded-insert-text item))
+           (text (car expanded))
+           (offset (cdr expanded)))
+      (cond
+       ((not (and (stringp text) (> (length text) 0)))
+        (cons fallback nil))
+       (offset (cons text (format "offset:%d" offset)))
+       (t (cons text nil))))))
+
+(defun lsp--completion-item-render (item fallback)
+  "Render ITEM (already resolved, or the original list item when a
+server has no `completionItem/resolve' capability at all) into (TEXT .
+OFFSET) -- OFFSET nil meaning \"end of TEXT\". Falls back to (FALLBACK
+. nil) if ITEM's own computed text is empty (defense against a
+genuinely empty resolve reply -- a completion must never simply
+vanish).
+
+M123 fix round: that emptiness check used to run on ITEM's RAW
+`insertText' -- BEFORE `lsp--expand-snippet' ever ran -- so a raw
+`insertText' of `\"$1\"' (a bare, unnamed tab stop with no default
+text: non-empty, length 2) sailed straight through the guard and was
+then expanded down to the EMPTY STRING, which the caller happily
+returned as the item to insert: accepting it deleted the typed prefix
+and inserted nothing, with no error and no visible sign anything went
+wrong. The check must run on the EXPANDED text (what will actually be
+inserted), not the pre-expansion one."
+  (let* ((text (lsp--completion-item-insert-text item))
+         (expanded (if (and (stringp text) (eq (gethash "insertTextFormat" item) 2))
+                       (lsp--expand-snippet text)
+                     (cons text nil)))
+         (final-text (car expanded)))
+    (if (not (and (stringp final-text) (> (length final-text) 0)))
+        (cons fallback nil)
+      expanded)))
+
+(defun lsp--resolve-and-render-completion (idx fallback)
+  "Accept-time resolve (M123): called from `commands::accept_completion'
+(Rust, via `apply_function') when the popup item just accepted carries
+a `PopupItem::payload' of `\"resolve:IDX\"' -- Rust passes IDX and the
+item's own `insert' string (FALLBACK) straight through. Sends
+`completionItem/resolve'
+SYNCHRONOUSLY (`lsp--request' + `lsp--await', the same discipline
+`lsp-hover-at-point' uses, NOT `lsp-request-async': accepting a
+candidate is a direct user keystroke with no idle tick to deliver an
+async callback into before that keystroke's own handling returns) for
+`lsp--completion-registry''s IDXth raw item, and renders the RESOLVED
+item's own fields in preference to the list item's -- per the LSP
+spec, a resolve reply is a copy of the same CompletionItem with more
+fields filled in, so it supersedes the list item wholesale rather than
+merging field-by-field.
+
+Never signals, and never loses the completion: IDX out of range for
+`lsp--completion-registry' (a marker that somehow outlived its popup --
+not reachable today, defended anyway), no live
+`lsp--completion-registry-client', or `lsp--request'/`lsp--await'
+erroring or timing out all fall back to rendering the UNRESOLVED list
+item exactly as `lsp--completion-item-insert-payload' would have
+without resolve capability at all; and if even that yields nothing
+usable, (FALLBACK . nil) -- the plain text `lsp--completion-items'
+already had in hand before ever attempting resolve.
+
+Returns (TEXT . OFFSET), OFFSET nil meaning \"point at the end of
+TEXT\" -- exactly the shape `commands::accept_completion' decodes."
+  (let* ((client lsp--completion-registry-client)
+         (item (and (lsp--client-p client)
+                    (vectorp lsp--completion-registry)
+                    (>= idx 0)
+                    (< idx (length lsp--completion-registry))
+                    (aref lsp--completion-registry idx))))
+    (if (not (hash-table-p item))
+        (cons fallback nil)
+      (let* ((resolved
+              (condition-case nil
+                  (let ((id (lsp--request client "completionItem/resolve" item)))
+                    (lsp--await client id))
+                (error nil)))
+             (final-item (if (hash-table-p resolved) resolved item)))
+        (lsp--completion-item-render final-item fallback)))))
 
 (defun lsp--completion-item-start (item prefix-start)
   "ITEM's replacement start (M44-3): `textEdit.range.start', converted
@@ -4092,7 +4718,7 @@ existing popup further when this is set and the buffer changes)."
       (cons (if (vectorp items) items nil) (and inc (not (eq inc :false))))))
    (t (cons nil nil))))
 
-(defun lsp--completion-items (items prefix-start point)
+(defun lsp--completion-items (items prefix-start point &optional client)
   "Build the (LABEL INSERT START FILTER) list `show-completion-popup'
 wants from ITEMS (a vector of CompletionItem hash-tables -- the `car'
 of what `lsp--completion-result-vector' returns), PREFIX-START (the
@@ -4100,6 +4726,18 @@ identifier-run start `lsp-completion-at-point' recorded when it sent
 the request), and POINT (current point as of when this answer is being
 processed -- may be later than the point at request time, since typing
 continues while a request is in flight, M44-3).
+
+CLIENT (M123, optional -- omitting it reproduces the pre-M123 literal-
+insert-only behaviour exactly, which is what every caller besides
+`lsp-completion-at-point' itself still wants) also sets
+`lsp--completion-registry'/`lsp--completion-registry-client' to ITEMS
+and CLIENT wholesale, keyed by each item's ORIGINAL index into ITEMS
+(preserved through the filter/sort below in a (ORIGINAL-INDEX . ITEM)
+pairing, since a `\"r\"'-kind marker's index must survive both), so
+`lsp--resolve-and-render-completion' can look a candidate's raw item
+back up at accept time. Every surviving candidate's INSERT field is
+built by `lsp--completion-item-insert-payload', which is where the
+resolve-deferred/inline-expand decision actually happens.
 
 Non-hash-table elements (a malformed server reply -- JSON `null', a
 bare string, ...) are dropped FIRST, before sorting (M44 review fix
@@ -4132,26 +4770,34 @@ PREFIX-START..POINT, since a `textEdit' can legitimately replace more
 than the ordinary prefix. A candidate whose own start is past POINT (a
 malformed `textEdit') is dropped outright -- its START would make no
 sense as a deletion range."
+  (when client
+    (setq lsp--completion-registry (and (vectorp items) items))
+    (setq lsp--completion-registry-client client))
   (let (out)
     (dotimes (idx (if items (length items) 0))
       (when (hash-table-p (aref items idx))
-        (push (aref items idx) out)))
+        (push (cons idx (aref items idx)) out)))
     (setq out (nreverse out))
     (setq out (sort out (lambda (a b)
-                           (string< (lsp--completion-item-sort-key a)
-                                    (lsp--completion-item-sort-key b)))))
+                           (string< (lsp--completion-item-sort-key (cdr a))
+                                    (lsp--completion-item-sort-key (cdr b))))))
     (let ((typed (buffer-substring-no-properties prefix-start point))
           result)
-      (dolist (item out)
-        (let* ((start (lsp--completion-item-start item prefix-start))
+      (dolist (pair out)
+        (let* ((orig-idx (car pair))
+               (item (cdr pair))
+               (start (lsp--completion-item-start item prefix-start))
                (filter (lsp--completion-item-filter-text item)))
           (when (and (<= start point)
                      (string-prefix-p typed filter))
-            (push (list (lsp--completion-item-label item)
-                        (lsp--completion-item-insert-text item)
-                        start
-                        filter)
-                  result))))
+            (let* ((label (lsp--completion-item-label item))
+                   (ip (lsp--completion-item-insert-payload item orig-idx client label))
+                   (insert (car ip))
+                   (payload (cdr ip)))
+              (push (if payload
+                        (list label insert start filter payload)
+                      (list label insert start filter))
+                    result)))))
       (nreverse result))))
 
 (defun lsp-completion-at-point ()
@@ -4210,7 +4856,7 @@ internally, so \"no such client\" degrades exactly as it always has."
            (when (and (eq (current-buffer) buf)
                       (= (lsp--completion-prefix-start (point)) prefix-start))
              (let* ((parsed (lsp--completion-result-vector result))
-                    (items (lsp--completion-items (car parsed) prefix-start (point)))
+                    (items (lsp--completion-items (car parsed) prefix-start (point) client))
                     (incomplete (cdr parsed)))
                (if items
                    (show-completion-popup items prefix-start incomplete)

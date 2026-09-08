@@ -146,6 +146,321 @@ fn typing_through_keymap() {
     assert_eq!(run(&mut i, "(buffer-string)"), "\"hello there\\nw\"");
 }
 
+// `kill-whole-line` (M110) is not bound to any key (see the M110 report:
+// neither frontend's key layer can express `C-S-backspace`, the GNU
+// binding, so there is nothing to bind it to), so most of these tests
+// call it directly via `(kill-whole-line)`. The two tests that need
+// `last-command` to reflect a real command cycle (append-on-repeat, and
+// an intervening command breaking that) bind it to an unused key
+// (`<f24>`, not bound anywhere in `simple.el`) for the duration of the
+// test and drive it through `feed_keys`, so `last_command` updates the
+// same way it would for any other command.
+#[test]
+fn kill_whole_line_middle_of_buffer() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nccc\\n\"");
+    assert_eq!(run(&mut i, "(point)"), "5"); // now the start of "ccc"
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb\n");
+    run(&mut i, "(yank)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nbbb\\nccc\\n\"");
+}
+
+#[test]
+fn kill_whole_line_point_mid_line() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 7)"); // middle of "bbb", not its start
+    run(&mut i, "(kill-whole-line)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb\n");
+}
+
+#[test]
+fn kill_whole_line_last_line_no_trailing_newline() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\")"); // no trailing newline
+    run(&mut i, "(goto-char (point-max))");
+    run(&mut i, "(kill-whole-line)");
+    // Verified against real GNU Emacs 30.2: with no trailing newline of
+    // its own to take, "bbb" is killed alone and the newline before it is
+    // left in place. The well-known consequence (real GNU behavior, not a
+    // bug) is that a file lacking a final newline gains one this way.
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb");
+    run(&mut i, "(yank)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nbbb\"");
+}
+
+#[test]
+fn kill_whole_line_point_max_with_trailing_newline_is_noop() {
+    // GNU Emacs 30.2 signals `end-of-buffer` and changes nothing when
+    // point sits on the buffer's implicit trailing empty line. This
+    // editor's `kill-line` handles its own equivalent boundary case by
+    // silently doing nothing rather than signaling (see the `start ==
+    // end` early return above); `kill-whole-line` follows that local
+    // convention instead of introducing a new error signal.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\n\")");
+    run(&mut i, "(goto-char (point-max))");
+    let before = ed.borrow().kill_ring.len();
+    assert_eq!(run(&mut i, "(kill-whole-line)"), "nil");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\"");
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        before,
+        "must not push an entry onto the kill ring"
+    );
+}
+
+#[test]
+fn kill_whole_line_single_newline_buffer_at_point_max_is_noop() {
+    // Same boundary case as above, but the buffer is nothing but the
+    // newline itself -- the defect-1 repro that lost the whole buffer.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"\\n\")");
+    run(&mut i, "(goto-char (point-max))");
+    let before = ed.borrow().kill_ring.len();
+    assert_eq!(run(&mut i, "(kill-whole-line)"), "nil");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"\\n\"");
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        before,
+        "must not push an entry onto the kill ring"
+    );
+}
+
+#[test]
+fn kill_whole_line_count_overshoots_remaining_lines_from_non_first_line() {
+    // Verified against real GNU Emacs 30.2: from "bbb" with only one real
+    // line left, `(kill-whole-line 2)` kills just that line, clamped at
+    // the buffer's end rather than erroring or reaching past it.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line 2)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb\n");
+}
+
+#[test]
+fn kill_whole_line_count_zero_excludes_trailing_newline() {
+    // Verified against real GNU Emacs 30.2: `(kill-whole-line 0)` kills
+    // the current line's content but leaves its trailing newline in
+    // place, unlike a positive count.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line 0)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb");
+}
+
+#[test]
+fn kill_whole_line_negative_count_kills_backward_with_preceding_newline() {
+    // Verified against real GNU Emacs 30.2: `(kill-whole-line -1)` from
+    // line 2 of "aaa\nbbb\nccc\n" kills "bbb" plus the newline that
+    // precedes it (but not "bbb"'s own trailing newline), giving
+    // "aaa\nccc\n" with "\nbbb" on the kill ring.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line -1)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "\nbbb");
+}
+
+#[test]
+fn kill_whole_line_negative_count_overshoots_past_first_line() {
+    // Verified against real GNU Emacs 30.2: from line 2 of
+    // "aaa\nbbb\nccc\n", `(kill-whole-line -5)` clamps at the buffer's
+    // start rather than erroring, killing "aaa\nbbb" and leaving
+    // "\nccc\n" ("bbb"'s own trailing newline survives).
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line -5)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "aaa\nbbb");
+}
+
+#[test]
+fn kill_whole_line_negative_count_large_valid_overshoots_past_first_line() {
+    // A large-but-valid negative count (safely negatable) should behave
+    // exactly like the smaller overshoot case above: clamp at the
+    // buffer's start, no error.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line -9223372036854775807)"); // i64::MIN + 1
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "aaa\nbbb");
+}
+
+#[test]
+fn kill_whole_line_negative_count_i64_min_does_not_panic() {
+    // Defect: the negative branch computed `(-n) as usize`, which
+    // overflows when n == i64::MIN (there is no positive i64 for
+    // -i64::MIN). Debug builds have overflow-checks on, so this used to
+    // panic ("attempt to negate with overflow") instead of clamping like
+    // any other large backward overshoot. `i64::MIN` reaches here
+    // directly from user elisp: `(kill-whole-line -9223372036854775808)`.
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line -9223372036854775808)"); // i64::MIN
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "aaa\nbbb");
+}
+
+#[test]
+fn kill_whole_line_refuses_on_read_only_buffer() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\n\")");
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(set-buffer-read-only t)");
+    let before_buf = run(&mut i, "(buffer-string)");
+    let before_kill_len = ed.borrow().kill_ring.len();
+    let out = run(&mut i, "(kill-whole-line)");
+    assert!(
+        out.starts_with("ERROR"),
+        "kill-whole-line on a read-only buffer must be refused: {}",
+        out
+    );
+    assert!(
+        out.contains("read-only") || out.contains("Read-only"),
+        "error must mention read-only: {}",
+        out
+    );
+    run(&mut i, "(set-buffer-read-only nil)"); // buffer-string itself never needs write access, but be tidy
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before_buf,
+        "a refused kill-whole-line must leave the buffer untouched"
+    );
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        before_kill_len,
+        "a refused kill-whole-line must leave the kill ring untouched"
+    );
+}
+
+#[test]
+fn kill_whole_line_last_line_with_trailing_newline() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\n\")");
+    run(&mut i, "(goto-char 6)"); // inside "bbb", before its newline
+    run(&mut i, "(kill-whole-line)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb\n");
+    run(&mut i, "(yank)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nbbb\\n\"");
+}
+
+#[test]
+fn kill_whole_line_empty_line_in_middle() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\n\\nccc\\n\")");
+    run(&mut i, "(goto-char 5)"); // the empty line between "aaa" and "ccc"
+    run(&mut i, "(kill-whole-line)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nccc\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "\n");
+}
+
+#[test]
+fn kill_whole_line_nothing_to_kill_does_not_error() {
+    let (mut i, ed) = setup();
+    // A wholly empty buffer: no text, no newline, nothing before it --
+    // there is truly nothing to take.
+    let before = ed.borrow().kill_ring.len();
+    assert_eq!(run(&mut i, "(kill-whole-line)"), "nil");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"\"");
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        before,
+        "nothing to kill must not push an entry onto the kill ring"
+    );
+}
+
+#[test]
+fn kill_whole_line_consecutive_calls_append_one_kill_ring_entry() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(global-set-key \"<f24>\" 'kill-whole-line)");
+    feed_keys(&mut i, &ed, "<f24>").unwrap(); // kills "aaa\n"
+    feed_keys(&mut i, &ed, "<f24>").unwrap(); // kills "bbb\n", should append
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"ccc\\n\"");
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        1,
+        "two consecutive kill-whole-lines must land as one kill-ring entry"
+    );
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "aaa\nbbb\n");
+    run(&mut i, "(yank)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nbbb\\nccc\\n\"");
+}
+
+#[test]
+fn kill_whole_line_intervening_command_prevents_append() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\n\")");
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(global-set-key \"<f24>\" 'kill-whole-line)");
+    feed_keys(&mut i, &ed, "<f24>").unwrap(); // kills "aaa\n"
+    feed_keys(&mut i, &ed, "C-f").unwrap(); // an unrelated command
+    feed_keys(&mut i, &ed, "<f24>").unwrap(); // kills "bbb\n", must NOT append
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"ccc\\n\"");
+    assert_eq!(
+        ed.borrow().kill_ring.len(),
+        2,
+        "an intervening non-kill command must break the append chain"
+    );
+    // Contents too, in order -- a mutation that got the right count but
+    // the wrong order or wrong text in either entry would survive the
+    // length-only assertion above.
+    assert_eq!(ed.borrow().kill_ring[0], "aaa\n");
+    assert_eq!(ed.borrow().kill_ring[1], "bbb\n");
+}
+
+#[test]
+fn kill_whole_line_positive_count_multiline_uses_running_position() {
+    // Coverage gap: every existing n>=1 multi-count test runs out of real
+    // lines on the second iteration, so the clamp masks whether the loop
+    // threads `pos` across iterations or reuses a fixed `bol`. Here there
+    // are enough lines that it can't be masked. Verified against real GNU
+    // Emacs 30.2 (`emacs -Q --batch --eval '(progn (insert
+    // "aaa\nbbb\nccc\nddd\n") (goto-char (point-min)) (forward-line 1)
+    // (kill-whole-line 2) (princ (format "buf=%S kills=%S\n"
+    // (buffer-string) kill-ring)))'`) -> buf="aaa\nddd\n"
+    // kills=("bbb\nccc\n"). If the loop used a fixed `bol` instead of the
+    // running `pos`, this would kill only "bbb\n".
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\nddd\\n\")");
+    run(&mut i, "(goto-char 5)"); // start of "bbb"
+    run(&mut i, "(kill-whole-line 2)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\nddd\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "bbb\nccc\n");
+}
+
+#[test]
+fn kill_whole_line_negative_count_multiline_uses_running_position() {
+    // Same coverage gap as above, for the n<0 loop. Verified against real
+    // GNU Emacs 30.2 (`emacs -Q --batch --eval '(progn (insert
+    // "aaa\nbbb\nccc\nddd\n") (goto-char (point-min)) (forward-line 3)
+    // (kill-whole-line -3) (princ (format "buf=%S kills=%S\n"
+    // (buffer-string) kill-ring)))'`) -> buf="aaa\n"
+    // kills=("\nbbb\nccc\nddd").
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"aaa\\nbbb\\nccc\\nddd\\n\")");
+    run(&mut i, "(goto-char 13)"); // start of "ddd"
+    run(&mut i, "(kill-whole-line -3)");
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"aaa\\n\"");
+    assert_eq!(ed.borrow().kill_ring.last().unwrap(), "\nbbb\nccc\nddd");
+}
+
 #[test]
 fn kill_and_yank_region() {
     let (mut i, ed) = setup();
@@ -603,6 +918,526 @@ fn window_split_and_navigate() {
 
     feed_keys(&mut i, &ed, "C-x 1").unwrap();
     assert_eq!(run(&mut i, "(window-count)"), "1");
+}
+
+// =======================================================================
+// M102: split ratios, resize commands, minimum-size protection
+// =======================================================================
+
+#[test]
+fn window_split_default_sizes_match_pre_m102_halves() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40, splits evenly
+    run(&mut i, "(split-window-below)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+}
+
+#[test]
+fn window_split_below_honors_size_argument() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below 10)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "10");
+    assert_eq!(run(&mut i, "(window-height 1)"), "30");
+}
+
+#[test]
+fn enlarge_window_grows_selected_and_shrinks_the_other() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    run(&mut i, "(enlarge-window 3)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "23");
+    assert_eq!(run(&mut i, "(window-height 1)"), "17");
+}
+
+#[test]
+fn shrink_window_shrinks_selected_and_grows_the_other() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    run(&mut i, "(shrink-window 2)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "18");
+    assert_eq!(run(&mut i, "(window-height 1)"), "22");
+}
+
+#[test]
+fn enlarge_and_shrink_window_horizontally_move_the_vertical_divider() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (91, 10); // windows_height irrelevant; width avail = 90 (1-col sep)
+    run(&mut i, "(split-window-right)"); // 45/45, id0 (left) selected
+    assert_eq!(run(&mut i, "(window-width 0)"), "45");
+    assert_eq!(run(&mut i, "(window-width 1)"), "45");
+
+    run(&mut i, "(enlarge-window-horizontally 10)");
+    assert_eq!(run(&mut i, "(window-width 0)"), "55");
+    assert_eq!(run(&mut i, "(window-width 1)"), "35");
+
+    run(&mut i, "(shrink-window-horizontally 12)");
+    assert_eq!(run(&mut i, "(window-width 0)"), "43");
+    assert_eq!(run(&mut i, "(window-width 1)"), "47");
+}
+
+#[test]
+fn enlarge_window_clamps_the_other_side_to_the_minimum_height() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    run(&mut i, "(enlarge-window 1000)");
+    // WINDOW_MIN_HEIGHT (redisplay.rs) is 2 -- the other window must
+    // land exactly there, not 0, not negative, and the call must not
+    // panic (a `run` that errors would show up as "ERROR: ..." here,
+    // not as a mismatched number).
+    assert_eq!(run(&mut i, "(window-height 1)"), "2");
+    assert_eq!(run(&mut i, "(window-height 0)"), "38");
+}
+
+#[test]
+fn split_window_below_refuses_when_too_small() {
+    let (mut i, ed) = setup();
+    // windows_height = rows - 1 = 3, below 2*WINDOW_MIN_HEIGHT (4).
+    ed.borrow_mut().frame = (40, 4);
+    feed_keys(&mut i, &ed, "C-x 2").unwrap();
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Window too small to split"
+    );
+}
+
+#[test]
+fn resizing_a_nested_split_does_not_disturb_the_outer_boundary() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (90, 41); // windows_height = 40, width avail = 89
+    run(&mut i, "(split-window-below)"); // id0 (top, selected) / id1 (bottom): 20/20
+    run(&mut i, "(split-window-right)"); // inside id0: id0 (left, selected) / id2 (right): 44/45
+    assert_eq!(run(&mut i, "(window-width 0)"), "44");
+    assert_eq!(run(&mut i, "(window-width 2)"), "45");
+
+    run(&mut i, "(enlarge-window-horizontally 10)");
+    // The outer (vertical) split's boundary must be untouched: the
+    // bottom window's height stays exactly what it was before the
+    // nested horizontal resize.
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    // The nested split itself did move.
+    assert_eq!(run(&mut i, "(window-width 0)"), "54");
+    assert_eq!(run(&mut i, "(window-width 2)"), "35");
+}
+
+#[test]
+fn balance_windows_resets_a_nested_asymmetric_layout() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (90, 41); // windows_height = 40, width avail = 89
+    run(&mut i, "(split-window-below)"); // id0 (top) / id1 (bottom): 20/20
+    run(&mut i, "(split-window-right)"); // inside id0: id0 (left) / id2 (right): 44/45
+    run(&mut i, "(enlarge-window 5)"); // outer split: id0 grows to 25, id1 shrinks to 15
+    run(&mut i, "(enlarge-window-horizontally 10)"); // nested split: id0 to 54/id2 35
+    assert_eq!(run(&mut i, "(window-height 0)"), "25");
+    assert_eq!(run(&mut i, "(window-height 1)"), "15");
+    assert_eq!(run(&mut i, "(window-width 0)"), "54");
+    assert_eq!(run(&mut i, "(window-width 2)"), "35");
+
+    run(&mut i, "(balance-windows)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+    assert_eq!(run(&mut i, "(window-width 0)"), "44");
+    assert_eq!(run(&mut i, "(window-width 2)"), "45");
+}
+
+#[test]
+fn enlarge_window_on_a_single_window_is_a_no_op_with_a_message() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41);
+    run(&mut i, "(enlarge-window)"); // no split exists yet
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Cannot resize a single window"
+    );
+}
+
+#[test]
+fn resizing_then_changing_frame_size_keeps_the_ratio_approximately() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)"); // 20/20
+    run(&mut i, "(enlarge-window 3)"); // 23/17 (frac = 0.575)
+    assert_eq!(run(&mut i, "(window-height 0)"), "23");
+    assert_eq!(run(&mut i, "(window-height 1)"), "17");
+
+    ed.borrow_mut().frame = (40, 80); // windows_height = 79
+    assert_eq!(run(&mut i, "(window-height 0)"), "45");
+    assert_eq!(run(&mut i, "(window-height 1)"), "34");
+    // Both windows stay at or above the minimum, and the ratio 45/79 ~=
+    // 0.57 stayed close to the original 0.575 (within the rounding
+    // slack the M102 spec explicitly allows).
+    assert!(run(&mut i, "(window-height 0)").parse::<i64>().unwrap() >= 2);
+    assert!(run(&mut i, "(window-height 1)").parse::<i64>().unwrap() >= 2);
+}
+
+#[test]
+fn window_resize_key_bindings_actually_resize() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (91, 41); // windows_height = 40, width avail = 90
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    feed_keys(&mut i, &ed, "C-x ^").unwrap();
+    assert_eq!(run(&mut i, "(window-height 0)"), "21");
+    assert_eq!(run(&mut i, "(window-height 1)"), "19");
+
+    run(&mut i, "(split-window-right)"); // inside id0: id0 (left)/id2 (right): 45/45
+    assert_eq!(run(&mut i, "(window-width 0)"), "45");
+    assert_eq!(run(&mut i, "(window-width 2)"), "45");
+
+    // Each of these key presses carries an implicit prefix count of 1
+    // (this editor has no `C-u`/prefix-argument input yet -- `p` always
+    // evaluates to 1 -- see commands.rs's `process_pending`), so a
+    // single `C-x }` moves the divider by exactly one column.
+    feed_keys(&mut i, &ed, "C-x }").unwrap();
+    assert_eq!(run(&mut i, "(window-width 0)"), "46");
+    assert_eq!(run(&mut i, "(window-width 2)"), "44");
+
+    feed_keys(&mut i, &ed, "C-x {").unwrap();
+    assert_eq!(run(&mut i, "(window-width 0)"), "45");
+    assert_eq!(run(&mut i, "(window-width 2)"), "45");
+
+    feed_keys(&mut i, &ed, "C-x +").unwrap();
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+    assert_eq!(run(&mut i, "(window-width 0)"), "45");
+    assert_eq!(run(&mut i, "(window-width 2)"), "45");
+}
+
+// M102 fix round (cold-review defect 1): plain `f32` truncation in
+// `split_lengths` made the read-count-add-delta-write-frac round trip
+// in `resize_in_layout` lossy, so repeated `enlarge-window` presses
+// silently stopped growing the window well short of
+// `WINDOW_MIN_HEIGHT`, on some frame sizes after as few as 2 presses.
+// `split_lengths` now nudges by a small epsilon before flooring (see
+// its own doc comment for why that's exact without disturbing the
+// existing default 50/50 splits) -- these tests pin the round trip
+// itself, across several frame sizes chosen because the reported bug
+// reproduced differently (or not at all) on different ones, so no
+// single size can hide a regression here.
+#[test]
+fn enlarge_window_never_stalls_across_frame_sizes() {
+    for &(cols, rows) in &[(80, 42), (80, 24), (120, 30), (41, 41)] {
+        let (mut i, ed) = setup();
+        ed.borrow_mut().frame = (cols, rows);
+        run(&mut i, "(split-window-below)");
+        let avail = rows - 1; // no minibuffer panel open
+        let min = 2; // WINDOW_MIN_HEIGHT
+        let max_a = avail - min;
+        let mut prev_a: i64 = run(&mut i, "(window-height 0)").parse().unwrap();
+        for step in 1..=25 {
+            run(&mut i, "(enlarge-window 1)");
+            let a: i64 = run(&mut i, "(window-height 0)").parse().unwrap();
+            let b: i64 = run(&mut i, "(window-height 1)").parse().unwrap();
+            if prev_a < max_a as i64 {
+                assert_eq!(
+                    a,
+                    prev_a + 1,
+                    "frame {}x{} step {}: expected +1 growth (a was {}), got {}",
+                    cols,
+                    rows,
+                    step,
+                    prev_a,
+                    a
+                );
+            } else {
+                assert_eq!(
+                    a, max_a as i64,
+                    "frame {}x{} step {}: once clamped, a must hold exactly at {}",
+                    cols, rows, step, max_a
+                );
+            }
+            assert!(
+                b >= min as i64,
+                "frame {}x{} step {}: other side {} must never drop below WINDOW_MIN_HEIGHT",
+                cols,
+                rows,
+                step,
+                b
+            );
+            prev_a = a;
+        }
+        assert_eq!(
+            prev_a, max_a as i64,
+            "frame {}x{} never actually reached the clamp within 25 presses",
+            cols, rows
+        );
+    }
+}
+
+#[test]
+fn enlarge_then_shrink_window_round_trips_to_the_original_height() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)");
+    let a0 = run(&mut i, "(window-height 0)");
+    let b0 = run(&mut i, "(window-height 1)");
+    run(&mut i, "(enlarge-window 1)");
+    run(&mut i, "(shrink-window 1)");
+    assert_eq!(run(&mut i, "(window-height 0)"), a0);
+    assert_eq!(run(&mut i, "(window-height 1)"), b0);
+}
+
+#[test]
+fn enlarge_then_shrink_window_horizontally_round_trips_to_the_original_width() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (91, 10); // width avail = 90 (1-col sep)
+    run(&mut i, "(split-window-right)");
+    let a0 = run(&mut i, "(window-width 0)");
+    let b0 = run(&mut i, "(window-width 1)");
+    run(&mut i, "(enlarge-window-horizontally 1)");
+    run(&mut i, "(shrink-window-horizontally 1)");
+    assert_eq!(run(&mut i, "(window-width 0)"), a0);
+    assert_eq!(run(&mut i, "(window-width 1)"), b0);
+}
+
+// M102 fix round (cold-review defect 2): `delta` comes straight from
+// `need_int` with no bound -- `i64::MAX`/`i64::MIN` used to overflow
+// the plain `a_len as i64 + delta` / `- delta` arithmetic in
+// `resize_in_layout` and panic in a debug build (this is one). Now
+// `saturating_add`/`saturating_sub`.
+#[test]
+fn window_resize_selected_does_not_panic_on_extreme_delta() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)");
+
+    let r = run(
+        &mut i,
+        &format!("(window-resize-selected {} nil)", i64::MAX),
+    );
+    assert!(
+        !r.starts_with("ERROR"),
+        "i64::MAX must not panic/error: {}",
+        r
+    );
+    let a: i64 = run(&mut i, "(window-height 0)").parse().unwrap();
+    let b: i64 = run(&mut i, "(window-height 1)").parse().unwrap();
+    assert_eq!(b, 2, "other side must clamp to WINDOW_MIN_HEIGHT");
+    assert_eq!(
+        a, 38,
+        "selected side must clamp to avail - WINDOW_MIN_HEIGHT"
+    );
+
+    let r = run(
+        &mut i,
+        &format!("(window-resize-selected {} nil)", i64::MIN),
+    );
+    assert!(
+        !r.starts_with("ERROR"),
+        "i64::MIN must not panic/error: {}",
+        r
+    );
+    let a: i64 = run(&mut i, "(window-height 0)").parse().unwrap();
+    let b: i64 = run(&mut i, "(window-height 1)").parse().unwrap();
+    assert_eq!(a, 2, "selected side must clamp to WINDOW_MIN_HEIGHT");
+    assert_eq!(b, 38, "other side must clamp to avail - WINDOW_MIN_HEIGHT");
+}
+
+// M102 fix round (cold-review defect 3): a SIZE outside `[min, avail -
+// min]` used to be silently clamped (`.max(0)`) instead of refused.
+//
+// M102 fix round 3 (cold-review, message misattribution): a SIZE that
+// is merely OUT OF RANGE on a window that is otherwise plenty big must
+// NOT report "Window too small to split" -- that message is reserved
+// for `raw < 2 * min + sep` (the window itself has no room for any
+// split at all). `split-window-internal` (builtins/ui.rs) now returns
+// the distinct symbol `bad-size` for this case, and `split-window--
+// report` (simple.el) turns THAT into "Invalid window size".
+#[test]
+fn split_window_below_refuses_an_out_of_range_size_with_the_right_message() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40, avail = 40, min = 2
+                                      // this frame is NOT too small -- a size-only rejection.
+    run(&mut i, "(split-window-below 0)");
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Invalid window size"
+    );
+
+    ed.borrow_mut().echo = None;
+    run(&mut i, "(split-window-below -5)");
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Invalid window size"
+    );
+
+    // SIZE too large for the OTHER side to keep the minimum -- also a
+    // size-only rejection, not "window too small".
+    ed.borrow_mut().echo = None;
+    run(&mut i, "(split-window-below 1000)");
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Invalid window size"
+    );
+}
+
+// M102 fix round 3 (cold-review, message misattribution): confirm the
+// TWO messages are actually distinguishable -- a genuinely tiny window
+// (no SIZE given at all) must still say "Window too small to split",
+// not "Invalid window size".
+#[test]
+fn split_window_below_still_says_window_too_small_with_no_size_given() {
+    let (mut i, ed) = setup();
+    // windows_height = 3, below 2*WINDOW_MIN_HEIGHT (4) -- see
+    // `split_window_below_refuses_when_too_small` above for the same
+    // frame size.
+    ed.borrow_mut().frame = (40, 4);
+    run(&mut i, "(split-window-below)");
+    assert_eq!(run(&mut i, "(window-count)"), "1");
+    assert_eq!(
+        ed.borrow().echo.clone().unwrap_or_default(),
+        "Window too small to split"
+    );
+}
+
+// M102 fix round 3 (cold-review, off-by-one coverage gap): the range
+// check in `split-window-internal` is the CLOSED interval `[min, avail
+// - min]`; changing either boundary's `<`/`>` to `<=`/`>=` would not
+// turn any pre-existing test red. These two pin both boundaries as
+// exactly-successful, not "close to the edge but still rejected".
+#[test]
+fn split_window_below_size_at_the_minimum_boundary_succeeds() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40, avail = 40, min = 2
+    run(&mut i, "(split-window-below 2)"); // SIZE == min, exactly
+    assert_eq!(run(&mut i, "(window-count)"), "2");
+    assert_eq!(run(&mut i, "(window-height 0)"), "2");
+    assert_eq!(run(&mut i, "(window-height 1)"), "38");
+}
+
+#[test]
+fn split_window_below_size_at_the_maximum_boundary_succeeds() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40, avail = 40, min = 2
+    run(&mut i, "(split-window-below 38)"); // SIZE == avail - min, exactly
+    assert_eq!(run(&mut i, "(window-count)"), "2");
+    assert_eq!(run(&mut i, "(window-height 0)"), "38");
+    assert_eq!(run(&mut i, "(window-height 1)"), "2");
+}
+
+// M102 fix round 2 (mutation report): `split_lengths`' own minimum-size
+// clamp (`raw_a.clamp(min, avail - min)`) is NOT redundant with
+// `resize_in_layout`'s `clamp_side_len` -- that one only clamps the
+// value being WRITTEN into `frac` at resize time, against the frame
+// size AT THAT MOMENT. It does nothing once the frame later shrinks:
+// `frac` itself doesn't change, so `split_lengths` (called fresh every
+// render, from `window_rects`) is the ONLY thing standing between an
+// old, skewed `frac` and a re-rendered side dropping below the minimum
+// on a smaller frame. `dev/mutations/m102.py`'s `let a = raw_a;`
+// mutation (dropping just this clamp) left all pre-existing M102 tests
+// green because none of them ever changed the frame size AFTER
+// skewing `frac` -- these three do.
+#[test]
+fn window_min_height_survives_a_frame_shrink_after_a_skewed_resize() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (80, 42); // windows_height = 41
+    run(&mut i, "(split-window-below)");
+    // Skew hard toward the top window: enlarge-window clamps against
+    // WINDOW_MIN_HEIGHT at THIS frame size, leaving frac ~= 39/41 ~=
+    // 0.951 baked into the split.
+    run(&mut i, "(enlarge-window 1000)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "39");
+    assert_eq!(run(&mut i, "(window-height 1)"), "2");
+
+    // Now shrink the frame drastically WITHOUT touching the split
+    // again -- `frac` is unchanged, only the frame got smaller. Both
+    // sizes chosen keep `avail = rows - 1 >= 2 * WINDOW_MIN_HEIGHT` (4),
+    // i.e. squarely in `split_lengths`' clamped branch, not its
+    // `avail < 2 * min` degenerate fallback (covered separately below).
+    for &rows in &[6usize, 5] {
+        ed.borrow_mut().frame = (80, rows);
+        let avail = rows - 1;
+        let a: i64 = run(&mut i, "(window-height 0)").parse().unwrap();
+        let b: i64 = run(&mut i, "(window-height 1)").parse().unwrap();
+        assert!(
+            a >= 2,
+            "rows={rows}: top window height {a} below WINDOW_MIN_HEIGHT"
+        );
+        assert!(
+            b >= 2,
+            "rows={rows}: bottom window height {b} below WINDOW_MIN_HEIGHT"
+        );
+        assert_eq!(
+            a + b,
+            avail as i64,
+            "rows={rows}: heights must sum to the available area ({avail})"
+        );
+    }
+}
+
+#[test]
+fn window_min_width_survives_a_frame_shrink_after_a_skewed_resize() {
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (91, 10); // width avail = 90 (1-col sep)
+    run(&mut i, "(split-window-right)");
+    // Skew hard toward the left window: frac ~= 86/90 ~= 0.9556.
+    run(&mut i, "(enlarge-window-horizontally 1000)");
+    assert_eq!(run(&mut i, "(window-width 0)"), "86");
+    assert_eq!(run(&mut i, "(window-width 1)"), "4");
+
+    // Shrink the frame width without touching the split again. All
+    // three keep `avail = width - sep >= 2 * WINDOW_MIN_WIDTH` (8).
+    for &width in &[12usize, 10, 9] {
+        ed.borrow_mut().frame = (width, 10);
+        let sep = if width > 2 { 1 } else { 0 };
+        let avail = width - sep;
+        let a: i64 = run(&mut i, "(window-width 0)").parse().unwrap();
+        let b: i64 = run(&mut i, "(window-width 1)").parse().unwrap();
+        assert!(
+            a >= 4,
+            "width={width}: left window width {a} below WINDOW_MIN_WIDTH"
+        );
+        assert!(
+            b >= 4,
+            "width={width}: right window width {b} below WINDOW_MIN_WIDTH"
+        );
+        assert_eq!(
+            a + b,
+            avail as i64,
+            "width={width}: widths must sum to the available area ({avail})"
+        );
+    }
+}
+
+#[test]
+fn degenerate_tiny_frame_after_skewed_resize_does_not_panic() {
+    // `avail < 2 * min` is `split_lengths`' explicitly-documented
+    // degenerate fallback -- it deliberately does NOT enforce the
+    // minimum there (a frame this tiny can't honor it on both sides at
+    // all), so this only asserts survival (no panic, window count
+    // unchanged), never a minimum size.
+    let (mut i, ed) = setup();
+    ed.borrow_mut().frame = (80, 42);
+    run(&mut i, "(split-window-below)");
+    run(&mut i, "(enlarge-window 1000)");
+
+    for &rows in &[4usize, 3] {
+        ed.borrow_mut().frame = (80, rows);
+        let r = run(&mut i, "(window-height 0)");
+        assert!(!r.starts_with("ERROR"), "rows={rows}: {r}");
+        assert_eq!(run(&mut i, "(window-count)"), "2");
+    }
+
+    let (mut i2, ed2) = setup();
+    ed2.borrow_mut().frame = (91, 10);
+    run(&mut i2, "(split-window-right)");
+    run(&mut i2, "(enlarge-window-horizontally 1000)");
+
+    for &width in &[8usize, 6] {
+        ed2.borrow_mut().frame = (width, 10);
+        let r = run(&mut i2, "(window-width 0)");
+        assert!(!r.starts_with("ERROR"), "width={width}: {r}");
+        assert_eq!(run(&mut i2, "(window-count)"), "2");
+    }
 }
 
 #[test]

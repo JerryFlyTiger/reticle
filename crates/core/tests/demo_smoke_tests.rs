@@ -26,6 +26,12 @@
 //! - `tools/TimingReport.java` is never compiled (no JDK dependency).
 //! - `rtl-verilog2001/fifo_sync_tb.v` is never simulated (no Icarus
 //!   Verilog dependency).
+//! - `rtl-verilog2001/gray_ctr_tb.v` (M124) is never simulated either,
+//!   for the same reason. `demo/tools/run_sim.sh` is the only thing that
+//!   runs it, and it is the only thing that can see whether
+//!   `gray_ctr.v` still encodes Gray at all -- M124's mutation V14
+//!   (`dev/mutations/m124.py`) is declared a survivor precisely because
+//!   no test in this suite simulates anything.
 //!
 //! Also pinned here as a known, deliberate non-round-trip: the M39
 //! `verilog-delete-auto` does not restore the exact original
@@ -141,18 +147,23 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 23] = [
+    const TABLE: [(&str, &str); 33] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
         ("rtl-verilog2001/.rules.verible_lint", "fundamental-mode"),
         ("rtl-verilog2001/fifo_sync.v", "verilog-mode"),
         ("rtl-verilog2001/fifo_sync_tb.v", "verilog-mode"),
+        ("rtl-verilog2001/gray_ctr.v", "verilog-mode"),
+        ("rtl-verilog2001/gray_ctr_tb.v", "verilog-mode"),
         ("rtl/.slang/server.json", "fundamental-mode"),
         ("rtl/bus/axi4_lite_arbiter.sv", "verilog-mode"),
+        ("rtl/bus/axi4_lite_if.sv", "verilog-mode"),
         ("rtl/core/alu.sv", "verilog-mode"),
+        ("rtl/core/clk_gate.sv", "verilog-mode"),
         ("rtl/core/regfile.sv", "verilog-mode"),
         ("rtl/include/soc_defs.svh", "verilog-mode"),
+        ("rtl/mem/sram_bank.sv", "verilog-mode"),
         ("rtl/mem/sram_wrapper.sv", "verilog-mode"),
         ("rtl/pkg/soc_pkg.sv", "verilog-mode"),
         ("rtl/top/soc_top.sv", "verilog-mode"),
@@ -161,10 +172,15 @@ fn every_file_under_demo_opens_in_its_expected_major_mode() {
         ("tools/bitvec.rs", "rust-mode"),
         ("tools/crc32.c", "c-mode"),
         ("tools/lint_rtl.sh", "sh-mode"),
+        ("tools/run_sim.sh", "sh-mode"),
         ("tools/sample_sim.log", "fundamental-mode"),
         ("tools/simlog_report.pl", "perl-mode"),
         ("tools/vcd_summary.py", "python-mode"),
         ("tools/vcd_writer.cpp", "c++-mode"),
+        ("verif/axi4_lite_monitor.sv", "verilog-mode"),
+        ("verif/soc_verif_pkg.sv", "verilog-mode"),
+        ("verif/sram_bank_tb.sv", "verilog-mode"),
+        ("verif/verible.filelist", "fundamental-mode"),
     ];
     let expected: BTreeMap<&str, &str> = TABLE.into_iter().collect();
     // Collecting into a map would silently drop a duplicated path,
@@ -457,48 +473,134 @@ fn arbiter_autoinst_expands_then_deletes() {
 }
 
 // ============================================================
-// 6. M73: every demo/ Verilog file's `standard-indent-width' matches
-//    its own 2-space style, and editing alu.sv produces a 2-column
-//    indent (not the verilog-mode default of 4) -- see demo/README.md's
-//    "three editor claims" section and indent.el's M73 header.
+// 6. M73: every demo/ Verilog file's own on-disk indent width is what
+//    `indent--detect-width' (indent.el:650, a pure scanner -- read-only,
+//    never applies anything) actually detects, and `standard-indent-width'
+//    ends up 2 for all nine -- see demo/README.md's "three editor claims"
+//    section and indent.el's M73 header.
+//
+//    M104 note: before M104, verilog-mode's own mode DEFAULT was 4, so
+//    asserting `standard-indent-width' alone was enough to tell "detection
+//    found 2" apart from "detection declined, mode default stood" for
+//    `rtl/include/soc_defs.svh' (4 vs. 2). M104 dropped that default to 2
+//    (to match `verible-verilog-format''s own default -- see modes.el),
+//    which made the old assertion vacuous: with the default now ALSO 2,
+//    every file in this array reads `standard-indent-width' == 2 whether
+//    detection ran successfully or silently declined and fell back to the
+//    default -- the array stopped being able to tell those two cases
+//    apart, exactly the "test doesn't reach what it claims to check"
+//    failure mode this project has hit seven times in one session before.
+//    So this test now asserts the DETECTOR's own return value directly
+//    (`indent--detect-width', not `standard-indent-width') -- that
+//    function's behavior has nothing to do with any mode's default, so
+//    this stays a real detection-mechanism test regardless of what the
+//    default is set to in the future. `standard-indent-width' is still
+//    checked below, but only as a secondary confirmation that the
+//    detected/defaulted value actually got applied to the buffer.
 // ============================================================
 
 #[test]
 fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
     let root = demo_root();
-    let verilog_files: [(&str, i64); 9] = [
-        ("rtl-verilog2001/fifo_sync.v", 2),
-        ("rtl-verilog2001/fifo_sync_tb.v", 2),
-        ("rtl/bus/axi4_lite_arbiter.sv", 2),
-        ("rtl/core/alu.sv", 2),
-        ("rtl/core/regfile.sv", 2),
+    let verilog_files: [(&str, Option<i64>); 17] = [
+        ("rtl-verilog2001/fifo_sync.v", Some(2)),
+        ("rtl-verilog2001/fifo_sync_tb.v", Some(2)),
+        ("rtl-verilog2001/gray_ctr.v", Some(2)),
+        ("rtl-verilog2001/gray_ctr_tb.v", Some(2)),
+        ("rtl/bus/axi4_lite_arbiter.sv", Some(2)),
+        ("rtl/bus/axi4_lite_if.sv", Some(2)),
+        ("rtl/core/alu.sv", Some(2)),
+        ("rtl/core/clk_gate.sv", Some(2)),
+        ("rtl/core/regfile.sv", Some(2)),
         // Only 2 lines of this 28-line file are indented at all (a
         // `SOC_ASSERT' macro continuation) -- below
         // `indent--detect-min-samples' (5), so detection returns nil
-        // ("not enough evidence to guess") and the mode default (4)
-        // stands. Not a bug: "don't guess without evidence" is the
-        // documented algorithm, and this file is the real-world case
-        // that exercises it, not a synthetic one.
-        ("rtl/include/soc_defs.svh", 4),
-        ("rtl/mem/sram_wrapper.sv", 2),
-        ("rtl/pkg/soc_pkg.sv", 2),
-        ("rtl/top/soc_top.sv", 2),
+        // ("not enough evidence to guess") and the mode default (2,
+        // as of M104) stands. Not a bug: "don't guess without evidence"
+        // is the documented algorithm, and this file is the real-world
+        // case that exercises it, not a synthetic one.
+        ("rtl/include/soc_defs.svh", None),
+        ("rtl/mem/sram_bank.sv", Some(2)),
+        ("rtl/mem/sram_wrapper.sv", Some(2)),
+        ("rtl/pkg/soc_pkg.sv", Some(2)),
+        ("rtl/top/soc_top.sv", Some(2)),
+        ("verif/axi4_lite_monitor.sv", Some(2)),
+        ("verif/soc_verif_pkg.sv", Some(2)),
+        ("verif/sram_bank_tb.sv", Some(2)),
     ];
+    // M122: a mechanism that decides what gets checked must fail loudly
+    // when it decides nothing does (CLAUDE.md, M114) -- this array is
+    // hand-maintained, so a new file added under demo/rtl or demo/verif
+    // without a matching entry here would previously be silently never
+    // checked at all. Cross-check against real filesystem discovery
+    // (mirroring `m119_collect_sv_files' in indent_tests.rs, but for
+    // `.v'/`.vh' too, since demo/rtl-verilog2001 is `.v').
+    fn collect_verilog_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} must exist and be readable: {}", dir.display(), e));
+        for entry in entries {
+            let entry = entry.expect("readable dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_verilog_files(&path, out);
+            } else if path
+                .extension()
+                .is_some_and(|e| e == "sv" || e == "svh" || e == "v" || e == "vh")
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut on_disk = Vec::new();
+    collect_verilog_files(&root.join("rtl-verilog2001"), &mut on_disk);
+    collect_verilog_files(&root.join("rtl"), &mut on_disk);
+    collect_verilog_files(&root.join("verif"), &mut on_disk);
+    let checked: std::collections::BTreeSet<&str> =
+        verilog_files.iter().map(|(rel, _)| *rel).collect();
+    let mut missing: Vec<String> = Vec::new();
+    for path in &on_disk {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("path is under demo_root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !checked.contains(rel.as_str()) {
+            missing.push(rel);
+        }
+    }
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "demo smoke test: these Verilog/SystemVerilog file(s) exist on disk under demo/rtl-\
+         verilog2001, demo/rtl or demo/verif but are NOT in this test's hand-maintained \
+         `verilog_files' array, so indent-width detection is silently never checked for them: \
+         {missing:?}"
+    );
     let (mut i, _ed) = setup();
-    for (rel, expected_width) in verilog_files {
+    for (rel, expected_detection) in verilog_files {
         let abs = root.join(rel);
         ok(
             &mut i,
             &format!("(find-file-internal {:?})", abs.to_str().unwrap()),
         );
+        let detected = ok(&mut i, "(indent--detect-width)");
+        let expected_detected_str = match expected_detection {
+            Some(w) => w.to_string(),
+            None => "nil".to_string(),
+        };
+        assert_eq!(
+            detected, expected_detected_str,
+            "{:?}: indent--detect-width returned {}, expected {}",
+            rel, detected, expected_detected_str
+        );
+        // Whether detection succeeded or declined, the applied width
+        // (detected value, or the mode default of 2 when it declined)
+        // must be 2 for every file here.
         let width = ok(&mut i, "standard-indent-width");
         assert_eq!(
-            width,
-            expected_width.to_string(),
-            "{:?}: standard-indent-width was {}, expected {}",
-            rel,
-            width,
-            expected_width
+            width, "2",
+            "{:?}: standard-indent-width was {}, expected 2 (detected or mode default)",
+            rel, width
         );
     }
 }

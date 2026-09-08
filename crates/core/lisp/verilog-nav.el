@@ -159,9 +159,16 @@
 ;;   `axi_if' in `axi_if u_if();', now jumps the same way a module type
 ;;   name does, with no changes needed in this file itself). `package'/
 ;;   `program'/`class' declarations are still not searched for or landed
-;;   on -- out of M97's scope; neither is a MODPORT name or a member
-;;   reached THROUGH an interface port (out of scope even with an LSP
-;;   client attached -- see PLAN.md's M97 record).
+;;   on -- out of M97's scope. (M124: an interface used only as a PORT
+;;   TYPE, e.g. `axi4_lite_if.monitor bus', is now ALSO a jump target --
+;;   both from the interface name itself and from the modport name,
+;;   which lands on the same interface declaration, not the modport --
+;;   see `verilog-nav--type-name-at-point''s own M124 doc.) Jumping to
+;;   the MODPORT ITSELF (a specific line inside the interface
+;;   declaration, not just the declaration's own start) or to a member
+;;   reached THROUGH an interface port remains out of scope, even with
+;;   an LSP client attached -- see PLAN.md's M97 record for the
+;;   original scope note this one extends.
 ;; - Does not jump to the INSTANCE's own declaration, and has no notion
 ;;   of `import pkg::*' at all.
 ;; - Multiple library files declaring the SAME module name: the first
@@ -184,47 +191,67 @@
 ;;
 ;; --- Reparse cost (M55 review correction, same shape verilog-complete.el
 ;;     already documents for its own file -- this file had no matching
-;;     section, which the review flagged as a gap) -----------------------
+;;     section, which the review flagged as a gap; corrected M120 --
+;;     M108/M109 landed after M55 and changed what each call below
+;;     actually costs, though not how many calls there are) -------------
 ;;
-;; `treesit-parser-create'/`treesit-node-at' (`treesit.rs') is a full,
-;; uncached, non-incremental reparse of the buffer's ENTIRE text on every
-;; call -- no `Tree::edit'-based reuse exists anywhere in this
-;; interpreter. One `M-.' on an instantiation's type name pays this cost
-;; as follows:
-;;   - `verilog-nav--type-name-at-point' always reparses the CURRENT
-;;     buffer once (`treesit-node-at', to find the enclosing
-;;     `module_instantiation') -- paid on every call, even ones that turn
-;;     out not to be on a type name at all.
-;;   - `verilog-auto--find-module-in-buffer' then reparses the CURRENT
-;;     buffer a SECOND time (a different node target -- the module
-;;     declaration, not the instantiation -- so this one can't be folded
-;;     into the first). This one is paid UNCONDITIONALLY: it is the
-;;     `let' initializer `verilog-goto-module-at-point' branches on, so
-;;     it runs before either branch is chosen, INCLUDING the library
-;;     branch, where it comes up empty by definition (the module isn't in
-;;     this buffer) and its whole cost is wasted. Folding it into the
+;; `treesit-parser-create'/`treesit-node-at' (`treesit.rs') go through
+;; `treesit::parse', which is now CACHED and INCREMENTAL, not a full
+;; reparse every time: within one unchanged edit generation for the
+;; buffer it's an O(1) `Rc' clone, and when the generation moved it
+;; reparses INCREMENTALLY via tree-sitter's `Tree::edit' rather than
+;; from scratch (M108/M109; see `treesit.rs''s module doc and `parse').
+;; Only a language switch, the very first parse of a buffer, or the rare
+;; defensive length-mismatch fallback inside `incremental_parse' (see its
+;; own comment in `treesit.rs') pays a full from-scratch reparse.
+;; `verilog-auto--parse-string' (used for
+;; library-candidate files below) is DIFFERENT: it has no buffer to key
+;; a generation on, so it is still a full, uncached parse on every call
+;; -- see `treesit.rs''s own doc on `parse_string'. One `M-.' on an
+;; instantiation's type name pays this cost as follows:
+;;   - `verilog-nav--type-name-at-point' always calls into `treesit::parse'
+;;     for the CURRENT buffer once (`treesit-node-at', to find the
+;;     enclosing `module_instantiation') -- paid on every call, even ones
+;;     that turn out not to be on a type name at all, but now usually an
+;;     O(1) cache hit or an incremental reparse rather than a full one.
+;;   - `verilog-auto--find-module-in-buffer' then calls into
+;;     `treesit::parse' for the CURRENT buffer a SECOND time (a different
+;;     node target -- the module declaration, not the instantiation -- so
+;;     this one can't be folded into the first; same generation as the
+;;     first call, so it's the SAME cached/incremental tree, an O(1) `Rc'
+;;     clone off what the first call just produced, not a second reparse
+;;     of any kind). This call is made UNCONDITIONALLY: it is the `let'
+;;     initializer `verilog-goto-module-at-point' branches on, so it runs
+;;     before either branch is chosen, INCLUDING the library branch, where
+;;     it comes up empty by definition (the module isn't in this buffer)
+;;     and its whole cost is wasted -- though with the cache, that wasted
+;;     cost is now an `Rc' clone, not a reparse. Folding it into the
 ;;     library branch's miss path is not possible without first knowing
 ;;     the answer it exists to compute.
-;;   - Same-buffer jump STOPS THERE, at two reparses total: the
-;;     `module_declaration' node the second parse produced is reused
+;;   - Same-buffer jump STOPS THERE, at two `treesit::parse' calls total:
+;;     the `module_declaration' node the second call produced is reused
 ;;     DIRECTLY for the actual `goto-char' (`verilog-nav--goto-decl-name')
 ;;     -- M55 review fix: an earlier version of this file discarded that
 ;;     node and called `verilog-auto--find-module-in-buffer' a THIRD time,
 ;;     from inside the goto helper, purely to re-derive something already
-;;     in hand. Two is not reducible further without an incremental
-;;     parser or a memoized tree passed between the two lookups (out of
-;;     this milestone's scope, same as verilog-complete.el's own
-;;     unresolved note on the identical cost shape).
-;;   - LIBRARY-file jump adds, on top of those same two: one string-based
-;;     parse per candidate file scanned up to and including the match
-;;     (`verilog-nav--find-module-in-libraries', via
-;;     `verilog-auto--parse-string'), THEN one more reparse of the TARGET
-;;     buffer once it's open (`verilog-auto--find-module-in-buffer'
-;;     again, inside `verilog-goto-module-at-point's own library branch)
-;;     to get a position valid against that buffer's actual (possibly
-;;     unsaved) content -- see the staleness section above for why that
-;;     last one is not optional, not merely uncached. Total N+3 for N
-;;     candidate files scanned, NOT N+2: the wasted current-buffer parse
+;;     in hand. Two is not reducible further within this file's own logic
+;;     (out of this milestone's scope, same as verilog-complete.el's own
+;;     unresolved note on the identical call shape) -- though as of
+;;     M108/M109 both calls are cheap regardless.
+;;   - LIBRARY-file jump adds, on top of those same two: one FULL,
+;;     uncached string-based parse per candidate file scanned up to and
+;;     including the match (`verilog-nav--find-module-in-libraries', via
+;;     `verilog-auto--parse-string', which has no buffer to key a cache
+;;     on -- this part of the cost model is unchanged by M108/M109), THEN
+;;     one more `treesit::parse' call against the TARGET buffer once it's
+;;     open (`verilog-auto--find-module-in-buffer' again, inside
+;;     `verilog-goto-module-at-point's own library branch) to get a
+;;     position valid against that buffer's actual (possibly unsaved)
+;;     content -- see the staleness section above for why that last call
+;;     is not optional, regardless of what it costs (it is a full parse
+;;     the first time that buffer is visited, then cached/incremental on
+;;     any later call for the same buffer). Total N+3 CALLS for N
+;;     candidate files scanned, NOT N+2: the wasted current-buffer call
 ;;     in the bullet above is easy to miss when counting, and the first
 ;;     version of this very section did miss it (caught in the M55 tail
 ;;     re-review, which is also why the count is spelled out as a number
@@ -265,11 +292,27 @@ boundary\", which overstated what exists.)"
 
 (defun verilog-nav--type-name-at-point ()
   "The instantiated module's type name (a string), if point sits within
-an instantiation's own `\"instance_type\"' field node; else nil. See
-this file's header for exactly which positions this excludes (instance
-name, port name, connection value, an ordinary signal reference) and
-why none of them qualify despite all sharing a `module_instantiation'
-ancestor with the type name."
+an instantiation's own `\"instance_type\"' field node; OR (M124) the
+interface name (a string), if point sits within a port's own
+`interface_port_header' -- either on the `interface_name' field itself
+(`axi4_lite_if.monitor bus', point on `axi4_lite_if') or on the
+`modport_name' field (point on `monitor'), in which case this still
+returns the INTERFACE's name, not the modport's: jumping to the
+modport itself is a separate, unimplemented feature (M124 deliberately
+stops at the interface declaration -- see this file's header for the
+disclosed-gap list). Returns nil otherwise. See this file's header for
+exactly which OTHER positions this excludes (instance name, port name,
+connection value, an ordinary signal reference) and why none of them
+qualify despite all sharing a `module_instantiation' ancestor with the
+type name.
+
+Dump-verified (M124, real `axi4_lite_monitor.sv' port shape
+`axi4_lite_if.monitor bus'): `interface_port_header' is a child of
+`ansi_port_declaration' with two fields, `interface_name' and
+`modport_name' -- structurally never a descendant of
+`module_instantiation', so the pre-M124 gate (which only ever looked
+for a `module_instantiation' ancestor) could never succeed from a port
+list at all; this is a structural gap, not a boundary bug."
   (let* ((pos (point))
          ;; on-ident: point must have an identifier character on at
          ;; least one side -- otherwise it's sitting on whitespace or
@@ -289,10 +332,24 @@ ancestor with the type name."
       (let* ((parser (treesit-parser-create 'verilog))
              (node (treesit-node-at ident-start parser))
              (mi (and node (verilog-auto--enclosing-of-type node "module_instantiation"))))
-        (when mi
-          (let ((type-node (treesit-node-child-by-field-name mi "instance_type")))
-            (when (and type-node (verilog-nav--point-in-node-p pos type-node))
-              (treesit-node-text type-node))))))))
+        (or (when mi
+              (let ((type-node (treesit-node-child-by-field-name mi "instance_type")))
+                (when (and type-node (verilog-nav--point-in-node-p pos type-node))
+                  (treesit-node-text type-node))))
+            ;; M124: an interface-typed port. `iph' is the nearest
+            ;; `interface_port_header' ancestor (there is no
+            ;; `module_instantiation' one here at all, so this branch is
+            ;; independent of the one above, not a fallback within it).
+            (when node
+              (let ((iph (verilog-auto--enclosing-of-type node "interface_port_header")))
+                (when iph
+                  (let ((iface-node (treesit-node-child-by-field-name iph "interface_name"))
+                        (modport-node (treesit-node-child-by-field-name iph "modport_name")))
+                    (cond
+                     ((and iface-node (verilog-nav--point-in-node-p pos iface-node))
+                      (treesit-node-text iface-node))
+                     ((and modport-node (verilog-nav--point-in-node-p pos modport-node) iface-node)
+                      (treesit-node-text iface-node))))))))))))
 
 ;; --- Lookup: current buffer, then library files (keeping the PATH) ------
 

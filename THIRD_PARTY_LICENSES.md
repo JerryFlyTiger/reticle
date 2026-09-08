@@ -8,18 +8,18 @@ rights to Reticle itself, which is licensed separately -- see
 
 Regenerate with `python3 dev/gen-third-party-licenses.py`.
 
-Total third-party crates: 454
+Total third-party crates: 460
 
 ## License summary
 
 | SPDX expression | Crates |
 | --- | ---: |
-| `MIT OR Apache-2.0` | 194 |
-| `MIT` | 105 |
+| `MIT OR Apache-2.0` | 195 |
+| `MIT` | 107 |
 | `Apache-2.0 OR MIT` | 33 |
+| `MIT/Apache-2.0` | 20 |
 | `Apache-2.0 WITH LLVM-exception` | 19 |
 | `Unicode-3.0` | 18 |
-| `MIT/Apache-2.0` | 17 |
 | `Apache-2.0` | 14 |
 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 7 |
 | `Zlib OR Apache-2.0 OR MIT` | 7 |
@@ -95,6 +95,26 @@ permissive and requires attribution only.
 shipped binaries. `r-efi` carries `MIT OR Apache-2.0 OR LGPL-2.1-or-later` and
 is used here under the MIT option; it is a UEFI-target crate that does not
 appear in the macOS, Linux or Windows build graphs at all.
+
+## Bundled fonts
+
+Beyond the egui-default font set noted above, `crates/frontend-gui` embeds two
+additional monospace font families as `gui-font` choices (M105), vendored into
+`assets/fonts/` and compiled into the binary with `include_bytes!`. Both are
+licensed under the SIL Open Font License, Version 1.1 (`OFL-1.1`), which
+permits redistribution as part of a larger work, including a commercial one,
+and requires that this attribution travel with the binary. The full license
+text for each is shipped alongside the font files themselves.
+
+| File | Upstream | Version | Copyright | License text |
+| --- | --- | --- | --- | --- |
+| `JetBrainsMono-Regular.ttf`, `JetBrainsMono-Bold.ttf`, `JetBrainsMono-Italic.ttf` | https://github.com/JetBrains/JetBrainsMono | v2.304 | Copyright 2020 The JetBrains Mono Project Authors | `assets/fonts/JetBrainsMono-OFL.txt` |
+| `FiraCode-Regular.ttf`, `FiraCode-Bold.ttf` | https://github.com/tonsky/FiraCode | 6.2 | Copyright (c) 2014, The Fira Code Project Authors | `assets/fonts/FiraCode-OFL.txt` |
+
+Fira Code's upstream release ships no italic face (only Bold/Light/Medium/
+Regular/Retina/SemiBold), so none is bundled here either -- `gui-font`'s
+`fira-code` choice falls back to a system font for italic text, exactly as it
+already does for any other font missing a same-family italic.
 
 ## Crates
 
@@ -650,6 +670,12 @@ appear in the macOS, Linux or Windows build graphs at all.
 - copyright license to reproduce, prepare Derivative Works of,
 - (c) You must retain, in the Source form of any Derivative Works
 - Copyright (c) 2012-2013 Mozilla Foundation
+
+### core_maths 0.1.1
+
+- License: `MIT`
+- Repository: https://github.com/robertbastian/core_maths
+- Copyright (c) 2024 Robert Bastian
 
 ### cpufeatures 0.2.17
 
@@ -2256,6 +2282,13 @@ appear in the macOS, Linux or Windows build graphs at all.
 - copyright license to reproduce, prepare Derivative Works of,
 - (c) You must retain, in the Source form of any Derivative Works
 
+### rustybuzz 0.20.1
+
+- License: `MIT`
+- Repository: https://github.com/harfbuzz/rustybuzz
+- Copyright (c) HarfBuzz developers
+- Copyright (c) 2020 Yevhenii Reizner
+
 ### same-file 1.0.6
 
 - License: `Unlicense/MIT`
@@ -2730,6 +2763,24 @@ appear in the macOS, Linux or Windows build graphs at all.
 - Repository: https://github.com/haraldh/rust_uds_windows
 - Copyright (c) Microsoft Corporation. All rights reserved.
 
+### unicode-bidi-mirroring 0.4.0
+
+- License: `MIT/Apache-2.0`
+- Repository: https://github.com/RazrFalcon/unicode-bidi-mirroring
+- copyright notice that is included in or attached to the work
+- copyright license to reproduce, prepare Derivative Works of,
+- (c) You must retain, in the Source form of any Derivative Works
+- Copyright (c) 2020 Yevhenii Reizner
+
+### unicode-ccc 0.4.0
+
+- License: `MIT/Apache-2.0`
+- Repository: https://github.com/RazrFalcon/unicode-ccc
+- copyright notice that is included in or attached to the work
+- copyright license to reproduce, prepare Derivative Works of,
+- (c) You must retain, in the Source form of any Derivative Works
+- Copyright (c) 2020 Yevhenii Reizner
+
 ### unicode-ident 1.0.24
 
 - License: `(MIT OR Apache-2.0) AND Unicode-3.0`
@@ -2738,6 +2789,24 @@ appear in the macOS, Linux or Windows build graphs at all.
 - copyright license to reproduce, prepare Derivative Works of,
 - (c) You must retain, in the Source form of any Derivative Works
 - COPYRIGHT AND PERMISSION NOTICE
+
+### unicode-properties 0.1.4
+
+- License: `MIT/Apache-2.0`
+- Repository: https://github.com/unicode-rs/unicode-properties
+- copyright notice that is included in or attached to the work
+- copyright license to reproduce, prepare Derivative Works of,
+- (c) You must retain, in the Source form of any Derivative Works
+- Copyright (c) 2015 The Rust Project Developers
+
+### unicode-script 0.5.8
+
+- License: `MIT OR Apache-2.0`
+- Repository: https://github.com/unicode-rs/unicode-script
+- copyright notice that is included in or attached to the work
+- copyright license to reproduce, prepare Derivative Works of,
+- (c) You must retain, in the Source form of any Derivative Works
+- Copyright (c) 2019 Manish Goregaokar
 
 ### unicode-segmentation 1.13.3
 

@@ -791,3 +791,130 @@ fn shallower_module_wins_over_a_same_named_one_in_a_subdirectory() {
         "depth-0 fifo.sv must win over sub/fifo.sv"
     );
 }
+
+// ============================================================
+// M122: cross-DIRECTORY jump via demo/verif/verible.filelist
+// ============================================================
+
+/// From the real `demo/verif/sram_bank_tb.sv''s `axi4_lite_if #(...)
+/// u_bus (...)' instantiation, the jump must resolve to the real
+/// declaration in `demo/rtl/bus/axi4_lite_if.sv' -- a DIFFERENT
+/// directory tree entirely, reachable only because `demo/verif/
+/// verible.filelist' lists `../rtl/bus/axi4_lite_if.sv' (M93's
+/// filelist-outranks-`.git' fix in `lsp--project-root' makes
+/// `demo/verif/' itself the resolved root for this buffer, not the
+/// repo's own `.git' three levels up, so the filelist is actually
+/// reached). Existing same-directory precedent:
+/// `jumps_to_an_interface_declared_in_the_same_buffer' above.
+#[test]
+fn jumps_to_an_interface_declared_in_a_different_directory_via_the_verif_filelist() {
+    let mut i = setup();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/verif/sram_bank_tb.sv"
+    );
+    let target = std::fs::canonicalize(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/rtl/bus/axi4_lite_if.sv"
+    ))
+    .expect("demo/rtl/bus/axi4_lite_if.sv must exist");
+    ok(&mut i, &format!("(find-file-internal {:?})", path));
+    // The file's own header comment (line 3) also says `axi4_lite_if`
+    // in prose before the real instantiation (line 145), so anchor on
+    // the unique `axi4_lite_if #(' text (the instantiation only) and
+    // back up past the trailing ` #(' (3 chars) into the middle of the
+    // identifier itself, rather than using `goto_mid' directly on a
+    // needle that would match the comment first.
+    goto_after(&mut i, "axi4_lite_if #(");
+    ok(&mut i, "(backward-char 9)");
+    let r = run(&mut i, "(verilog-goto-module-at-point)");
+    assert_eq!(r, "t", "expected a successful cross-directory jump: {}", r);
+    let landed = run(&mut i, "(buffer-file-name)");
+    let landed_path = match landed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(s) => s.to_string(),
+        None => panic!("(buffer-file-name) did not return a string: {landed}"),
+    };
+    assert_eq!(
+        std::fs::canonicalize(&landed_path).expect("landed file must exist"),
+        target,
+        "must land in demo/rtl/bus/axi4_lite_if.sv, landed in {landed_path:?} instead"
+    );
+    let point = run(&mut i, "(point)");
+    let name_start: usize = point.parse().unwrap();
+    let name = ok(
+        &mut i,
+        &format!("(buffer-substring {} {})", name_start, name_start + 12),
+    );
+    assert_eq!(name, "\"axi4_lite_if\"");
+}
+
+// --- M124 Part B: interface used only as a PORT TYPE ---------------------
+// Reproduced (M124): with a port `axi4_lite_if.monitor bus' (the real
+// shape in `demo/verif/axi4_lite_monitor.sv:19-21'), `M-.' did nothing at
+// all -- `verilog-nav--type-name-at-point' returned nil because the only
+// gate it had was "nearest `module_instantiation' ancestor", and
+// `interface_port_header' is structurally never a descendant of one.
+// `demo/rtl/bus/axi4_lite_if.sv' declares `interface axi4_lite_if'.
+
+#[test]
+fn jumps_from_an_interface_typed_port_s_interface_name_to_the_interface_declaration() {
+    let mut i = setup();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/verif/axi4_lite_monitor.sv"
+    );
+    let target = std::fs::canonicalize(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/rtl/bus/axi4_lite_if.sv"
+    ))
+    .expect("demo/rtl/bus/axi4_lite_if.sv must exist");
+    ok(&mut i, &format!("(find-file-internal {:?})", path));
+    // The header comment (line 5) also mentions "axi4_lite_if.monitor
+    // bus" in prose, so anchor on the indented port-declaration line
+    // itself (4 leading spaces), not present in the comment's shape.
+    goto_after(&mut i, "    axi4_lite_if");
+    let r = run(&mut i, "(verilog-goto-module-at-point)");
+    assert_eq!(r, "t", "expected a successful cross-file jump: {}", r);
+    let landed = run(&mut i, "(buffer-file-name)");
+    let landed_path = match landed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(s) => s.to_string(),
+        None => panic!("(buffer-file-name) did not return a string: {landed}"),
+    };
+    assert_eq!(
+        std::fs::canonicalize(&landed_path).expect("landed file must exist"),
+        target,
+        "must land in demo/rtl/bus/axi4_lite_if.sv, landed in {landed_path:?} instead"
+    );
+}
+
+#[test]
+fn jumps_from_an_interface_typed_port_s_modport_name_to_the_interface_declaration() {
+    let mut i = setup();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/verif/axi4_lite_monitor.sv"
+    );
+    let target = std::fs::canonicalize(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/rtl/bus/axi4_lite_if.sv"
+    ))
+    .expect("demo/rtl/bus/axi4_lite_if.sv must exist");
+    ok(&mut i, &format!("(find-file-internal {:?})", path));
+    // Point on the MODPORT name ("monitor") rather than the interface
+    // name -- must still land on the interface declaration, not fail
+    // and not attempt to locate the modport itself (out of scope, see
+    // `verilog-nav--type-name-at-point''s own M124 doc).
+    goto_after(&mut i, "    axi4_lite_if.monitor");
+    let r = run(&mut i, "(verilog-goto-module-at-point)");
+    assert_eq!(r, "t", "expected a successful cross-file jump: {}", r);
+    let landed = run(&mut i, "(buffer-file-name)");
+    let landed_path = match landed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(s) => s.to_string(),
+        None => panic!("(buffer-file-name) did not return a string: {landed}"),
+    };
+    assert_eq!(
+        std::fs::canonicalize(&landed_path).expect("landed file must exist"),
+        target,
+        "must land in demo/rtl/bus/axi4_lite_if.sv, landed in {landed_path:?} instead"
+    );
+}

@@ -331,6 +331,37 @@ fn ctrl_w_direction_with_no_window_there_messages_and_leaves_selection_alone() {
 }
 
 #[test]
+fn ctrl_w_plus_grows_the_selected_window() {
+    // M102: `C-w +' -> `evil-window-increase-height' -> `enlarge-window'.
+    let (mut i, ed) = setup_evil("hello");
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40, splits evenly
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    run(&mut i, "(evil-mode 1)"); // re-init after the raw eval above
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+
+    feed(&mut i, &ed, "C-w +");
+    assert_eq!(run(&mut i, "(window-height 0)"), "21");
+    assert_eq!(run(&mut i, "(window-height 1)"), "19");
+}
+
+#[test]
+fn ctrl_w_equals_balances_all_windows() {
+    // M102: `C-w =' -> `evil-window-balance' -> `balance-windows'.
+    let (mut i, ed) = setup_evil("hello");
+    ed.borrow_mut().frame = (40, 41); // windows_height = 40
+    run(&mut i, "(split-window-below)"); // 20/20, id0 (top) selected
+    run(&mut i, "(evil-mode 1)");
+    run(&mut i, "(enlarge-window 5)");
+    assert_eq!(run(&mut i, "(window-height 0)"), "25");
+    assert_eq!(run(&mut i, "(window-height 1)"), "15");
+
+    feed(&mut i, &ed, "C-w =");
+    assert_eq!(run(&mut i, "(window-height 0)"), "20");
+    assert_eq!(run(&mut i, "(window-height 1)"), "20");
+}
+
+#[test]
 fn normal_state_ctrl_w_is_the_window_prefix_not_kill_region() {
     let (mut i, ed) = setup_evil("hello world");
     run(&mut i, "(set-mark 1)");

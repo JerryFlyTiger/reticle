@@ -1036,10 +1036,206 @@ function at all -- see that function's own docstring)."
 \"NAME (source-file)\" when SOURCE is non-nil, bare NAME for a
 buffer-local module (there is no \"(this buffer)\" annotation -- a
 module the engineer is looking at right now needs no reminder of where
-it lives)."
+it lives). UNCHANGED by M123 Part C -- see `verilog-complete--
+instantiate-item' for the SECOND item Part C adds right after this
+one's own call site, never by editing this function."
   (let* ((name (car entry)) (source (cdr entry))
          (label (if source (format "%s (%s)" name source) name)))
     (list label name prefix-start name)))
+
+;; --- M123 Part C: "instantiate" items -------------------------------------
+;;
+;; A Verilog engineer typing a module's own name at a statement start
+;; (the context `verilog-complete--handle-instantiation-type-context'
+;; already claims) almost always wants the WHOLE instantiation, not
+;; just the bare type name `verilog-complete--module-item' above
+;; offers -- `slang-server' knows this (its own completion items ARE
+;; full instantiation snippets, see the M123 spec), but a Verilog user
+;; of THIS editor can never see that: `verilog-mode's
+;; `local-completion-function' tier (this file) wins over LSP
+;; (`lsp.el's own M54 note), and the OTHER server this project targets,
+;; `verible-verilog-ls', has no completion at all. So this file grows
+;; its own instantiation-skeleton generator, one candidate that reuses
+;; the SAME resolved-module readers every other branch here already
+;; uses (`verilog-complete--module-ports'/`--module-parameters' --
+;; never a second parser), rendered through Part B's `lsp--expand-
+;; snippet' (lsp.el) rather than a second insertion mechanism of its
+;; own, exactly the way an LSP-sourced snippet completion is rendered.
+;;
+;; Placement: `verilog-complete--handle-instantiation-type-context'
+;; below puts this SECOND, right after the plain-name item for the
+;; SAME module, for every matching module -- never on its own, never
+;; before the plain item. The plain item's own construction
+;; (`verilog-complete--module-item', directly above) is untouched.
+;;
+;; Snippet-syntax escaping: every piece of LITERAL text folded into the
+;; generated snippet (the module name, port/parameter names, parameter
+;; defaults) is escaped first (`verilog-complete--snippet-escape') --
+;; SystemVerilog identifiers/defaults can legally contain `$' (system-
+;; task-adjacent names inside a default expression), and an unescaped
+;; `$' there would be misread by `lsp--expand-snippet' as introducing a
+;; tab stop of this function's own construction, silently eating real
+;; port/parameter text. Only the `${N:...}'/`$0' markers THIS file
+;; deliberately writes are ever left unescaped.
+;;
+;; Column alignment: every `.NAME(EXPR)' connection/override line is
+;; padded to `verilog-auto-inst-column' the SAME way
+;; `verilog-auto--connection-text' pads an AUTOINST connection line --
+;; reused, not reinvented, per this milestone's own instruction to
+;; match verilog-auto.el's convention rather than invent a second one.
+;;
+;; The zero-port, zero-parameter case (a module that resolves but
+;; declares no ports and no `#(parameter ...)' header -- a real, if
+;; unusual, shape: an empty placeholder or a bind-target module) is
+;; OFFERED, not suppressed: the skeleton simply degenerates to `NAME
+;; ${0:u_NAME} ();' with no `#(...)' header and an empty port list,
+;; still a complete, pastable statement. This file already treats
+;; "module resolves at all" as license to offer something everywhere
+;; else -- the plain-name item right next to this one doesn't
+;; special-case a zero-port module either -- and there is no cheaper
+;; way to tell "genuinely zero ports" apart from "this file failed to
+;; parse this module's ports" here that would make suppressing it a
+;; safer default (the module already came from `verilog-complete--all-
+;; modules', which only ever lists modules that DO resolve). Pinned by
+;; `instantiate_item_for_a_zero_port_zero_parameter_module_offers_an_
+;; empty_shell' in `verilog_complete_tests.rs'.
+
+(defun verilog-complete--snippet-escape (s)
+  "S with every `\\' doubled and every `$' escaped to `\\$' -- the exact
+inverse of what `lsp--expand-snippet' undoes for those two characters,
+so LITERAL identifier/default text this file builds (never received
+from a server) can never be misread by that expander as introducing a
+tab stop or an escape of its own. Verilog identifiers/defaults can
+legally contain `$' but never `\\'; escaping both costs nothing and
+covers a default expression more thoroughly than escaping only `$'
+would.
+
+M123 fix round (cold review): the \"exact inverse\" claim above used to
+be false in practice -- `lsp--expand-snippet' only ever unescaped `\\$',
+so a `\\' this function doubled came back out of the round trip STILL
+DOUBLED, not restored to one. Fixed on the EXPANDER's side (it now
+follows the real LSP/TextMate grammar and unescapes `\\\\'/`\\}' too,
+not just `\\$'), not here -- this function's own doubling was already
+correct; it just had no counterpart to undo it. See `lsp--expand-
+snippet's own docstring for the fix and
+`snippet_escape_and_expand_round_trip_a_backslash_bearing_identifier'
+(completion_popup_tests.rs) for the pin."
+  (let ((out "") (i 0) (len (length s)))
+    (while (< i len)
+      (let ((c (aref s i)))
+        (cond
+         ((eq c ?\\) (setq out (concat out "\\\\")))
+         ((eq c ?$) (setq out (concat out "\\$")))
+         (t (setq out (concat out (char-to-string c))))))
+      (setq i (1+ i)))
+    out))
+
+(defun verilog-complete--instantiate-label (name ports)
+  "\"NAME  (instantiate, N portS)\" -- distinguishable at a glance from
+the plain-name item directly above it (`verilog-complete--module-item's
+own bare-or-annotated NAME) and states up front that accepting this
+one is the bigger action: a whole instantiation statement, not just a
+type name. Two spaces between NAME and the parenthetical, matching
+this file's own `verilog-complete--port-label'/`--param-label' habit
+of a short, scannable annotation rather than a sentence."
+  (format "%s  (instantiate, %d port%s)"
+          name (length ports) (if (= (length ports) 1) "" "s")))
+
+(defun verilog-complete--instantiate-port-line (port cont-indent)
+  "One `.NAME(NAME)' port-connection line for the instantiation
+skeleton -- same padded shape `verilog-auto--connection-text' emits
+for an AUTOINST connection (`.NAME' padded to `verilog-auto-inst-
+column'), except EXPR is always the port's own (escaped) NAME: there
+is no already-declared signal to connect to yet, unlike AUTOINST's
+fill-in-the-blanks job -- this is a brand-new instantiation."
+  (let* ((name (verilog-complete--snippet-escape (nth 0 port)))
+         (dotname (concat "." name)))
+    (concat cont-indent
+            (verilog-auto--pad-to-column dotname verilog-auto-inst-column (length cont-indent))
+            "(" name ")")))
+
+(defun verilog-complete--instantiate-param-line (param cont-indent n)
+  "One `.NAME(${N:DEFAULT})' parameter-override line -- DEFAULT is
+PARAM's own declared default text when it has one, else NAME itself
+\(nothing better to suggest\), both escaped. The numbered tab stop is
+real snippet syntax: `lsp--expand-snippet' treats an ordinary N here as
+a `plain' stop (removed, DEFAULT's text inserted verbatim -- see that
+function's own docstring), no different in THIS client's hands from N
+being fixed at 1, but correct sequential numbering costs nothing and
+matches the shape a real LSP snippet would use, in case a later
+milestone adds real multi-stop editing. `.NAME' is column-padded
+exactly like a port connection -- see `verilog-complete--instantiate-
+port-line'."
+  (let* ((name (verilog-complete--snippet-escape (nth 0 param)))
+         (default (verilog-complete--snippet-escape (or (nth 1 param) (nth 0 param))))
+         (dotname (concat "." name)))
+    (concat cont-indent
+            (verilog-auto--pad-to-column dotname verilog-auto-inst-column (length cont-indent))
+            "(${" (number-to-string n) ":" default "})")))
+
+(defun verilog-complete--instantiate-snippet (name ports params indent)
+  "The full snippet-syntax TEXT `verilog-complete--instantiate-item'
+hands to `lsp--expand-snippet' -- NAME (escaped) followed by an
+optional `#(...)' parameter-override header (omitted entirely when
+PARAMS is nil, never emitted empty), a `${0:u_NAME}' default instance
+name (the one cursor stop this client surfaces, see `lsp--expand-
+snippet's own docstring), and the `(...)' port-connection list (an
+empty `()' when PORTS is nil -- see this section's own zero-port
+decision above). INDENT is the whitespace already on the statement's
+own line; continuation lines (inside `#(...)' and the port list) get
+INDENT plus two more spaces, this project's own 2-space step (see
+`CLAUDE.md's `verible-verilog-format --indentation_spaces=2' pin)."
+  (let* ((cont-indent (concat indent "  "))
+         (esc-name (verilog-complete--snippet-escape name))
+         (inst-name (verilog-complete--snippet-escape (concat "u_" name)))
+         (param-lines (let ((n 0))
+                        (mapcar (lambda (p)
+                                  (setq n (1+ n))
+                                  (verilog-complete--instantiate-param-line p cont-indent n))
+                                params)))
+         (port-lines (mapcar (lambda (p) (verilog-complete--instantiate-port-line p cont-indent))
+                              ports)))
+    (concat
+     esc-name
+     (if param-lines
+         (concat " #(\n" (string-join param-lines ",\n") "\n" indent ")")
+       "")
+     " ${0:" inst-name "} ("
+     (if port-lines
+         (concat "\n" (string-join port-lines ",\n") "\n" indent ")")
+       ")")
+     ";")))
+
+(defun verilog-complete--instantiate-item (name prefix-start indent)
+  "The M123 Part C \"instantiate\" `show-completion-popup' ITEMS element
+for module NAME -- see this section's own header for the full design.
+Rendered through `lsp--expand-snippet' (lsp.el): a non-nil OFFSET (the
+skeleton's own `${0:...}' default-instance-name stop) becomes an
+`\"offset:N\"' `PopupItem' PAYLOAD (the 5th list element -- see
+`PopupItem::payload's own doc comment, `editor.rs'), exactly the same
+convention `lsp.el's own snippet-bearing items already use; PREFIX-
+START/NAME are this item's own START/FILTER, matching `verilog-
+complete--module-item's own convention so the SAME typed-prefix filter
+narrows both items for a module together as the user keeps typing."
+  (let* ((ports (verilog-complete--module-ports name))
+         (params (verilog-complete--module-parameters name))
+         (label (verilog-complete--instantiate-label name ports))
+         (snippet (verilog-complete--instantiate-snippet name ports params indent))
+         (expanded (lsp--expand-snippet snippet))
+         (text (car expanded))
+         (offset (cdr expanded)))
+    (if offset
+        (list label text prefix-start name (format "offset:%d" offset))
+      (list label text prefix-start name))))
+
+(defun verilog-complete--items-for-entry (entry prefix-start indent)
+  "The plain-name item for ENTRY (`verilog-complete--module-item',
+UNCHANGED) followed by ENTRY's own \"instantiate\" item (M123 Part C,
+`verilog-complete--instantiate-item') -- called once per candidate in
+`verilog-complete--handle-instantiation-type-context', so every
+matching module offers both, plain item always first."
+  (list (verilog-complete--module-item entry prefix-start)
+        (verilog-complete--instantiate-item (car entry) prefix-start indent)))
 
 ;; --- Entry point ------------------------------------------------------------
 
@@ -1221,15 +1417,23 @@ skip straight to `show-completion-popup' with whatever it happened to
 peek at -- `all' below is still built from `verilog-complete--all-
 modules' in full, so the ACTUAL candidates shown are always current,
 even on the rare occasion the cheap check's own answer was stale (see
-its docstring)."
+its docstring).
+
+M123 Part C: each matching module now contributes TWO items, not one
+-- see `verilog-complete--items-for-entry' -- the plain-name item
+first, then that module's own \"instantiate\" item, flattened via
+`apply' + `append' so the popup sees one flat list in that exact
+per-module order."
   (let ((typed (buffer-substring-no-properties prefix-start point)))
     (when (verilog-complete--any-module-name-matches-p typed)
       (let* ((all (verilog-complete--all-modules))
              (candidates (verilog-auto--filter
                           (lambda (e) (string-prefix-p typed (car e)))
                           all))
-             (items (mapcar (lambda (e) (verilog-complete--module-item e prefix-start))
-                             candidates)))
+             (indent (verilog-auto--line-indent prefix-start))
+             (items (apply #'append
+                           (mapcar (lambda (e) (verilog-complete--items-for-entry e prefix-start indent))
+                                   candidates))))
         (when items
           (show-completion-popup items prefix-start)
           t)))))

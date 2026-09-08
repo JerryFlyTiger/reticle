@@ -22,6 +22,19 @@
 # Without it `screencapture` exits with "could not create image from rect" and
 # this script tells you so rather than writing a misleading blank file. Note
 # that locating the window needs no permission at all -- only the pixels do.
+#
+# The binary this script runs must actually be current, or a screenshot proves
+# nothing. On 2026-09-03 this bit for real: a fix landed, `cargo test -p
+# frontend-gui` was run afterward (which relinks frontend-gui's own test
+# binaries but does NOT relink the root `reticle` binary), and this script's
+# old fixed debug-first pick silently ran a 1.5-hour-old debug binary built
+# BEFORE the fix. The resulting "after" screenshot differed from the "before"
+# one by only 200 pixels, which read as "the fix did nothing" -- the fix was
+# fine; the binary was stale. Re-running after `cargo build --workspace`
+# showed the real difference: 16,112 pixels for one font, 21,491 for another,
+# both now visibly slanted. Hence two rules below: pick whichever of
+# debug/release is actually newer (not "debug unless absent"), and refuse to
+# run at all if any `.rs` file is newer than the binary picked.
 
 set -eu
 
@@ -35,10 +48,34 @@ if [ "$(uname)" != "Darwin" ]; then
     exit 1
 fi
 
-BIN="$ROOT/target/debug/reticle"
-[ -x "$BIN" ] || BIN="$ROOT/target/release/reticle"
-if [ ! -x "$BIN" ]; then
+BIN=""
+for CANDIDATE in "$ROOT/target/debug/reticle" "$ROOT/target/release/reticle"; do
+    if [ -x "$CANDIDATE" ]; then
+        # Pick whichever candidate is actually newer, not "debug unless
+        # absent" -- a debug build from an hour ago and a release build from
+        # a minute ago must not lose to a fixed preference order.
+        if [ -z "$BIN" ] || [ "$CANDIDATE" -nt "$BIN" ]; then
+            BIN="$CANDIDATE"
+        fi
+    fi
+done
+if [ -z "$BIN" ]; then
     echo "error: no reticle binary; run 'cargo build --workspace' first" >&2
+    exit 1
+fi
+
+# Staleness gate: if any source file is newer than the binary we picked, the
+# binary predates that source change and a screenshot from it proves nothing
+# about the current code -- see this script's header comment for the incident
+# that made this necessary.
+# Only sources that can actually change the binary: a test or bench file is
+# newer constantly (they are edited far more often than product code) and
+# blocking on those would train everyone to ignore this gate.
+STALE=$(find "$ROOT/crates" "$ROOT/src" -name '*.rs' \
+    -not -path '*/tests/*' -not -path '*/benches/*' \
+    -newer "$BIN" -print -quit)
+if [ -n "$STALE" ]; then
+    echo "error: $BIN is older than $STALE -- run 'cargo build --workspace' first" >&2
     exit 1
 fi
 

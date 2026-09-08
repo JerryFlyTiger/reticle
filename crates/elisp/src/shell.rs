@@ -46,6 +46,7 @@ use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use crate::builtins::{defun, need_str};
 use crate::interp::Interp;
@@ -355,6 +356,146 @@ impl ShellProc {
     }
 }
 
+/// M104: synchronous "feed stdin, collect stdout/stderr" process
+/// execution, for `call-process-string`.
+///
+/// DIR (M104 fix round): the working directory to spawn PROGRAM in, or
+/// `None` to inherit the editor's own current directory (the previous,
+/// only behavior). This matters because a formatter invoked without it
+/// runs in whatever directory the EDITOR happened to start in, not the
+/// directory of the file actually being formatted -- concretely,
+/// `clang-format -style=file` searches for a `.clang-format` starting
+/// from ITS OWN working directory and upward, and silently falls back
+/// to LLVM style (exit 0, no diagnostic at all) if it doesn't find one,
+/// so a wrong `dir` doesn't error, it just quietly uses the wrong style.
+///
+/// Runs PROGRAM with ARGS, writes INPUT to its stdin and then closes
+/// the pipe (load-bearing -- a reader like a formatter blocks forever
+/// on an unclosed stdin, same reasoning as the writer thread in
+/// `ShellProc::spawn` above), and BLOCKS the calling thread until the
+/// child exits or TIMEOUT_MS elapses. Because elisp is single-threaded
+/// and driven off the editor's event loop, this call blocks the whole
+/// editor for up to TIMEOUT_MS -- which is exactly why it exists as a
+/// separate primitive from `start-shell-process` (async, unbounded):
+/// this one is for short, well-behaved external tools invoked at a
+/// predictable moment (formatting a buffer on save), where a bounded
+/// synchronous wait is an acceptable trade for not needing an elisp-side
+/// poll loop. It is NOT a general process-execution primitive.
+///
+/// On timeout, or if `try_wait` itself errors, the child's entire
+/// process GROUP is killed via `kill(-pid, SIGKILL)`, not just the
+/// direct child (`process_group(0)` at spawn makes the child its own
+/// group leader so this reaches any of ITS children too) -- killing
+/// only the direct child has left an orphaned grandchild running for 18
+/// minutes elsewhere in this project (see `dev/mutate.py`'s header,
+/// point 5). Non-Unix targets fall back to killing just the child
+/// process, since process groups are a Unix concept.
+///
+/// If PROGRAM can't even be spawned (not found, not executable, ...),
+/// this returns a non-zero exit code with the OS error message in
+/// stderr, rather than propagating an `Err` -- the elisp caller (M104's
+/// `format.el`) treats "formatter missing" and "formatter failed" the
+/// same way (message the user, don't touch the buffer), and forcing it
+/// to handle two different call shapes for that would buy nothing.
+fn call_process_string(
+    program: &str,
+    args: &[String],
+    input: &str,
+    timeout_ms: u64,
+    dir: Option<&str>,
+) -> (i32, String, String) {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                127,
+                String::new(),
+                format!("call-process-string: {}: {}", program, e),
+            )
+        }
+    };
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input_bytes = input.as_bytes().to_vec();
+    let stdin_thread = std::thread::spawn(move || {
+        // Swallow write errors (EPIPE if the child exits/dies before
+        // reading all of stdin) -- expected, not exceptional, same as
+        // the writer thread in `ShellProc::spawn` above.
+        let _ = stdin.write_all(&input_bytes);
+        // `stdin` drops here, closing the pipe -- this is what sends
+        // the child's stdin its EOF.
+    });
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    });
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    match status {
+        Some(status) => {
+            // Child already exited: its pipes are closed, so the
+            // writer/reader threads finish (or already have) promptly.
+            let _ = stdin_thread.join();
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            (status.code().unwrap_or(-1), stdout, stderr)
+        }
+        None => {
+            // Timed out (or try_wait errored): kill the whole process
+            // group FIRST, then join -- joining the writer/reader
+            // threads before killing could itself hang (e.g. a writer
+            // thread blocked on a full stdin pipe that a wedged child
+            // never drains).
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdin_thread.join();
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            (-1, stdout, stderr)
+        }
+    }
+}
+
 const SHELL_TAG: &str = "shell-process";
 
 fn proc_arg(
@@ -429,5 +570,51 @@ pub fn register(interp: &mut Interp) {
         let p = proc_arg(i, &a[0])?;
         let live = p.borrow_mut().live();
         Ok(Value::bool(live, i.syms.t))
+    });
+    // M104: `(call-process-string PROGRAM ARGS INPUT &optional
+    // TIMEOUT-MS DIR)` -> `(EXIT-CODE STDOUT STDERR)`. Synchronous --
+    // see `call_process_string`'s doc comment above for why this blocks
+    // the editor and why that's an acceptable trade for its intended
+    // use (save-time formatting), unlike the async `start-shell-process`
+    // family above. DIR (M104 fix round) is the directory to spawn
+    // PROGRAM in; omitted or nil inherits the editor's own current
+    // directory, the pre-fix-round behavior -- see `call_process_string`'s
+    // own doc comment for why a caller like `format--clang-args' needs
+    // to pass this explicitly rather than relying on the default.
+    defun(interp, "call-process-string", 3, Some(5), |i, a| {
+        let program = need_str(i, &a[0])?.to_string();
+        let args: Vec<String> = match &a[1] {
+            Value::Nil => Vec::new(),
+            v => match v.list_to_vec() {
+                Some(items) => items
+                    .iter()
+                    .map(|item| need_str(i, item).map(|s| s.to_string()))
+                    .collect::<Result<Vec<String>, crate::error::Flow>>()?,
+                None => return Err(i.wrong_type("listp", v)),
+            },
+        };
+        let input = need_str(i, &a[2])?.to_string();
+        let timeout_ms = match a.get(3) {
+            None | Some(Value::Nil) => 5000,
+            Some(v) => {
+                let n = crate::builtins::need_int(i, v)?;
+                if n < 0 {
+                    0
+                } else {
+                    n as u64
+                }
+            }
+        };
+        let dir = match a.get(4) {
+            None | Some(Value::Nil) => None,
+            Some(v) => Some(need_str(i, v)?.to_string()),
+        };
+        let (code, stdout, stderr) =
+            call_process_string(&program, &args, &input, timeout_ms, dir.as_deref());
+        Ok(Value::list(vec![
+            Value::Int(code as i64),
+            Value::string(stdout),
+            Value::string(stderr),
+        ]))
     });
 }

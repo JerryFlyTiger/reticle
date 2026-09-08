@@ -127,13 +127,91 @@ stays up until the user actually answers."
   (goto-char (point-min))
   (forward-line (1- n)))
 
-(defun split-window-below ()
-  (interactive)
-  (split-window-internal nil))
+(defun split-window--report (result)
+  "Shared tail for `split-window-below'/`split-window-right': echo the
+message matching RESULT, the raw return of `split-window-internal'
+(builtins/ui.rs), which distinguishes two different failure causes
+that both used to collapse into one misleading \"Window too small to
+split\" message (M102 fix round, cold-review): `nil' means the window
+itself has no room for any split; the symbol `bad-size' means the
+window is big enough but the given SIZE argument doesn't fit
+`[WINDOW_MIN_HEIGHT/WIDTH, avail - WINDOW_MIN_HEIGHT/WIDTH]'. `t'
+means success -- nothing to echo."
+  (cond
+   ((eq result 'bad-size) (message "Invalid window size"))
+   ((not result) (message "Window too small to split"))))
 
-(defun split-window-right ()
+(defun split-window-below (&optional size)
+  "Split the selected window into two, one above the other. SIZE, if
+given, is the number of lines given to the upper (original) window;
+otherwise the split is even. Does nothing but echo a message if the
+split can't happen (M102): either the selected window itself is too
+small, or SIZE doesn't leave room for both windows to keep the
+minimum size.
+
+This editor has no `universal-argument'/`C-u' yet (see commands.rs:
+the `p'/`P' interactive codes always evaluate to 1/nil regardless of
+any prefix keys typed before a command), so SIZE can only be supplied
+by calling this function from elisp directly, e.g. `(split-window-below
+10)' -- `C-x 2' always splits evenly."
+  (interactive "P")
+  (split-window--report (split-window-internal nil size)))
+
+(defun split-window-right (&optional size)
+  "Split the selected window into two, side by side. SIZE, if given, is
+the number of columns given to the left (original) window; otherwise
+the split is even. Does nothing but echo a message if the split can't
+happen (M102): either the selected window itself is too small, or
+SIZE doesn't leave room for both windows to keep the minimum size.
+
+This editor has no `universal-argument'/`C-u' yet (see commands.rs:
+the `p'/`P' interactive codes always evaluate to 1/nil regardless of
+any prefix keys typed before a command), so SIZE can only be supplied
+by calling this function from elisp directly, e.g. `(split-window-right
+10)' -- `C-x 3' always splits evenly."
+  (interactive "P")
+  (split-window--report (split-window-internal t size)))
+
+;; --- M102: window resizing ---
+
+(defun enlarge-window (&optional n)
+  "Make the selected window N lines taller (shrinking a neighboring
+window by the same amount). N defaults to 1; a negative N shrinks.
+
+This editor has no `universal-argument'/`C-u' yet (see commands.rs:
+the `p'/`P' interactive codes always evaluate to 1/nil, regardless of
+any prefix keys typed before a command), so a single `C-x ^' keypress
+always moves by exactly one line -- a larger N can only be supplied by
+calling this function from elisp directly, e.g. `(enlarge-window 5)'."
+  (interactive "p")
+  (unless (window-resize-selected (or n 1) nil)
+    (message "Cannot resize a single window")))
+
+(defun shrink-window (&optional n)
+  "Make the selected window N lines shorter (growing a neighboring
+window by the same amount). N defaults to 1."
+  (interactive "p")
+  (unless (window-resize-selected (- (or n 1)) nil)
+    (message "Cannot resize a single window")))
+
+(defun enlarge-window-horizontally (&optional n)
+  "Make the selected window N columns wider (shrinking a neighboring
+window by the same amount). N defaults to 1; a negative N shrinks."
+  (interactive "p")
+  (unless (window-resize-selected (or n 1) t)
+    (message "Cannot resize a single window")))
+
+(defun shrink-window-horizontally (&optional n)
+  "Make the selected window N columns narrower (growing a neighboring
+window by the same amount). N defaults to 1."
+  (interactive "p")
+  (unless (window-resize-selected (- (or n 1)) t)
+    (message "Cannot resize a single window")))
+
+(defun balance-windows ()
+  "Make all windows in the current layout the same size (M102)."
   (interactive)
-  (split-window-internal t))
+  (window-balance))
 
 (defun isearch-forward ()
   (interactive)
@@ -238,10 +316,12 @@ line that starts with an open parenthesis."
 ;;   never `dispatch_key', so `describe-key' run from inside a minibuffer
 ;;   read would report on the buffer BEHIND it, not the minibuffer's own
 ;;   bindings -- there is no minibuffer-local keymap to report on either.
-;; - `*Help*' REPLACES the current window rather than splitting to show
-;;   both -- `switch-to-buffer-internal' and `split-window-internal' have
-;;   never been combined anywhere else in this editor, and wiring that up
-;;   is a new feature, not a v1 requirement here.
+;; - (M103, was here, now fixed) `*Help*' used to REPLACE the current
+;;   window rather than splitting to show both. `describe-bindings'
+;;   below now goes through `pop-to-buffer' (window.el), which splits
+;;   (or reuses an existing window) instead of overwriting -- see
+;;   window.el's own header for the full design and its one remaining
+;;   gap (no user-configurable display policy).
 ;; - A single "Major mode / Minor mode" split in `describe-bindings':
 ;;   every minor-mode-style keymap installed via `local-set-key' is
 ;;   flattened into the SAME buffer-local `local' keymap as the major
@@ -344,13 +424,55 @@ ORIGINAL starting point instead of just the last hop."
   (or quit-source (current-buffer)))
 
 (defun quit-source-return ()
-  "Switch to the current buffer's `quit-source', or `*scratch*' if that
-buffer no longer exists (killed, or never set)."
+  "Leave the current buffer, restoring whatever was on screen before it
+was shown.
+
+M103: window-aware. If the SELECTED window itself was created by
+`display-buffer' splitting a window to make room for it
+(`window-created-for-display-p', ui.rs -- a per-WINDOW flag, see
+`Window::created_for_display''s own doc comment in editor.rs), `q'
+deletes that window (`delete-window') instead of switching a buffer,
+restoring the pre-split layout. Otherwise (the buffer was shown by
+reusing an already-existing window, or there is only one window left
+so there is nothing to delete): the pre-M103 behavior -- switch to the
+current buffer's `quit-source', or `*scratch*' if that buffer no
+longer exists (killed, or never set).
+
+Two real bugs, and a model correction, are folded into this simple
+shape (M103's third fix round; see PLAN.md's M103 record for the full
+history): this used to check a BUFFER-LOCAL flag
+(`window--created-for-display') instead of a per-window one, which
+could not tell apart two windows showing the same buffer -- exactly
+the situation a plain `C-x 2'/`C-x 3' split, or a `C-x b' switch into
+an already-displayed buffer, produces. That version had to choose
+between two failure modes depending on how its condition was written:
+either it deleted whichever window the flag happened to name even when
+the user was looking at a DIFFERENT window showing the same buffer
+(first repro: `C-h b' splits off B for `*Help*'; `C-x 2' from B clones
+it into C; `C-x o' to C; `q' must close C, not jump to B and delete
+that), or it deleted a window the mechanism never created at all
+(second repro: `C-h b' splits off B for `*Help*'; `C-x o' back to the
+ORIGINAL window A; `C-x b' switches A's buffer to `*Help*' directly,
+bypassing `display-buffer' entirely; `q' with A selected must not
+delete A). No condition on a single buffer-local flag can satisfy both
+repros at once, because the flag cannot distinguish which of two
+windows sharing a buffer is the one THIS mechanism is responsible for.
+Moving the flag onto `Window' itself removes the ambiguity: neither
+C (a plain split) nor A (a plain buffer switch) is EVER flagged,
+regardless of what buffer they show, so \"delete the window I created\"
+and \"delete the window being looked at\" collapse into the same
+window whenever there is one to delete, and into NO deletion
+(fall through to the plain buffer-switch below) whenever there isn't
+-- which is also what GNU does for a window with no `quit-restore'
+parameter."
   (interactive)
-  (let ((target (if (and quit-source (memq quit-source (buffer-list)))
-                     quit-source
-                   "*scratch*")))
-    (switch-to-buffer-internal target)))
+  (if (and (window-created-for-display-p (selected-window))
+           (> (window-count) 1))
+      (delete-window)
+    (let ((target (if (and quit-source (memq quit-source (buffer-list)))
+                       quit-source
+                     "*scratch*")))
+      (switch-to-buffer-internal target))))
 
 (defun help-quit ()
   "Leave `*Help*', returning to wherever `describe-bindings' was called
@@ -448,7 +570,13 @@ See this file's M67 header note for what this does NOT cover."
              (help--format-layer
               "Global keymap:"
               global (append emulation-descs local-descs)))))
-      (switch-to-buffer-internal "*Help*")
+      ;; M103: `pop-to-buffer', not `switch-to-buffer-internal' -- splits
+      ;; a window for `*Help*' (or reuses one already showing it/the
+      ;; window after selected) instead of overwriting whatever the user
+      ;; was editing. See window.el's header for why this editor selects
+      ;; the new window (unlike GNU's own `display-buffer'-based callers
+      ;; for `*Help*').
+      (pop-to-buffer "*Help*")
       (setq-local quit-source source)
       (major-mode-internal-set 'help-mode)
       (let ((map (make-sparse-keymap)))
@@ -481,6 +609,139 @@ redisplay.rs's current-line-highlight block, keyed off the `hl-line'
 face). A plain global toggle, not buffer-local. On by default since
 M32 (M16 originally shipped it off); add `(setq hl-line-mode nil)' to
 init.el to turn it back off.")
+
+;; --- M113: matching-bracket highlighting (GNU's show-paren-mode) ---
+
+(defvar show-paren-mode t
+  "Non-nil highlights the bracket pair adjacent to point (`show-paren-
+match' face), matching GNU Emacs's default adjacency rule: triggers
+when the character immediately AFTER point is an opener, or the one
+immediately BEFORE point is a closer — never when point sits just
+inside a bracket instead of facing it (verified against real
+`emacs -Q --batch`, see the M113 report). An unmatched bracket
+highlights nothing (GNU instead shows it alone in a mismatch face;
+this project has no such face, so this is a deliberate divergence, not
+an oversight — see redisplay.rs's paren-highlight block).
+
+A plain global toggle, not buffer-local, same convention as `hl-line-
+mode' just above — this depends on the background highlight engine's
+cached parse (highlight.rs's `Engine::matching_pair'), so it only ever
+does anything in a buffer that engine is running for, same as
+`rainbow-delimiters-mode', but the TOGGLE itself is global because
+matching brackets is exactly as useful in every language as
+current-line highlighting is, not a per-major-mode decorative choice.
+On by default: the editor comparisons this milestone exists to answer
+(VS Code, JetBrains) both ship it on. Add `(setq show-paren-mode nil)'
+to init.el to turn it back off.")
+
+;; --- M116: trailing whitespace, fill-column ruler (GNU's own names) ---
+
+(defvar show-trailing-whitespace nil
+  "Buffer-local (GNU's own name/semantics). Non-nil highlights whitespace
+at the end of a line (space/tab immediately before the newline or
+buffer end) with the `trailing-whitespace' face — see redisplay.rs's
+trailing-whitespace block. Lives in the grid rather than the GUI paint
+pass so the TUI gets it too: trailing whitespace is exactly as invisible
+in a terminal as in a graphical window, and the grid is the one thing
+both frontends already read.
+
+GNU defaults this off. This project defaults it ON for `prog-mode'
+buffers instead (`prog-mode-hook', modes.el) — same buffer-local-
+default-on-for-prog-buffers convention as `rainbow-delimiters-mode' and
+`display-line-numbers'. The divergence: this project's target user is
+an RTL engineer whose linter (verible) rejects trailing whitespace
+outright, so showing it by default is the useful behavior here, not a
+cosmetic default GNU just happens to ship differently.
+
+Exclusion (verified against the real `emacs -Q --batch'/info manual
+installed at `/opt/homebrew/bin/emacs', not assumed): GNU's manual
+states this feature \"does not apply when point is at the end of the
+line containing the whitespace\" — a narrower rule than \"point is
+anywhere on that line\". This project follows the exact rule observed:
+only the specific line where point sits AT its end (`point' equals that
+line's end position, not merely equal to that line's number) is
+exempted, so trailing whitespace elsewhere on point's own line (e.g.
+point moved to column 0 with `C-a') still highlights. The reason GNU
+gives, and this project's behavior shares: skipping this narrow case
+avoids the highlight flashing on and off while typing new text at the
+end of a line.")
+
+(defvar fill-column 100
+  "Buffer-local (GNU's own name/semantics). The column
+`display-fill-column-indicator-mode' draws its ruler at — read via the
+same buffer-local-aware path as every other per-buffer redisplay
+toggle (`fill-column-indicator' block, frontend-gui/src/lib.rs).
+
+GNU defaults this to 70, a prose line-length convention going back to
+`auto-fill-mode'. This project defaults it to 100 instead: the target
+user is an RTL engineer, and 100 is `verible''s own default
+`--line_length' limit (see `demo/tools/lint_rtl.sh') — the number that
+actually means something for Verilog/SystemVerilog as this project's
+users write it, not GNU's prose-oriented number.")
+
+(defvar display-fill-column-indicator-mode nil
+  "Buffer-local (GNU's own name). Non-nil draws a 1-device-px vertical
+rule at column `fill-column' (`fill-column-indicator' face). GUI only —
+follows the same column-to-pixel code as the indent guides
+(`indent_guide_columns' in frontend-gui/src/lib.rs, itself GUI-only for
+the same reason: the TUI has no graphical-rule primitive to draw one
+with, only character cells).
+
+Same buffer-local-default-on-for-prog-buffers convention as
+`rainbow-delimiters-mode', turned on by `prog-mode-hook' (modes.el).
+GNU defaults this off; this project defaults it ON for `prog-mode'
+buffers instead — a ruler nobody discovers by reading `M-x' menus is a
+ruler nobody uses, and the whole point of adding this alongside
+trailing-whitespace and the ligature toggle in the same milestone is
+that a feature which exists but cannot be seen might as well not
+exist.")
+
+;; --- M118: sticky scope header + scope breadcrumb ---
+
+(defvar scope-header t
+  "Global. Non-nil pins the source line of each construct enclosing
+point at the top of its window, once that construct's own opening line
+has scrolled off screen — VS Code's \"sticky scroll\". Up to
+`scope-header-max-lines' rows, outermost first, innermost kept when the
+enclosing chain is deeper than that. Fed by `highlight.rs''s
+`Engine::scope_chain', itself built from `scope.rs''s per-language
+node-kind tables (Verilog first — see that file's header for exactly
+which construct kinds count as a scope per language).
+
+Painted as an overlay on top of the window's own top rows, after the
+normal text loop — it HIDES the buffer lines underneath rather than
+reserving space for them, and carries no syntax colouring of its own
+(a single uniform `scope-header' face). Both are deliberate v1 limits,
+not oversights: reserving real row budget for a non-buffer row would
+require teaching the scroll/recenter machinery a concept it does not
+have anywhere else in this codebase (see PLAN.md's M87 stage 3 record
+for why that was rejected as a permanent version of an already-
+occasional gap).")
+
+(defvar scope-header-max-lines 3
+  "Global. Cap on how many rows `scope-header' pins at once — see that
+variable's doc. When the chain enclosing point is deeper than this,
+the INNERMOST constructs are kept (the immediately enclosing one is
+the useful one), not the outermost.")
+
+(defvar scope-breadcrumb t
+  "Global. Non-nil shows the full chain of constructs enclosing point
+as a mode-line segment, `[outer > ... > inner]' — e.g.
+`[soc_top > always_ff > case]'. Lowest priority of every mode-line
+segment (`compose_mode_line', redisplay.rs): dropped before the
+diagnostic count, the mode name, the LSP indicator, and the directory
+segment, all of which are checked (and kept) ahead of it once the
+window gets narrow.
+
+Deliberate divergence from GNU's `which-function-mode' (verified
+against real `emacs -Q --batch', not assumed): GNU shows only the
+INNERMOST name as `[name]', and shows the literal string \"n/a\" when
+it cannot tell. This project shows the FULL path instead, and shows
+NOTHING AT ALL rather than \"n/a\" when the chain is empty — the
+segment is already dropped under width pressure, so an \"unknown\"
+placeholder would be noise in exactly the buffers (plain text, no
+grammar) where it is permanently unknown, not an occasional state
+worth flagging.")
 
 ;; --- M28: evil-mode integration foundation ---
 
@@ -611,6 +872,13 @@ init.el to turn it back off.")
 (global-set-key "C-c l r" 'lsp-rename)
 (global-set-key "C-c l f" 'lsp-format-buffer)
 (global-set-key "C-c l F" 'lsp-format-region)
+;; M104: style-selectable formatting, dispatching per-mode to either LSP
+;; or an external formatter (format.el) -- distinct from "C-c l f/F"
+;; above, which always go straight to LSP with no style choice and no
+;; external-process fallback.
+(global-set-key "C-c f f" 'format-buffer)
+(global-set-key "C-c f r" 'format-region)
+(global-set-key "C-c f s" 'format-set-style)
 (global-set-key "C-c l s" 'lsp-goto-symbol-by-name)
 (global-set-key "C-c l n" 'lsp-next-symbol)
 (global-set-key "C-c l p" 'lsp-previous-symbol)
@@ -628,6 +896,13 @@ init.el to turn it back off.")
 (global-set-key "C-x o" 'other-window)
 (global-set-key "C-x 0" 'delete-window)
 (global-set-key "C-x 1" 'delete-other-windows)
+
+;; M102: window resizing. GNU has no default binding for
+;; `shrink-window'; it's still reachable via M-x here.
+(global-set-key "C-x ^" 'enlarge-window)
+(global-set-key "C-x }" 'enlarge-window-horizontally)
+(global-set-key "C-x {" 'shrink-window-horizontally)
+(global-set-key "C-x +" 'balance-windows)
 
 (global-set-key "C-s" 'isearch-forward)
 (global-set-key "C-r" 'isearch-backward)

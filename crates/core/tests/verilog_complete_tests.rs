@@ -111,6 +111,89 @@ fn insert_names(items: &[(String, String, usize, String)]) -> Vec<String> {
     items.iter().map(|it| it.1.clone()).collect()
 }
 
+/// Same column-padding algorithm `verilog-auto--pad-to-column' uses
+/// (also mirrored by `verilog_auto_tests.rs`'s own `pad' helper),
+/// reused here so the M123 Part C tests below pin the REAL
+/// `.NAME(EXPR)' alignment `verilog-complete--instantiate-item'
+/// produces, rather than a hand-typed guess at the spacing.
+fn pad(s: &str, col: usize, offset: usize) -> String {
+    let n = (col as isize - (offset + s.len()) as isize).max(1) as usize;
+    format!("{}{}", s, " ".repeat(n))
+}
+
+/// One `.NAME(EXPR)' line, exactly as `verilog-complete--instantiate-
+/// port-line'/`--instantiate-param-line' build it: CONT_INDENT, then
+/// `.NAME' padded to column 40 (`verilog-auto-inst-column'), then
+/// `(EXPR)'.
+fn instantiate_line(cont_indent: &str, name: &str, expr: &str) -> String {
+    format!(
+        "{}{}({})",
+        cont_indent,
+        pad(&format!(".{}", name), 40, cont_indent.len()),
+        expr
+    )
+}
+
+/// A port connection line specifically -- EXPR is always the port's
+/// own NAME (see `verilog-complete--instantiate-port-line's own
+/// docstring for why).
+fn instantiate_conn_line(cont_indent: &str, name: &str) -> String {
+    instantiate_line(cont_indent, name, name)
+}
+
+/// Every double-quoted substring in S, in order -- used to pull plain
+/// string values (port/parameter names, defaults) back out of
+/// `prin1_to_string' output for a list this test asked the SAME
+/// readers `verilog-complete--instantiate-item' itself calls
+/// (`verilog-complete--module-ports'/`--module-parameters') to
+/// compute, without this test re-implementing a second, independent
+/// Verilog port/parameter parser of its own just to build an
+/// expectation.
+fn extract_quoted(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut tok = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                tok.push(c2);
+            }
+            out.push(tok);
+        }
+    }
+    out
+}
+
+/// Expected `insert` text for M123 Part C's "instantiate" item, for a
+/// parameterless module NAME whose statement sits at STMT_INDENT, with
+/// PORTS given as bare port names in declaration order (each port's
+/// own connection expression is always its own name -- see
+/// `verilog-complete--instantiate-port-line's own docstring for why).
+/// PORTS empty produces the degenerate `NAME u_NAME ();' shape this
+/// milestone's own zero-port test pins.
+fn expected_instantiate_text(name: &str, stmt_indent: &str, ports: &[&str]) -> String {
+    let cont_indent = format!("{}  ", stmt_indent);
+    let inst_name = format!("u_{}", name);
+    if ports.is_empty() {
+        format!("{} {} ();", name, inst_name)
+    } else {
+        let lines: Vec<String> = ports
+            .iter()
+            .map(|p| instantiate_conn_line(&cont_indent, p))
+            .collect();
+        format!(
+            "{} {} (\n{}\n{});",
+            name,
+            inst_name,
+            lines.join(",\n"),
+            stmt_indent
+        )
+    }
+}
+
 /// Moves point to right after the FIRST (from `point-min`) occurrence of
 /// NEEDLE, via `search-forward` -- real Emacs point semantics, sidesteps
 /// any manual byte-offset-vs-1-based-point arithmetic entirely.
@@ -930,12 +1013,21 @@ fn module_name_completes_from_library_file() {
     let r = run(&mut i, "(verilog-complete-at-point)");
     assert_eq!(r, "t", "instantiation type-name position: {}", r);
     let items = popup_items(&ed).expect("popup must open");
-    let names = insert_names(&items);
+    // M123 Part C: this handler now offers a SECOND item per matching
+    // module -- the plain-name item's own insert string (element 0) is
+    // pinned exactly as before this milestone (byte-for-byte the same
+    // string the pre-M123 assertion checked), and element 1 is the new
+    // "instantiate" item's own full skeleton, pinned exactly too (the
+    // module has exactly one port and no parameters -- the degenerate
+    // case this milestone's own spec asked to pin).
     assert_eq!(
-        names,
-        vec!["fifo".to_string()],
-        "must offer the library module, matched by the typed prefix \"fif\": {:?}",
-        names
+        insert_names(&items),
+        vec![
+            "fifo".to_string(),
+            expected_instantiate_text("fifo", "  ", &["wr"])
+        ],
+        "element 0 (plain name) unchanged, element 1 the new instantiate skeleton: {:?}",
+        items
     );
     assert!(
         items[0].0.contains("sub.sv"),
@@ -954,12 +1046,17 @@ fn module_name_completes_from_same_buffer() {
     let r = run(&mut i, "(verilog-complete-at-point)");
     assert_eq!(r, "t", "instantiation type-name position: {}", r);
     let items = popup_items(&ed).expect("popup must open");
-    let names = insert_names(&items);
+    // M123 Part C: same shape as `module_name_completes_from_library_
+    // file' above -- element 0 is the pre-existing plain-name insert
+    // string, unchanged; element 1 is the new instantiate skeleton.
     assert_eq!(
-        names,
-        vec!["fifo".to_string()],
-        "must offer the SAME-buffer module too, not just library files: {:?}",
-        names
+        insert_names(&items),
+        vec![
+            "fifo".to_string(),
+            expected_instantiate_text("fifo", "  ", &["wr"])
+        ],
+        "must offer the SAME-buffer module too, not just library files, plus its instantiate item: {:?}",
+        items
     );
     assert!(
         !items[0].0.contains('('),
@@ -1264,9 +1361,15 @@ endmodule
             src, needle, r
         );
         let items = popup_items(&ed).expect("popup must open");
+        // M123 Part C: element 0 is the pre-existing plain-name insert
+        // string, unchanged; element 1 is the new instantiate
+        // skeleton (each of these three modules has one port, "x").
         assert_eq!(
             insert_names(&items),
-            vec![expected.to_string()],
+            vec![
+                expected.to_string(),
+                expected_instantiate_text(expected, "  ", &["x"])
+            ],
             "src={:?}",
             src
         );
@@ -1323,7 +1426,15 @@ endmodule
     let r = run(&mut i, "(verilog-complete-at-point)");
     assert_eq!(r, "t", "a real module DOES match \"cnt\": {}", r);
     let items = popup_items(&ed).expect("popup must open");
-    assert_eq!(insert_names(&items), vec!["cnt_fifo".to_string()]);
+    // M123 Part C: element 0 is the pre-existing plain-name insert
+    // string, unchanged; element 1 is the new instantiate skeleton.
+    assert_eq!(
+        insert_names(&items),
+        vec![
+            "cnt_fifo".to_string(),
+            expected_instantiate_text("cnt_fifo", "  ", &["wr"])
+        ]
+    );
 }
 
 // ============================================================
@@ -1415,7 +1526,17 @@ endmodule
         r
     );
     let items = popup_items(&ed).expect("popup must open");
-    assert_eq!(insert_names(&items), vec!["fifo".to_string()]);
+    // M123 Part C: element 0 is the pre-existing plain-name insert
+    // string, unchanged; element 1 is the new instantiate skeleton.
+    // The "fif" line sits 6 spaces in (module -> generate -> if ->
+    // begin, 2 spaces per level).
+    assert_eq!(
+        insert_names(&items),
+        vec![
+            "fifo".to_string(),
+            expected_instantiate_text("fifo", "      ", &["wr"])
+        ]
+    );
 }
 
 #[test]
@@ -1851,4 +1972,203 @@ fn manual_e2e_verible_capability_gate_falls_to_dabbrev_at_a_non_port_position() 
 
     ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
     println!("PASS: verible-verilog-ls e2e -- capability gate blocks LSP, falls to dabbrev");
+}
+
+// ============================================================
+// M123 Part C: "instantiate" items
+// ============================================================
+
+#[test]
+fn instantiate_item_for_a_real_demo_rtl_module_with_parameters_and_many_ports() {
+    // Real project material (`demo/rtl/mem/sram_bank.sv'), per this
+    // project's own "use what's here first" rule -- not a hand-typed
+    // fixture. `verilog-library-directories' points straight at its
+    // own directory so it resolves as a LIBRARY module, the same
+    // resolution path `verilog-complete--library-ports'/`--library-
+    // parameters' already exercise elsewhere in this file.
+    //
+    // The expected skeleton text is built from the SAME readers
+    // `verilog-complete--instantiate-item' itself calls
+    // (`verilog-complete--module-ports'/`--module-parameters'), not a
+    // second, independent Verilog parser written just for this test --
+    // this test is checking the WIRING from those readers to the
+    // generated snippet text, not re-deriving port/parameter ground
+    // truth from the .sv file's own syntax by hand.
+    let path = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/rtl/mem/sram_bank.sv"
+    ));
+    assert!(
+        path.exists(),
+        "demo/rtl/mem/sram_bank.sv must exist: {:?}",
+        path
+    );
+    let dir = path.parent().unwrap().to_str().unwrap().to_string();
+
+    let (mut i, ed) = setup();
+    insert_src(&mut i, "module top;\n  sram_ban\nendmodule\n");
+    ok(&mut i, "(verilog-mode)");
+    ok(
+        &mut i,
+        &format!("(setq-local verilog-library-directories (list {:?}))", dir),
+    );
+
+    let port_names = extract_quoted(&ok(
+        &mut i,
+        "(mapcar (function car) (verilog-complete--module-ports \"sram_bank\"))",
+    ));
+    let param_names = extract_quoted(&ok(
+        &mut i,
+        "(mapcar (function car) (verilog-complete--module-parameters \"sram_bank\"))",
+    ));
+    let param_defaults = extract_quoted(&ok(
+        &mut i,
+        "(mapcar (function cadr) (verilog-complete--module-parameters \"sram_bank\"))",
+    ));
+    assert!(
+        port_names.len() > 10,
+        "sanity: sram_bank has many ports, got {:?}",
+        port_names
+    );
+    assert_eq!(
+        param_names,
+        vec!["NumBanks".to_string(), "AddrWidth".to_string()]
+    );
+    assert_eq!(param_defaults, vec!["4".to_string(), "12".to_string()]);
+
+    goto_after(&mut i, "  sram_ban");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "sram_bank must match the typed prefix: {}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    assert_eq!(
+        items.len(),
+        2,
+        "one matching module -> plain item + instantiate item: {:?}",
+        items
+    );
+    assert_eq!(items[0].1, "sram_bank", "plain-name item unchanged");
+
+    let indent = "  ";
+    let cont_indent = "    ";
+    // RAW (pre-expansion) param lines carry real `${N:DEFAULT}' tab-
+    // stop syntax -- see `verilog-complete--instantiate-param-line's
+    // own docstring; the EXPANDED form (what the popup's `insert'
+    // field actually carries) has each `${N:DEFAULT}' replaced by its
+    // own bare DEFAULT text, exactly what `lsp--expand-snippet' does
+    // for an ordinary (non-`$0') stop.
+    let raw_param_lines: Vec<String> = param_names
+        .iter()
+        .zip(param_defaults.iter())
+        .enumerate()
+        .map(|(idx, (n, d))| instantiate_line(cont_indent, n, &format!("${{{}:{}}}", idx + 1, d)))
+        .collect();
+    let expanded_param_lines: Vec<String> = param_names
+        .iter()
+        .zip(param_defaults.iter())
+        .map(|(n, d)| instantiate_line(cont_indent, n, d))
+        .collect();
+    let port_lines: Vec<String> = port_names
+        .iter()
+        .map(|n| instantiate_conn_line(cont_indent, n))
+        .collect();
+    let raw_expected = format!(
+        "sram_bank #(\n{}\n{}) ${{0:u_sram_bank}} (\n{}\n{});",
+        raw_param_lines.join(",\n"),
+        indent,
+        port_lines.join(",\n"),
+        indent
+    );
+    let expanded_expected = format!(
+        "sram_bank #(\n{}\n{}) u_sram_bank (\n{}\n{});",
+        expanded_param_lines.join(",\n"),
+        indent,
+        port_lines.join(",\n"),
+        indent
+    );
+    // The RAW snippet (pre-expansion) is what `verilog-complete--
+    // instantiate-snippet' builds -- reproduce it here via the same
+    // function to pin the exact text this milestone's own generator
+    // produces, then confirm `lsp--expand-snippet' (Part B, already
+    // its own independently-tested unit) turns it into the SAME final
+    // `insert' the popup carries.
+    let raw = ok(
+        &mut i,
+        "(verilog-complete--instantiate-snippet \"sram_bank\" (verilog-complete--module-ports \"sram_bank\") (verilog-complete--module-parameters \"sram_bank\") \"  \")",
+    );
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .map(|s| s.replace("\\n", "\n").replace("\\\"", "\""))
+        .unwrap_or(raw.clone());
+    assert_eq!(
+        raw, raw_expected,
+        "raw snippet text must match this test's own expectation"
+    );
+
+    assert_eq!(
+        items[1].1, expanded_expected,
+        "instantiate item's `insert' must be the raw snippet with every tab stop expanded"
+    );
+    assert_eq!(
+        items[1].0,
+        format!("sram_bank  (instantiate, {} ports)", port_names.len())
+    );
+
+    // Cursor lands right at the default instance name -- payload isn't
+    // observable via `popup_items' (label/insert/start/filter only), so
+    // read `PopupItem::payload' directly off `Editor::completion_popup'.
+    let payload = ed.borrow().completion_popup.as_ref().unwrap().items[1]
+        .payload
+        .clone();
+    let offset = payload
+        .as_deref()
+        .and_then(|p| p.strip_prefix("offset:"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .expect("instantiate item must carry an `offset:N' payload (the `$0' stop)");
+    assert!(
+        items[1].1[offset..].starts_with("u_sram_bank"),
+        "offset must point right at the default instance name: {} / {}",
+        offset,
+        items[1].1
+    );
+}
+
+#[test]
+fn instantiate_item_for_a_zero_port_zero_parameter_module_offers_an_empty_shell() {
+    // M123 Part C's own documented decision (see `verilog-complete.el'
+    // -- the "M123 Part C: instantiate items" section header): a
+    // module that resolves but declares no ports and no `#(parameter
+    // ...)' header is OFFERED, not suppressed, degenerating to `NAME
+    // ${0:u_NAME} ();'. Pins that decision as an executable fact
+    // rather than leaving it only stated in a comment.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  emp\nendmodule\n\nmodule empty_mod;\nendmodule\n";
+    insert_src(&mut i, src);
+    ok(&mut i, "(verilog-mode)");
+    goto_after(&mut i, "  emp");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "empty_mod must match the typed prefix: {}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    assert_eq!(
+        insert_names(&items),
+        vec![
+            "empty_mod".to_string(),
+            "empty_mod u_empty_mod ();".to_string()
+        ],
+        "a zero-port module is offered as an empty-shell instantiation, not suppressed: {:?}",
+        items
+    );
+    assert_eq!(
+        items[1].0, "empty_mod  (instantiate, 0 ports)",
+        "label states zero ports plainly rather than hiding the degenerate case: {}",
+        items[1].0
+    );
+    let payload = ed.borrow().completion_popup.as_ref().unwrap().items[1]
+        .payload
+        .clone();
+    assert!(
+        payload.as_deref().unwrap_or("").starts_with("offset:"),
+        "even the empty-shell skeleton carries a `$0' cursor stop at the instance name: {:?}",
+        payload
+    );
 }

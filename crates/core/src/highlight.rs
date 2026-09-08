@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use elisp::{Interp, Value};
 
 use crate::buffer::{Buffer, OverlayData};
+use crate::scope::Scope;
 use crate::treesit::Lang;
 
 /// Snapshot age before it is sent to the parser thread. Continuous
@@ -63,7 +64,28 @@ struct Res {
     key: usize,
     gen: u64,
     spans: Vec<Span>,
+    /// M113 (show-paren-mode): (open_char_pos, close_char_pos) for every
+    /// bracket pair `collect_rainbow_spans` matched during this same
+    /// tree walk -- both positions are always exactly one char wide (a
+    /// literal `(`/`[`/`{`/`)`/`]`/`}` token), so there is no separate
+    /// end to carry. Riding the same worker pass as `spans` means point
+    /// never has to trigger a reparse: this list only changes when the
+    /// text does, and the per-frame part (which pair, if any, is
+    /// adjacent to point) is decided on the main thread by
+    /// `Engine::matching_pair`.
+    pairs: Vec<(usize, usize)>,
+    /// M118 (sticky scope header / breadcrumb): every scope-kind node in
+    /// this parse (`scope::is_scope_kind`), collected in the same
+    /// background-thread walk as `spans`/`pairs` -- see
+    /// `Engine::scope_chain`'s doc for the per-frame query this feeds
+    /// and its generation-guard contract.
+    scopes: Vec<Scope>,
 }
+
+/// A completed parse's generation, highlight spans, bracket pairs
+/// (M113), and scope-chain nodes (M118), bundled since they're always
+/// cached/replaced together.
+type Cached = (u64, Vec<Span>, Vec<(usize, usize)>, Vec<Scope>);
 
 struct BufState {
     buffer: Weak<RefCell<Buffer>>,
@@ -74,8 +96,11 @@ struct BufState {
     last_change: Instant,
     /// Generation of the job currently in flight, if any.
     in_flight: Option<u64>,
-    /// Cached spans from the last completed parse + their generation.
-    cached: Option<(u64, Vec<Span>)>,
+    /// Cached spans + bracket pairs from the last completed parse, plus
+    /// their generation (M113: the pairs are `Res::pairs`, cached
+    /// alongside spans so `Engine::matching_pair` never has to reparse
+    /// just because point moved).
+    cached: Option<Cached>,
     /// What's currently materialized: (generation, char range, whether
     /// `rainbow-delimiters-mode` was on for that materialization -- M37,
     /// see `apply_visible`).
@@ -121,6 +146,119 @@ impl Engine {
 
     pub fn is_enabled(&self, buffer: &Rc<RefCell<Buffer>>) -> bool {
         self.states.contains_key(&(Rc::as_ptr(buffer) as usize))
+    }
+
+    /// M113 (show-paren-mode): the bracket pair GNU Emacs would show for
+    /// `point` in `buffer`, or `None`. Matches GNU's default adjacency
+    /// rule (verified against real `emacs -Q --batch`, see the M113
+    /// report): triggers when the char immediately AFTER point is an
+    /// opener (`point == open`), or the char immediately BEFORE point is
+    /// a closer (`point == close + 1`) -- never when point merely sits
+    /// next to a bracket from the "inside" (just after an opener, or
+    /// just before a closer). An unmatched bracket is not in `pairs` at
+    /// all (`collect_rainbow_spans` only ever records a pair once its
+    /// closer is actually found), so this naturally returns `None` for
+    /// it -- deliberately NOT GNU's own behavior (real Emacs highlights
+    /// an unmatched bracket alone in a "mismatch" face); this project
+    /// has no mismatch face and the milestone spec calls for "nothing"
+    /// here, so this is a documented, intentional divergence.
+    ///
+    /// A linear scan of every pair in the buffer, not a hash lookup:
+    /// this runs once per frame per selected window (not once per
+    /// character), so its cost is O(pairs in the buffer) once per
+    /// render, not O(pairs) per cell.
+    pub fn matching_pair(
+        &self,
+        buffer: &Rc<RefCell<Buffer>>,
+        point: usize,
+    ) -> Option<(usize, usize)> {
+        let key = Rc::as_ptr(buffer) as usize;
+        let (gen, _, pairs, _) = self.states.get(&key)?.cached.as_ref()?;
+        // M113 review fix round: `cached` is the last COMPLETED parse,
+        // but the buffer's live `edit_ticks` can already have moved past
+        // it -- an edit bumps `edit_ticks` immediately; the worker only
+        // catches up a debounce-interval later. Between those two
+        // moments, `pairs`' char offsets describe text that no longer
+        // exists, and comparing them against the buffer's CURRENT point
+        // can coincidentally "match" a position that isn't a bracket at
+        // all anymore (reproduced: edit elsewhere in the buffer while
+        // point rests on an already-matched bracket -- the edit doesn't
+        // move point, so the stale coordinates keep "matching" until the
+        // reparse lands). Same generation check `treesit.rs`'s `parse`
+        // already uses for its own tree cache (`cached_gen == gen`);
+        // deliberately does NOT try to shift `pairs`' offsets to follow
+        // the edit -- see this method's test coverage
+        // (`show_paren_tests.rs`) for why "no highlight for one frame"
+        // is the correct answer, not "guess where the pair moved to".
+        if *gen != buffer.borrow().edit_ticks {
+            return None;
+        }
+        // `.find()` returns the FIRST match in `pairs`' own order, which
+        // is close-position ascending (see `collect_rainbow_spans`'
+        // ORDERING INVARIANT comment) -- load-bearing at a
+        // `"()()"`-style boundary where point sits exactly between one
+        // pair's closer and the next pair's opener, satisfying BOTH
+        // pairs' adjacency condition at once. Real GNU Emacs picks the
+        // earlier-closing pair there (verified against `emacs -Q
+        // --batch`); returning the first match is what reproduces that,
+        // and only continues to as long as `pairs` keeps coming out in
+        // that order.
+        pairs
+            .iter()
+            .copied()
+            .find(|&(open, close)| open == point || close + 1 == point)
+    }
+
+    /// M118 (sticky scope header / breadcrumb): constructs enclosing
+    /// `pos`, outermost first. Empty when the buffer has no parse, no
+    /// grammar, or a parse older than the buffer's current `edit_ticks`.
+    ///
+    /// Same shape as `matching_pair` above, including the generation
+    /// guard: an edit bumps `edit_ticks` immediately, but the worker only
+    /// catches up a debounce interval later, so `cached`'s scopes can
+    /// describe text that no longer exists for a short window. Returning
+    /// empty rather than trying to shift `Scope::start`/`end` to follow
+    /// the edit is the same tradeoff `matching_pair` documents at length
+    /// -- "no header/breadcrumb for one frame" is the correct answer,
+    /// not "guess where the enclosing construct moved to" (a stale
+    /// `Scope` pinning the wrong source line as a header row would be
+    /// actively misleading, worse than showing nothing).
+    pub fn scope_chain(&self, buffer: &Rc<RefCell<Buffer>>, pos: usize) -> Vec<Scope> {
+        let key = Rc::as_ptr(buffer) as usize;
+        let Some((gen, _, _, scopes)) = self.states.get(&key).and_then(|st| st.cached.as_ref())
+        else {
+            return Vec::new();
+        };
+        if *gen != buffer.borrow().edit_ticks {
+            return Vec::new();
+        }
+        // Half-open enclosure: `start <= pos && pos < end`. Point resting
+        // exactly AT a scope's own end (e.g. right on `endmodule`'s
+        // final char, or the char immediately after it) is treated as
+        // OUTSIDE that scope -- intentional, the same half-open
+        // convention this codebase already uses for spans elsewhere
+        // (buffer ranges throughout are `[start, end)`), not an
+        // oversight.
+        let mut chain: Vec<Scope> = scopes
+            .iter()
+            .filter(|s| s.start <= pos && pos < s.end)
+            .cloned()
+            .collect();
+        // Outermost first: ascending by start, and on a tie descending
+        // by end so the wider (outer) one sorts first -- defensive, not
+        // exercised by any known input. The comment this replaced cited
+        // a `module_declaration`/`module_ansi_header` tie as the
+        // motivating case, but `module_ansi_header` is not in
+        // `is_scope_kind` (`scope.rs`), so it never becomes a `Scope`
+        // and can never reach this comparator. No construct
+        // `is_scope_kind` currently accepts, for any language this
+        // module supports, is known to nest another accepted construct
+        // starting at the exact same char. Same honesty convention
+        // `treesit.rs`'s `incremental_parse` uses for its own
+        // known-unobservable length check: kept as defence against a
+        // grammar shape nobody has found yet, not claimed as covered.
+        chain.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        chain
     }
 }
 
@@ -251,12 +389,20 @@ fn worker(job_rx: mpsc::Receiver<Job>, res_tx: mpsc::Sender<Res>) {
         let Some(tree) = parser.parse(&job.text, None) else {
             continue;
         };
-        let spans = extract_spans(&job.text, &tree, query);
+        let (spans, pairs) = extract_spans(&job.text, &tree, query);
+        // M118: a separate, simpler walk than `extract_spans`'
+        // capture-query pass -- scopes are plain node-kind matches, not
+        // query captures, so there is no shared machinery to ride along
+        // with. Still only once per completed parse, on this same
+        // background thread, never per frame.
+        let scopes = crate::scope::collect_scopes(&tree, &job.text, job.lang);
         if res_tx
             .send(Res {
                 key: job.key,
                 gen: job.gen,
                 spans,
+                pairs,
+                scopes,
             })
             .is_err()
         {
@@ -265,7 +411,11 @@ fn worker(job_rx: mpsc::Receiver<Job>, res_tx: mpsc::Sender<Res>) {
     }
 }
 
-fn extract_spans(text: &str, tree: &tree_sitter::Tree, query: &tree_sitter::Query) -> Vec<Span> {
+fn extract_spans(
+    text: &str,
+    tree: &tree_sitter::Tree,
+    query: &tree_sitter::Query,
+) -> (Vec<Span>, Vec<(usize, usize)>) {
     use streaming_iterator::StreamingIterator;
     let mut cursor = tree_sitter::QueryCursor::new();
     // 4th element: `rainbow` (see `Span::rainbow`) -- false for every
@@ -282,7 +432,17 @@ fn extract_spans(text: &str, tree: &tree_sitter::Tree, query: &tree_sitter::Quer
     // M37: rainbow-delimiters -- a second pass, independent of the query
     // above (see `collect_rainbow_spans`), appended into the SAME `raw`
     // vec so it rides the byte->char conversion below for free.
-    collect_rainbow_spans(tree, &mut raw);
+    //
+    // M113 (show-paren-mode): the same walk also hands back
+    // `raw_pairs`, the (open_start_byte, close_start_byte) of every
+    // pair it actually matched. Both positions are always themselves
+    // entries `collect_rainbow_spans` already pushed into `raw` above
+    // (an opener's span is pushed the moment it's seen; a closer's only
+    // when it matches -- exactly the condition a pair is recorded
+    // under), so they are guaranteed already present in `boundaries`
+    // below with no separate pass needed.
+    let mut raw_pairs: Vec<(usize, usize)> = Vec::new();
+    collect_rainbow_spans(tree, &mut raw, &mut raw_pairs);
     // Convert all byte boundaries to char positions in one pass over the
     // text (boundaries sorted, walked with a single char_indices scan).
     let mut boundaries: Vec<usize> = raw.iter().flat_map(|&(s, e, _, _)| [s, e]).collect();
@@ -304,14 +464,25 @@ fn extract_spans(text: &str, tree: &tree_sitter::Tree, query: &tree_sitter::Quer
         byte_to_char.insert(boundaries[bi], total_chars);
         bi += 1;
     }
-    raw.into_iter()
+    let pairs: Vec<(usize, usize)> = raw_pairs
+        .into_iter()
+        .map(|(o, c)| {
+            (
+                byte_to_char.get(&o).copied().unwrap_or(0),
+                byte_to_char.get(&c).copied().unwrap_or(0),
+            )
+        })
+        .collect();
+    let spans = raw
+        .into_iter()
         .map(|(s, e, face, rainbow)| Span {
             start: byte_to_char.get(&s).copied().unwrap_or(0),
             end: byte_to_char.get(&e).copied().unwrap_or(0),
             face,
             rainbow,
         })
-        .collect()
+        .collect();
+    (spans, pairs)
 }
 
 /// `rainbow-delimiters-depth-{1..9}-face`, cycling every 9 nesting
@@ -423,13 +594,41 @@ fn rainbow_face(depth: i32) -> &'static str {
 /// up once error recovery is involved, covered by this codebase's own
 /// error-recovery fixtures (elisp and a second, structurally-distinct
 /// language, mirroring the shape that motivated this fix).
+/// `pairs` (M113, `show-paren-mode`): every (open_start_byte,
+/// close_start_byte) this same walk actually matched, pushed at the
+/// exact moment `top_matches` fires below -- the identical condition
+/// under which this function already colors both members the same
+/// rainbow depth. An opener that never finds its sibling closer (or is
+/// eagerly popped, see the doc comment above) never appears here, which
+/// is what makes `Engine::matching_pair` naturally report "no pair" for
+/// an unmatched bracket with no extra bookkeeping.
+///
+/// ORDERING INVARIANT (review fix round): `pairs` comes out sorted by
+/// CLOSE position ascending, because a pair is pushed at the exact
+/// moment its closer is visited by this DFS walk, and the walk visits
+/// every leaf token in left-to-right DOCUMENT order. `Engine::
+/// matching_pair`'s `.find()` relies on this to break the tie at a
+/// `"()()"`-style boundary (point sitting exactly between one pair's
+/// closer and the next pair's opener, so BOTH pairs' adjacency
+/// condition is satisfied) the same way real GNU Emacs does: the
+/// earlier-closing pair wins. If this function is ever rewritten to
+/// build `pairs` some other way (e.g. sorting by open position, or
+/// collecting per-subtree and concatenating), that tie-break silently
+/// flips unless the new code re-sorts by close position first --
+/// pinned by `show_paren_tests.rs`'s
+/// `tie_break_at_a_close_open_boundary_picks_the_earlier_closing_pair`.
 fn collect_rainbow_spans(
     tree: &tree_sitter::Tree,
     out: &mut Vec<(usize, usize, &'static str, bool)>,
+    pairs: &mut Vec<(usize, usize)>,
 ) {
-    // (parent node id, expected closer kind) per pending opener -- see the
-    // doc comment above.
-    let mut open: Vec<(usize, &'static str)> = Vec::new();
+    // (parent node id, expected closer kind, opener's own start byte,
+    // whether the OPENER itself is a synthesized MISSING node) per
+    // pending opener -- see the doc comment above. The third and fourth
+    // fields are M113's addition, needed only to emit `pairs` once a
+    // closer matches; the matching logic itself still keys off the
+    // first two, unchanged from before M113.
+    let mut open: Vec<(usize, &'static str, usize, bool)> = Vec::new();
     // Current node's ancestor-id chain (root-to-parent), hand-maintained
     // alongside the cursor walk below instead of calling `Node::parent()`.
     let mut ancestors: Vec<usize> = Vec::new();
@@ -441,7 +640,12 @@ fn collect_rainbow_spans(
             match node.kind() {
                 "(" | "[" | "{" => {
                     if let Some(parent) = parent {
-                        open.push((parent, closer_for(node.kind())));
+                        open.push((
+                            parent,
+                            closer_for(node.kind()),
+                            node.start_byte(),
+                            node.is_missing(),
+                        ));
                         out.push((
                             node.start_byte(),
                             node.end_byte(),
@@ -452,7 +656,7 @@ fn collect_rainbow_spans(
                 }
                 ")" | "]" | "}" => {
                     let top_matches = match (parent, open.last()) {
-                        (Some(parent), Some(&(open_parent, expected))) => {
+                        (Some(parent), Some(&(open_parent, expected, _, _))) => {
                             parent == open_parent && node.kind() == expected
                         }
                         _ => false,
@@ -464,7 +668,50 @@ fn collect_rainbow_spans(
                             rainbow_face(open.len() as i32),
                             true,
                         ));
-                        open.pop();
+                        let (_, _, open_start, open_missing) =
+                            open.pop().expect("top_matches checked Some");
+                        // M113 fix round: guard BOTH sides against a
+                        // synthesized MISSING node, not just the closer.
+                        // A zero-width node tree-sitter inserts to
+                        // recover from an unbalanced structure still
+                        // satisfies `top_matches` above, and rainbow-
+                        // delimiters doesn't care which side it's on
+                        // (the resulting span has start==end and
+                        // `apply_visible` already drops zero-length
+                        // spans, so it never renders either way). But
+                        // `Engine::matching_pair` cares about `open`/
+                        // `close` independently of each other: a real
+                        // unmatched "(" with a MISSING ")" synthesized
+                        // after it would otherwise get a phantom pair
+                        // whose `open` field is its own real position
+                        // (wrongly lighting up point-before-that-
+                        // opener); symmetrically, a MISSING "(" tree-
+                        // sitter might synthesize ahead of a real,
+                        // otherwise-unmatched ")" would give that real
+                        // closer a phantom partner at the synthesized
+                        // opener's (also real-looking, non-empty range
+                        // in byte terms, but never actually typed)
+                        // position. Tested empirically (elisp, C, Rust,
+                        // Verilog, a lone stray closer): tree-sitter
+                        // wraps the orphan closer in its own `ERROR`
+                        // node instead of synthesizing a MISSING opener
+                        // for it, so the MISSING-opener side of this
+                        // guard is not known to be reachable today in
+                        // any of those four grammars -- kept anyway
+                        // because nothing rules it out for the five
+                        // grammars not tested this way (Python, Bash,
+                        // Java, Perl, C++), and because guarding both
+                        // sides is the only way to keep this correct
+                        // without re-auditing every grammar's specific
+                        // recovery behavior. Excluding either side's
+                        // MISSING node from `pairs` (while leaving
+                        // `out`/`open.pop()` untouched, so rainbow's own
+                        // behavior is bit-for-bit unchanged) is what
+                        // makes `matching_pair` return `None` for a real
+                        // unmatched bracket, per this milestone's spec.
+                        if !node.is_missing() && !open_missing {
+                            pairs.push((open_start, node.start_byte()));
+                        }
                     }
                 }
                 _ => {}
@@ -481,7 +728,7 @@ fn collect_rainbow_spans(
             // above for why this is the boundary that keeps a stray
             // opener's damage from spreading past its own enclosing node.
             let finished = cursor.node();
-            while open.last().map(|&(p, _)| p) == Some(finished.id()) {
+            while open.last().map(|&(p, _, _, _)| p) == Some(finished.id()) {
                 open.pop();
             }
             if cursor.goto_next_sibling() {
@@ -592,10 +839,10 @@ fn engine_tick(interp: &mut Interp, ed: &Rc<RefCell<crate::editor::Editor>>, eng
             let newer = st
                 .cached
                 .as_ref()
-                .map(|(g, _)| res.gen > *g)
+                .map(|(g, _, _, _)| res.gen > *g)
                 .unwrap_or(true);
             if newer {
-                st.cached = Some((res.gen, res.spans));
+                st.cached = Some((res.gen, res.spans, res.pairs, res.scopes));
             }
         }
     }
@@ -613,7 +860,7 @@ fn engine_tick(interp: &mut Interp, ed: &Rc<RefCell<crate::editor::Editor>>, eng
             st.seen = ticks;
             st.last_change = Instant::now();
         }
-        let cached_gen = st.cached.as_ref().map(|(g, _)| *g);
+        let cached_gen = st.cached.as_ref().map(|(g, _, _, _)| *g);
         let needs_parse = cached_gen != Some(st.seen);
         if needs_parse && st.in_flight.is_none() && st.last_change.elapsed() >= DEBOUNCE {
             let text = buffer.borrow().text.to_string();
@@ -638,7 +885,7 @@ fn apply_visible(
     st: &mut BufState,
     buffer: &Rc<RefCell<Buffer>>,
 ) {
-    let Some((gen, spans)) = &st.cached else {
+    let Some((gen, spans, _pairs, _scopes)) = &st.cached else {
         return;
     };
     let range = visible_range(ed, buffer);

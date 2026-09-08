@@ -1231,6 +1231,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "indexmap",
+ "libc",
  "libloading",
  "module-abi",
  "num-bigint",

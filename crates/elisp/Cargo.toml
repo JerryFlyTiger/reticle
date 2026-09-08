@@ -17,3 +17,4 @@ smallvec = "1"
 module-abi = { path = "../module-abi" }
 libloading = "0.8"
 serde_json = "1"
+libc = "0.2"

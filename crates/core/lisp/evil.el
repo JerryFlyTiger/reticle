@@ -85,9 +85,10 @@
 ;; - `u'/C-r don't consume a count (`u' is bound straight to simple.el's
 ;;   `undo' -- see the redo section below for why that identity
 ;;   matters).
-;; - C-d/C-u move point by an approximate half-page line count
-;;   (`frame-height' / 2); they do not scroll the window viewport (no
-;;   elisp-level window-start control is exposed here).
+;; - C-d/C-u move point by half the SELECTED WINDOW's own text height
+;;   (`window-height' minus its mode-line row, halved -- see
+;;   `evil--halfpage'), not the frame's; they do not scroll the window
+;;   viewport (no elisp-level window-start control is exposed here).
 ;; - Ex commands (`:', M30): a small, fixed, case-sensitive command set
 ;;   (:w/:q/:q!/:wq/:x/:e PATH/:N/:$), plus M42-II's `:s' substitute
 ;;   (its own range/pattern/replacement grammar -- see the "M42-II: :s
@@ -1971,10 +1972,19 @@ non-blank' lands ON the character itself -- so this needs the `+1'
       (goto-char target))))
 
 (defun evil--halfpage ()
-  "Approximate half-page line count for C-d/C-u -- `frame-height'/2 (a
-window's actual height isn't exposed to elisp here); documented v1
-simplification, see the file header."
-  (max 1 (/ (frame-height) 2)))
+  "Half-page line count for C-d/C-u: half of the SELECTED window's own
+text height, not the frame's (M120 fix -- a window's height IS exposed
+to elisp via `window-height', this function simply never called it;
+see the file header). `window-height' returns the window's whole
+on-screen rect including its own mode-line row (confirmed against that
+function's own doc and against how `redisplay.rs' draws the mode line
+as the rect's last row), so the text height used for the half-page
+count is `window-height' minus 1. Falls back to `frame-height' if
+`window-height' returns nil (WINDOW-ID names no live window -- not
+expected for the selected window in practice, but this must still
+return a number)."
+  (let ((wh (window-height)))
+    (max 1 (/ (if wh (max 1 (1- wh)) (frame-height)) 2))))
 
 (defun evil-scroll-down ()
   (interactive)
@@ -3410,6 +3420,30 @@ is left untouched either way."
   (interactive)
   (evil--window-move 'right))
 
+;; M102: window resizing, thin wrappers over the same `enlarge-window'/
+;; `shrink-window'/`balance-windows' commands `C-x ^'/`C-x }'/`C-x {'/
+;; `C-x +' call (simple.el) -- same naming convention as the direction
+;; commands above.
+(defun evil-window-increase-height ()  ; C-w +
+  (interactive)
+  (enlarge-window))
+
+(defun evil-window-decrease-height ()  ; C-w -
+  (interactive)
+  (shrink-window))
+
+(defun evil-window-increase-width ()  ; C-w >
+  (interactive)
+  (enlarge-window-horizontally))
+
+(defun evil-window-decrease-width ()  ; C-w <
+  (interactive)
+  (shrink-window-horizontally))
+
+(defun evil-window-balance ()  ; C-w =
+  (interactive)
+  (balance-windows))
+
 (define-key evil--normal-map "C-w s" 'evil-window-split)
 (define-key evil--normal-map "C-w v" 'evil-window-vsplit)
 (define-key evil--normal-map "C-w w" 'evil-window-other)
@@ -3428,6 +3462,12 @@ is left untouched either way."
 (define-key evil--normal-map "C-w <down>" 'evil-window-down)
 (define-key evil--normal-map "C-w <up>" 'evil-window-up)
 (define-key evil--normal-map "C-w <right>" 'evil-window-right)
+;; M102: window resizing.
+(define-key evil--normal-map "C-w +" 'evil-window-increase-height)
+(define-key evil--normal-map "C-w -" 'evil-window-decrease-height)
+(define-key evil--normal-map "C-w >" 'evil-window-increase-width)
+(define-key evil--normal-map "C-w <" 'evil-window-decrease-width)
+(define-key evil--normal-map "C-w =" 'evil-window-balance)
 
 ;; --- Keymap population ---------------------------------------------------
 

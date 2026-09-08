@@ -22,7 +22,8 @@ opinion about, next to the existing `dev/` tooling directory.
 ```
 demo/
   rtl/              SystemVerilog — a small SoC, split across subdirectories
-  rtl-verilog2001/  plain Verilog-2001 — a FIFO and its testbench
+  rtl-verilog2001/  plain Verilog-2001 — a FIFO, a Gray-code counter, and testbenches
+  verif/            SystemVerilog — testbenches and verification-only material
   tools/            Rust, C, C++, Java, Python, Perl, shell
   editor/           Emacs Lisp — a working init.el for RTL work
   docs/             Org — design notes for the SoC
@@ -78,6 +79,34 @@ learn what the design consists of. Reticle reads the same file for
 its own module lookup, so the editor and the language server agree on
 one list instead of each guessing.
 
+## Verification material: `verif/`
+
+`interface`, `modport`, `generate`/`genvar`, `class`, `program`,
+`covergroup` and concurrent assertions are all real SystemVerilog
+constructs this editor has code paths for (highlight queries, scope/
+breadcrumb kinds, indent rules) but that, until now, `rtl/` had no real
+example of — every one of them was validated only against hand-written
+snippets inside the Rust test suite. `verif/` is where that material
+lives: `bus/axi4_lite_if.sv` under `rtl/` is the `interface` (three
+`modport`s, plus two labelled concurrent assertions checking AW/AR
+handshake stability), `core/clk_gate.sv` is the `always_latch`,
+`mem/sram_bank.sv` is the `generate`/`genvar` (a nested `if` generate
+inside a `for` generate) — those three stay under `rtl/` because they
+are genuinely synthesizable design, not testbench. `verif/` itself
+holds the parts that only make sense in simulation:
+`soc_verif_pkg.sv` (a `class`-based read/write checker),
+`sram_bank_tb.sv` (a `program` block driving the stimulus, plus a
+guarded `covergroup`), and `axi4_lite_monitor.sv` (a passive protocol
+checker whose own port is interface-typed — see "Checked by Verible,
+never simulated" below for why it lives here rather than being wired
+into the testbench). `verif/verible.filelist` is a second file list,
+separate from `rtl/verible.filelist` on purpose: the RTL list stays a
+clean statement of "what synthesizes," and the verification list adds
+the testbench files plus everything they depend on
+(`../rtl/pkg/soc_pkg.sv` and friends), each path resolved relative to
+`verif/` itself, the same convention `rtl/verible.filelist` already
+uses relative to `rtl/`.
+
 `rtl/.slang/server.json` is the equivalent per-project config file for
 `slang-server`, the other Verilog language server Reticle talks to.
 Without it, slang can't find `rtl/include/soc_defs.svh` from
@@ -119,6 +148,7 @@ passes the full default rule set with **no waivers at all**.
 | `tools/simlog_report.pl` | Perl | collapses a simulator log into distinct messages with counts |
 | `tools/TimingReport.java` | Java | pulls the worst paths out of a static timing report |
 | `tools/lint_rtl.sh` | shell | runs every check on this page |
+| `tools/run_sim.sh` | shell | actually simulates the FIFO and the AXI4-Lite testbench with Icarus |
 | `editor/init-example.el` | Emacs Lisp | a real init.el for RTL work |
 | `docs/design-notes.org` | Org | design decisions for the SoC |
 
@@ -131,6 +161,9 @@ unrelated "hello, world"s.
 ```sh
 # SystemVerilog + Verilog: parse, lint, format-check
 ./tools/lint_rtl.sh
+
+# SystemVerilog + Verilog: actually simulate (Icarus Verilog)
+./tools/run_sim.sh
 
 # Rust: unit tests
 rustc --test tools/bitvec.rs -o /tmp/bitvec && /tmp/bitvec
@@ -155,9 +188,18 @@ perl -c tools/simlog_report.pl
 
 Verified on macOS (arm64) when this directory was written:
 
-- `./tools/lint_rtl.sh` — **all three checks pass** across all 9 Verilog
+- `./tools/lint_rtl.sh` — **all three checks pass** across all 17 Verilog
   and SystemVerilog files (`verible-verilog-syntax`, `-lint`, `-format
   --verify`).
+- `./tools/run_sim.sh` — **all three simulations actually run and pass**:
+  `rtl-verilog2001/fifo_sync` prints `PASS: fifo_sync 8 x 32`,
+  `rtl-verilog2001/gray_ctr` prints `PASS: gray_ctr WIDTH=4` (M124: a
+  non-ANSI-header Gray-code counter, checked against both the expected
+  binary sequence and the one-bit-per-step Gray property across two full
+  wraps), and `verif/sram_bank_tb` prints `PASS: sram_bank 4 banks x 3
+  words (hits=12 misses=0)` — 4 banks, 3 words each, written and read
+  back through the real `axi4_lite_if` interface and `sram_bank`'s
+  generate-instantiated `sram_wrapper`/`clk_gate` hierarchy.
 - `tools/bitvec.rs` — **5 tests passed, 0 failed**.
 - `tools/crc32.c` — **5 vectors + streaming pass**.
 - `tools/vcd_writer.cpp` — builds clean with `-Wall -Wextra`, produced a
@@ -172,19 +214,22 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 23 files open in the correct major mode** — 18 in a
+- **All 33 files open in the correct major mode** — 27 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
-  `emacs-lisp-mode`, `org-mode`) and 5 in `fundamental-mode`
-  (`README.md`, `rtl/verible.filelist`, `rtl/.slang/server.json`,
-  `rtl-verilog2001/.rules.verible_lint`, `tools/sample_sim.log`).
+  `emacs-lisp-mode`, `org-mode`) and 6 in `fundamental-mode`
+  (`README.md`, `rtl/verible.filelist`, `verif/verible.filelist`,
+  `rtl/.slang/server.json`, `rtl-verilog2001/.rules.verible_lint`,
+  `tools/sample_sim.log`). (M124: `gray_ctr.v`/`gray_ctr_tb.v` added to
+  `rtl-verilog2001/`, both dump-verified to open in `verilog-mode`.)
 - From `rtl/top/soc_top.sv`, **`M-.` on `alu` lands in
   `rtl/core/alu.sv`** and port completion engages inside `u_regfile`'s
   port list — the two table rows above are measured, not asserted.
-- That file sees **5 library files** even though `rtl/top/` contains
-  only `soc_top.sv` itself: all five arrive via `rtl/verible.filelist`.
-- Open any of the 8 files under `rtl/` and `rtl-verilog2001/` that have
-  enough indented lines to go on, and the editor's indent step
+- That file sees **8 library files** even though `rtl/top/` contains
+  only `soc_top.sv` itself: all eight arrive via `rtl/verible.filelist`.
+- Open any of the 16 files under `rtl/`, `rtl-verilog2001/` and
+  `verif/` that have enough indented lines to go on, and the editor's
+  indent step
   **follows that file's own 2-space style** instead of `verilog-mode`'s
   4-space default: a new statement line opened in a module body or
   inside a `begin`/`end` block lands where `verible-verilog-format`
@@ -225,7 +270,7 @@ And, driving the editor itself rather than the external toolchains:
 
 The four editor claims above, plus the `C-c C-a` / `C-c C-k` rows of
 the keybinding table, are the ones a test now re-checks on every run:
-`crates/core/tests/demo_smoke_tests.rs`. The "5 library files" count is
+`crates/core/tests/demo_smoke_tests.rs`. The "8 library files" count is
 not asserted directly — the cross-file jump and completion tests only
 prove that resolution reaches other directories at all. Add or remove a
 file under `demo/` and that test fails until its expected-mode table and
@@ -239,16 +284,58 @@ current mode is read with `(major-mode-internal-get)`). Worth saying out
 loud, because it is the whole argument for this directory: sample code
 nobody executes drifts into being wrong.
 
-Not verified, for lack of a toolchain on that machine:
+Not verified, for lack of a toolchain on this machine:
 
-- `tools/TimingReport.java` — **no JDK installed**, so it has never been
-  compiled. It is the one file on this page whose claims rest on reading
-  rather than running.
-- `rtl-verilog2001/fifo_sync_tb.v` — **no simulator installed**. The
-  testbench is written for Icarus Verilog
-  (`iverilog -o /tmp/fifo_tb fifo_sync.v fifo_sync_tb.v && /tmp/fifo_tb`)
-  but has not been run, so treat "PASS" in its output as intent, not
-  evidence.
+- `tools/TimingReport.java` — **no JDK installed**: `/usr/bin/java` on
+  this machine is the macOS stub (`java -version` reports "Unable to
+  locate a Java Runtime"), and there is no `javac` that actually
+  compiles anything. It is the one file on this page whose claims rest
+  on reading rather than running.
+
+`rtl-verilog2001/fifo_sync_tb.v` is **no longer** in this list — it now
+actually runs (`./tools/run_sim.sh`, above): `PASS: fifo_sync 8 x 32` is
+an observed result, not intent. Same for `rtl-verilog2001/gray_ctr_tb.v`
+(M124), added together with `gray_ctr.v` and wired into the same script
+from the start — `PASS: gray_ctr WIDTH=4` is likewise observed.
+
+### Checked by Verible, never simulated
+
+Icarus Verilog 13.0 (the simulator `./tools/run_sim.sh` uses) does not
+support every construct `verible-verilog-lint`/`-format` accept, so
+three pieces of real material in this tree are checked by Verible with
+the full default rule set and zero waivers, but **never actually
+simulated** — named explicitly here per this project's own rule that
+anything not yet run must be called out by name:
+
+- **Concurrent assertions** (`property`/`endproperty`, `assert
+  property`) in `rtl/bus/axi4_lite_if.sv` and `rtl/mem/sram_bank.sv`.
+  Compiling either file without `-DSOC_SVA_OFF` fails:
+  `concurrent_assertion_item not supported. Try -gno-assertions or
+  -gsupported-assertions to turn this message off.`, followed by a
+  cascade of `syntax error` / `Invalid module item.` for the rest of
+  the property body — Icarus's own error, not a defect in the SVA
+  itself (it is written directly in the source, never hidden inside a
+  macro, specifically so a real parser sees it). `./tools/run_sim.sh`
+  always passes `-DSOC_SVA_OFF`, so the `` `ifndef `` guard around each
+  property strips it out of every simulation run.
+- **The `covergroup`** in `verif/sram_bank_tb.sv`. Compiling without
+  `-DSOC_COVERAGE_OFF` fails the same way, on the `covergroup
+  cg_axi_bank @(posedge clk_i);` line: `syntax error` / `Invalid module
+  item.`. `./tools/run_sim.sh` always passes `-DSOC_COVERAGE_OFF`.
+- **`verif/axi4_lite_monitor.sv`** in its entirety — this is an Icarus
+  limitation, not a language or design one; the material is IEEE
+  1800-2017 legal and Verible accepts it. Its own module port is
+  interface-typed (`axi4_lite_if.monitor bus`), and Icarus 13.0 cannot
+  parse a module whose own port is interface-typed at all, independent
+  of the assertions inside it: `axi4_lite_monitor.sv:20: syntax error`
+  / `axi4_lite_monitor.sv:20: Errors in port declarations.` (measured
+  directly, isolating this file from the concurrent-assertion issue
+  above by compiling it with `-DSOC_SVA_OFF` set and getting the exact
+  same port-declaration error regardless). `./tools/run_sim.sh` never
+  compiles this file at all — `sram_bank_tb.sv` instead wires an
+  `axi4_lite_if` instance directly to `sram_bank`'s flat ports, so the
+  interface itself is still exercised end to end in real simulation
+  even though this passive monitor cannot be instantiated alongside it.
 
 ## Editing this directory
 

@@ -390,6 +390,15 @@ pub fn register(interp: &mut Interp) {
             None => Err(i.error("The mark is not set now, so there is no region")),
         }
     });
+    // M101: t only when a mark exists AND it's marked active -- `push-mark'
+    // sets the former without the latter, so callers that just want "is
+    // there a usable region right now" (expand-region.el) need this rather
+    // than testing `mark' directly.
+    defun(interp, "region-active-p", 0, Some(0), |i, _| {
+        let b = cur(i);
+        let bb = b.borrow();
+        Ok(Value::bool(bb.mark.is_some() && bb.mark_active, i.syms.t))
+    });
 
     // Kill ring.
     defun(interp, "kill-region-internal", 2, Some(2), |i, a| {
@@ -442,6 +451,104 @@ pub fn register(interp: &mut Interp) {
         let append = {
             let editor = ed.borrow();
             matches!(&editor.last_command, Value::Sym(id) if i.sym_name(*id) == "kill-line")
+        };
+        if append {
+            ed.borrow_mut().kill_append(text, false);
+        } else {
+            ed.borrow_mut().kill_new(text);
+        }
+        Ok(Value::Nil)
+    });
+    // Kill the whole line(s) point is on. Mirrors `kill-line` above (same
+    // append-to-kill-ring-on-repeat logic). Behavior verified against real
+    // GNU Emacs 30.2 (`emacs -Q --batch`, plus reading `kill-whole-line` in
+    // its `lisp/simple.el`) rather than assumed, after an earlier version
+    // of this comment asserted a GNU rule ("back up over the preceding
+    // newline when the last line has none") that turned out not to exist
+    // and corrupted the buffer by eating the *previous* line's newline
+    // whenever point sat on the buffer's implicit trailing empty line.
+    //
+    // - n >= 1: kill n whole lines forward, starting at the beginning of
+    //   point's line, newlines included. If fewer than n real lines
+    //   remain, kill only up to the buffer's end (no error) — GNU does the
+    //   same via `forward-visible-line`. If point is already sitting on
+    //   the buffer's implicit trailing empty line (an eob with no content
+    //   after it, e.g. right after a final newline, or a wholly empty
+    //   buffer), the loop below naturally comes out with `start == end`
+    //   there — GNU signals `end-of-buffer` instead, but `kill-line` right
+    //   above us handles its own equivalent case (`start == end` at eob)
+    //   by silently doing nothing rather than signaling, so we follow that
+    //   local convention here too instead of adding a new error signal.
+    // - n == 0: kill the current line's content only, excluding its
+    //   trailing newline (if any). A third divergence lives here too: on a
+    //   line with no content (`start == end`), real GNU unconditionally
+    //   pre-seeds the kill ring with `(kill-new "")` before it ever
+    //   computes the range (`simple.el`, around line 6705), so it pushes
+    //   an empty string onto the kill ring even though nothing changes in
+    //   the buffer. Verified against real GNU Emacs 30.2: `(kill-whole-line
+    //   0)` on a blank line leaves `kill-ring` holding `("")`. We instead
+    //   fall straight into the shared `start == end` early return below
+    //   (the same one the n>=1 and n<0 boundary cases use) and push
+    //   nothing. This is the same shared short-circuit as the other two
+    //   divergences, not a separate decision — behavior unchanged, noted
+    //   here only because it was missing from this list.
+    // - n < 0: kill backward. Kill |n| lines counting the current one,
+    //   *excluding* the current line's own trailing newline but
+    //   *including* the newline that precedes the first killed line (GNU:
+    //   "Also kill the preceding newline. This is meant to make `repeat`
+    //   work well with negative arguments.") If the backward count runs
+    //   past the buffer's start, stop there (no error, matching the n >= 1
+    //   overshoot rule); if point is already on an empty first line with
+    //   nothing before it, the loop below likewise comes out with `start
+    //   == end` — GNU signals `beginning-of-buffer`, we again follow
+    //   `kill-line`'s silent no-op-at-the-boundary convention instead.
+    defun(interp, "kill-whole-line", 0, Some(1), |i, a| {
+        let n = match opt(a, 0) {
+            Value::Nil => 1i64,
+            v => need_int(i, &v)?,
+        };
+        let b = cur(i);
+        super::check_writable(i, &b)?;
+        let ed = ed_handle(i);
+        let (start, end) = {
+            let bb = b.borrow();
+            let len = bb.text.len();
+            let bol = bb.text.line_start(bb.point);
+            if n >= 1 {
+                let mut pos = bol;
+                for _ in 0..n {
+                    let le = bb.text.line_end(pos);
+                    if le < len {
+                        pos = le + 1;
+                    } else {
+                        pos = len;
+                        break;
+                    }
+                }
+                (bol, pos)
+            } else if n == 0 {
+                (bol, bb.text.line_end(bol))
+            } else {
+                let k = n.unsigned_abs() as usize;
+                let mut pos = bol;
+                for _ in 0..k.saturating_sub(1) {
+                    if pos == 0 {
+                        break;
+                    }
+                    pos = bb.text.line_start(pos - 1);
+                }
+                pos = pos.saturating_sub(1);
+                (pos, bb.text.line_end(bol))
+            }
+        };
+        if start == end {
+            return Ok(Value::Nil);
+        }
+        let text = edit_delete(&ed, &b, start, end);
+        // Consecutive kill-whole-lines append to the same kill-ring entry.
+        let append = {
+            let editor = ed.borrow();
+            matches!(&editor.last_command, Value::Sym(id) if i.sym_name(*id) == "kill-whole-line")
         };
         if append {
             ed.borrow_mut().kill_append(text, false);

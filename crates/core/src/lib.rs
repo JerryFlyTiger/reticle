@@ -18,6 +18,7 @@ pub mod keymap;
 pub mod panel;
 pub mod redisplay;
 pub mod remote;
+pub mod scope;
 pub mod sexp;
 pub mod textdiff;
 pub mod treesit;
@@ -28,6 +29,7 @@ use std::rc::Rc;
 use elisp::{Interp, Value};
 
 pub const SIMPLE_EL: &str = include_str!("../lisp/simple.el");
+pub const WINDOW_EL: &str = include_str!("../lisp/window.el");
 pub const MODES_EL: &str = include_str!("../lisp/modes.el");
 pub const INDENT_EL: &str = include_str!("../lisp/indent.el");
 pub const ELECTRIC_PAIR_EL: &str = include_str!("../lisp/electric-pair.el");
@@ -46,6 +48,9 @@ pub const SEARCH_EL: &str = include_str!("../lisp/search.el");
 pub const VERILOG_AUTO_EL: &str = include_str!("../lisp/verilog-auto.el");
 pub const VERILOG_COMPLETE_EL: &str = include_str!("../lisp/verilog-complete.el");
 pub const VERILOG_NAV_EL: &str = include_str!("../lisp/verilog-nav.el");
+pub const EXPAND_REGION_EL: &str = include_str!("../lisp/expand-region.el");
+pub const FORMAT_EL: &str = include_str!("../lisp/format.el");
+pub const GUI_EL: &str = include_str!("../lisp/gui.el");
 
 /// Create the editor, install it into the interpreter, register all
 /// editing builtins, and load the elisp command layer.
@@ -147,6 +152,16 @@ pub fn init_editor(interp: &mut Interp) -> Rc<RefCell<editor::Editor>> {
     if let Err(flow) = interp.eval_source(SIMPLE_EL) {
         let msg = interp.describe_flow(&flow);
         panic!("error loading simple.el: {}", msg);
+    }
+    // M103: `display-buffer'/`pop-to-buffer' (window.el's own `quit-
+    // source-return' window-aware branch reads `window--created-for-
+    // display', set by `display-buffer' -- both live in simple.el, so
+    // window.el is loaded right after it, before anything that will
+    // actually CALL `pop-to-buffer' (describe-bindings below, eshell.el,
+    // ielm.el, shell-command.el) gets a chance to run).
+    if let Err(flow) = interp.eval_source(WINDOW_EL) {
+        let msg = interp.describe_flow(&flow);
+        panic!("error loading window.el: {}", msg);
     }
     if let Err(flow) = interp.eval_source(MODES_EL) {
         let msg = interp.describe_flow(&flow);
@@ -279,6 +294,42 @@ pub fn init_editor(interp: &mut Interp) -> Rc<RefCell<editor::Editor>> {
     if let Err(flow) = interp.eval_source(VERILOG_NAV_EL) {
         let msg = interp.describe_flow(&flow);
         panic!("error loading verilog-nav.el: {}", msg);
+    }
+    // M101: `expand-region'/`contract-region', generic (not Verilog-
+    // specific) semantic selection growing. Loaded after everything
+    // above: it reads `treesit--buffer-language' (a buffer-local set by
+    // `modes.el', loaded near the top of this list) and calls the
+    // `treesit-*'/`region-*' builtins, but doesn't need any of the
+    // Verilog-specific files' definitions -- placed last purely to keep
+    // new files appended at the tail of this list, matching every
+    // addition since verilog-auto.el.
+    if let Err(flow) = interp.eval_source(EXPAND_REGION_EL) {
+        let msg = interp.describe_flow(&flow);
+        panic!("error loading expand-region.el: {}", msg);
+    }
+    // M104: style-selectable save-time formatting. Loaded last: it
+    // calls `lsp-format-buffer'/`lsp-format-region'/`lsp--live-buffer-
+    // client'/`lsp--capability-supported-p' (all defined in `lsp.el',
+    // loaded long before this point) only from inside function bodies
+    // that don't run until a save actually happens, well after every
+    // file here has finished loading -- same "referenced by name inside
+    // a closure, not at load time" reasoning as `verilog-complete.el'/
+    // `verilog-nav.el' above.
+    if let Err(flow) = interp.eval_source(FORMAT_EL) {
+        let msg = interp.describe_flow(&flow);
+        panic!("error loading format.el: {}", msg);
+    }
+    // M105: user-selectable GUI font, plus `defvar'/docstrings for every
+    // `gui-*' variable the GUI frontend (`crates/frontend-gui/src/lib.rs')
+    // already reads by name -- none of them had one before this file.
+    // Loaded last for the same reason as `expand-region.el'/`format.el'
+    // above: nothing else here references anything `gui.el' defines, and
+    // `gui.el' itself only calls `file-exists-p'/`expand-file-name'
+    // (builtins, always available) and `with-completing-read' (`simple.el',
+    // loaded near the top of this list).
+    if let Err(flow) = interp.eval_source(GUI_EL) {
+        let msg = interp.describe_flow(&flow);
+        panic!("error loading gui.el: {}", msg);
     }
     // Ship the editor's own lisp layer byte-compiled, like GNU Emacs's
     // .elc files. User init.el functions are left interpreted and tier

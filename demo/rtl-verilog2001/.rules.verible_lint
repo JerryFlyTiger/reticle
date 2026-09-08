@@ -3,9 +3,13 @@
 # Verible's default rule set encodes a SystemVerilog style guide, and it
 # applies that guide to `.v' files too -- IEEE 1364 was folded into IEEE
 # 1800 in 2009, so as far as the tool is concerned there is one language.
-# The three rules below ask for constructs that DO NOT EXIST in
-# Verilog-2001, so obeying them here would mean giving up the thing this
-# directory exists to show:
+# The four rules below are waived for two different reasons. The first
+# three ask for constructs that DO NOT EXIST in Verilog-2001, so obeying
+# them here would mean giving up the thing this directory exists to
+# show; the fourth (`parameter-name-style') is not about a missing
+# construct at all -- it is a SystemVerilog style-guide naming
+# preference, waived because applying it would misrepresent Verilog-2001
+# convention as a style deficiency:
 #
 #   explicit-parameter-storage-type   wants `parameter int unsigned W'
 #                                     -- typed parameters are SV-only.
@@ -14,12 +18,23 @@
 #                                     wants `reg mem [DEPTH]' -- the
 #                                     `[0:DEPTH-1]' form is the Verilog
 #                                     one, and still legal.
-#   parameter-name-style              wants CamelCase parameter names.
-#                                     That is a SystemVerilog style-guide
-#                                     preference; UPPER_SNAKE_CASE is the
-#                                     universal Verilog-2001 convention
-#                                     and renaming would misrepresent
-#                                     what this code is meant to show.
+#   parameter-name-style              its `parameter_style' allows both
+#                                     CamelCase and ALL_CAPS, so plain
+#                                     `parameter' declarations (as in
+#                                     fifo_sync.v) already pass with no
+#                                     waiver; what actually fails is
+#                                     `localparam_style', which is
+#                                     CamelCase-only and rejects a
+#                                     multi-word ALL_CAPS `localparam'
+#                                     (fifo_sync_tb.v's `localparam
+#                                     DATA_WIDTH' / `ADDR_WIDTH'; the
+#                                     single-word `localparam DEPTH'
+#                                     passes on its own). UPPER_SNAKE_CASE
+#                                     is the universal Verilog-2001
+#                                     convention for both, so renaming the
+#                                     localparams to satisfy this rule
+#                                     would misrepresent what this code is
+#                                     meant to show.
 #
 # Waiving per-directory rather than globally is deliberate: the
 # SystemVerilog design under demo/rtl/ passes the full default rule set

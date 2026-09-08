@@ -22,6 +22,18 @@ use elisp::Interp;
 fn setup() -> Interp {
     let mut interp = elisp::new_interp();
     core::init_editor(&mut interp);
+    // M104 fix round: several tests here save real .rs files while
+    // attached to a fake `cat' LSP connection whose capabilities never
+    // populate -- the asymmetric `lsp--capability-supported-p' policy
+    // treats that as "supported", so `format-on-save' (M104, default
+    // `t') could route saves through `lsp-format-buffer' (or, for a
+    // buffer with no LSP client at all, through the `rustfmt' fallback
+    // if that happens to be installed), inserting extra frames or
+    // silently rewriting buffer content depending on what's on THIS
+    // machine's PATH. This file tests LSP wiring, not formatting, so it
+    // opts out unconditionally.
+    let r = interp.eval_source("(setq format-on-save nil)");
+    assert!(r.is_ok(), "setq format-on-save nil failed");
     interp
 }
 

@@ -14,6 +14,49 @@
 //! rather than sharing them across integration-test binaries (each
 //! `tests/*.rs' file compiles to its own binary in this crate's test
 //! harness).
+//!
+//! M123 fix round: this file's own `register_cat'/`lsp--await' path
+//! DOES still depend on the echo, and was checked against M123 Part
+//! A's dispatcher change rather than assumed safe just because the
+//! suite stays green (`cargo test -p core --test lsp_auto_attach_tests'
+//! run six times in a row, unfiltered, all 16/16) -- but it survives
+//! for a reason worth recording, not because the defect `lsp_autostart_
+//! tests.rs' hit doesn't apply here. It takes one extra round trip
+//! now: `lsp--await' calls `lsp--dispatch' on every message it sees,
+//! same as the async path. The FIRST message `cat' echoes back is the
+//! real `initialize' request itself (id AND method both present) --
+//! Part A's dispatcher correctly reads that as a server-initiated
+//! REQUEST and answers it inline via `lsp--respond-to-request', which
+//! sends a `MethodNotFound' error response (`{jsonrpc, id, error}', no
+//! `method' key) back over the SAME connection. `cat' echoes THAT back
+//! too, and this time it lands in the plain `id'-only branch (a real
+//! response, no `method'), gets stashed in `lsp--client-pending', and
+//! `lsp--await''s next poll finds it and returns `(gethash "result"
+//! msg)' -- `nil', since an error response carries no `result' key.
+//! That is the EXACT SAME `nil' `lsp--await' would have returned
+//! before Part A existed (the OLD dispatcher's `id' branch would have
+//! stashed the echoed `initialize' request itself, and `(gethash
+//! "result" ...)' on a message with no `result' key is `nil' either
+//! way) -- so every assertion in this file that only cares "did the
+//! handshake complete, not what capabilities came back" is unaffected;
+//! nothing here inspects `lsp--client-capabilities' or otherwise reads
+//! meaning INTO that `nil'. Two hops through the connection instead of
+//! one, same observable result -- which is also why `lsp_autostart_
+//! tests.rs' broke and this file didn't: that file's ASYNC path
+//! (`lsp-process-pending-all'/the autostart completion callback) reads
+//! `(gethash "result" ...)' too, but only ever polls and dispatches
+//! messages ONE AT A TIME across separate idle-tick-driven calls with
+//! no blocking retry loop of its own -- there is no `lsp--await'-style
+//! "keep going until MY id shows up" spin here to carry the completion
+//! callback through that second hop, so the completion callback fires
+//! (with a wrong-but-harmless nil-as-if-success reading) on the FIRST
+//! echoed message and never sees the second at all... except Part A
+//! changed what happens on THAT first message: it's now correctly
+//! recognized as a request and answered instead of being handed to the
+//! completion callback as if it were the reply, so the callback that
+//! used to fire (wrongly, but effectively) on hop one now never fires
+//! at all. Fixed in `lsp_autostart_tests.rs' by making the fake server
+//! answer properly instead of echoing (see that file's own header).
 
 use elisp::printer::prin1_to_string;
 use elisp::Interp;

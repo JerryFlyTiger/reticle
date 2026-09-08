@@ -129,12 +129,38 @@ pub struct CompletionState {
 /// the ordinary identifier prefix). `filter` is the text (`filterText`,
 /// or `label` when absent — `lsp.el`'s `lsp--completion-item-filter-
 /// text`) that span is prefix-matched against.
+///
+/// `payload` (M123, optional -- `None` for every candidate built before
+/// this milestone, and every candidate `insert` string is still the
+/// literal text to type when it IS `None`) is a small opaque STRING a
+/// producer can attach for `commands::accept_completion` to act on at
+/// accept time, beyond plain literal insertion. `lsp.el`'s two known
+/// shapes today: `"offset:N"` (the snippet expander already ran, and
+/// point should land N chars into `insert` rather than at its end --
+/// `$0` in an LSP snippet) and `"resolve:N"` (`insert` is a FALLBACK;
+/// `N` indexes `lsp--completion-registry`, and `accept_completion` calls
+/// back into elisp to run `completionItem/resolve` before deciding what
+/// to actually insert). This is its own slot rather than a hidden
+/// prefix baked into `insert` (M123 review finding): `insert` is *the
+/// literal text that gets inserted*, and overloading it with a
+/// sentinel-prefixed convention would mean (a) any producer whose real
+/// insert text happens to collide with that sentinel gets silently
+/// mis-decoded, (b) every future reader of `insert` -- logging,
+/// measurement, rendering -- has to separately know about the hidden
+/// convention, and (c) two producers (`lsp.el`'s LSP items,
+/// `verilog-complete.el`'s Verilog items) would differ INVISIBLY
+/// instead of structurally. A dedicated optional field says what it is;
+/// a 4-element `show-completion-popup` item list (no payload) still
+/// builds a `PopupItem` exactly as before this milestone, so
+/// `verilog-complete.el`'s pre-existing items needed no change at all
+/// for this field to exist.
 #[derive(Clone)]
 pub struct PopupItem {
     pub label: String,
     pub insert: String,
     pub start: usize,
     pub filter: String,
+    pub payload: Option<String>,
 }
 
 /// The cursor-anchored LSP completion popup (M40-4, extended M44-3),
@@ -209,6 +235,28 @@ pub struct Window {
     /// the mismatch, drops the pin, and lets `ensure_point_visible`
     /// recentre A normally.
     pub scroll_pin: Option<usize>,
+    /// M103 (third fix round, cold-review defect): non-nil precisely when
+    /// this WINDOW (not its buffer) was created by `display-buffer`
+    /// (window.el) splitting a window to make room for it -- GNU's
+    /// `quit-restore` window parameter, one level down. Deliberately a
+    /// per-WINDOW flag, not a buffer-local variable: the flag's whole job
+    /// is answering "should `q' delete THIS window", and a buffer-local
+    /// flag structurally cannot answer that when the same buffer is
+    /// showing in more than one window at once (a plain `C-x 2`/`C-x 3`
+    /// split, or a `C-x b` switch into an already-displayed buffer, both
+    /// produce exactly that). The prior (buffer-local) design had to
+    /// choose between two real bugs in that situation -- deleting
+    /// whichever window the flag happened to name (even if the user was
+    /// looking at a different one showing the same buffer), or deleting
+    /// a window that was never `display-buffer`'s to delete at all -- and
+    /// could not satisfy both "delete the window created for display" and
+    /// "never delete a window I didn't create" at once, because one flag
+    /// cannot distinguish two windows sharing a buffer. Per-window state
+    /// resolves this for free: a window created by a plain split, or one
+    /// the user pointed at an existing buffer with `switch-to-buffer',
+    /// simply never has this set, regardless of what its buffer is doing
+    /// elsewhere.
+    pub created_for_display: bool,
 }
 
 /// Binary window layout tree; leaves index into `Editor::windows`.
@@ -216,12 +264,33 @@ pub enum Layout {
     Leaf(usize),
     Split {
         horizontal: bool,
+        /// M102: the fraction of the split's available length (after the
+        /// M45 vertical-split separator column is subtracted, for a
+        /// horizontal split) given to side `a`. `0.5` reproduces the
+        /// pre-M102 always-halved behavior exactly (see
+        /// `redisplay::split_lengths`, the single place that turns this
+        /// into cell counts, with a minimum-size clamp). Legal range
+        /// `[0.0, 1.0]`; values outside that range are never written by
+        /// this crate but are not rejected on read -- `split_lengths`
+        /// clamps at rendering time regardless.
+        frac: f32,
         a: Box<Layout>,
         b: Box<Layout>,
     },
 }
 
 impl Layout {
+    /// M102 `balance-windows` (`C-x +`): reset every split in the tree
+    /// back to an even 50/50, the same ratio a fresh `split-window`
+    /// without a SIZE argument produces.
+    pub fn balance(&mut self) {
+        if let Layout::Split { frac, a, b, .. } = self {
+            *frac = 0.5;
+            a.balance();
+            b.balance();
+        }
+    }
+
     pub fn leaves(&self, out: &mut Vec<usize>) {
         match self {
             Layout::Leaf(id) => out.push(*id),
@@ -450,6 +519,7 @@ impl Editor {
                 point: 0,
                 window_start: 0,
                 scroll_pin: None,
+                created_for_display: false,
             },
         );
         Editor {
@@ -747,13 +817,37 @@ pub fn show_buffer_in_selected_window(
 }
 
 /// Select window `id`: save the old window's point, restore the new one's.
+///
+/// M103 fix round (cold-review defect): the save-back below used to run
+/// unconditionally, but `display-buffer`'s step 2 (window.el) calls
+/// `set-window-buffer` on the SELECTED window and then immediately
+/// selects it again via this function with `id == sel` -- at that
+/// point `Editor::current` is still the OLD buffer that window used to
+/// show (nothing has re-synced it yet), while `win.buffer`/`win.point`
+/// already belong to the NEW buffer `set-window-buffer` just installed.
+/// Saving `cur_point` (the old buffer's point) into `win.point`
+/// unconditionally clobbers the new buffer's freshly-set point with the
+/// old buffer's, and that wrong value then gets read back a few lines
+/// down and written into the new buffer. Confirmed by real repro: `C-h
+/// b` (point 3 in `*Help*`) then `pop-to-buffer` on a second buffer
+/// whose point was 22 landed at 3, not 22. Guarded by comparing
+/// `editor.current` against the OUTGOING window's buffer with
+/// `Rc::ptr_eq`: only save back when they still match (i.e. the normal
+/// case, where nothing has swapped the window's buffer out from under
+/// `current` behind this call's back). This is deliberately narrower
+/// than "skip the whole block when id == sel" -- the `id == sel` case
+/// still needs `Editor::current` synced to the window's (possibly new)
+/// buffer, which the unconditional tail of this function already does
+/// via `set_current_buffer`; only the SAVE of the stale point is wrong.
 pub fn select_window(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, id: usize) {
     let target_buf = {
         let mut editor = ed.borrow_mut();
         let sel = editor.selected_window;
-        let cur_point = editor.current.borrow().point;
+        let current = editor.current.clone();
         if let Some(win) = editor.windows.get_mut(&sel) {
-            win.point = cur_point;
+            if Rc::ptr_eq(&current, &win.buffer) {
+                win.point = current.borrow().point;
+            }
         }
         let Some(win) = editor.windows.get(&id) else {
             return;
@@ -789,8 +883,10 @@ pub fn sync_current_to_selected(interp: &mut Interp, ed: &Rc<RefCell<Editor>>) {
 }
 
 /// Split the selected window; the new window shows the same buffer.
-/// `horizontal` = side by side (C-x 3), else stacked (C-x 2).
-pub fn split_selected(ed: &Rc<RefCell<Editor>>, horizontal: bool) {
+/// `horizontal` = side by side (C-x 3), else stacked (C-x 2). `frac`
+/// (M102) is the fraction of the split given to the original ("a") side;
+/// `None` means the pre-M102 default of an even half.
+pub fn split_selected(ed: &Rc<RefCell<Editor>>, horizontal: bool, frac: Option<f32>) {
     let mut editor = ed.borrow_mut();
     let sel = editor.selected_window;
     let Some(win) = editor.windows.get(&sel) else {
@@ -801,6 +897,11 @@ pub fn split_selected(ed: &Rc<RefCell<Editor>>, horizontal: bool) {
         point: win.buffer.borrow().point,
         window_start: win.window_start,
         scroll_pin: None,
+        // A plain C-x 2/C-x 3 split (this function) never sets this --
+        // only `display-buffer' (window.el), via `set-window-created-
+        // for-display', marks a window as one it created for that
+        // purpose. See `Window::created_for_display''s own doc comment.
+        created_for_display: false,
     };
     let new_id = editor.next_window_id;
     editor.next_window_id += 1;
@@ -809,6 +910,7 @@ pub fn split_selected(ed: &Rc<RefCell<Editor>>, horizontal: bool) {
         sel,
         Layout::Split {
             horizontal,
+            frac: frac.unwrap_or(0.5),
             a: Box::new(Layout::Leaf(sel)),
             b: Box::new(Layout::Leaf(new_id)),
         },

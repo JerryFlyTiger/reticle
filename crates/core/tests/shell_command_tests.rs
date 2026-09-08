@@ -490,6 +490,20 @@ fn shell_command_on_region_survives_concurrent_edit_at_region_start() {
 #[test]
 fn shell_command_quit_source_recorded_at_invocation_not_at_pump_time() {
     let (mut i, ed) = setup();
+    // M103: pre-split into two windows so `shell-command--maybe-show`'s
+    // `pop-to-buffer` REUSES the other window (`display-buffer` step 2)
+    // instead of splitting one. This test is specifically about
+    // `quit-source` being captured AT INVOCATION TIME, not about
+    // `quit-source-return`'s window-aware "delete the window `display-
+    // buffer` created for me" branch (that branch is covered by
+    // `window_display_tests.rs`) -- if a split happened here instead,
+    // `q` would correctly delete the newly created window and land back
+    // on whatever the OTHER (pre-existing) window already showed
+    // (`*other*`, since that window's own buffer was never touched),
+    // which is the right answer for THAT mechanism but would silently
+    // stop exercising the invocation-time-capture behavior this test
+    // exists to guard.
+    run(&mut i, "(split-window-below)");
     run(&mut i, "(get-buffer-create \"*scratch*\")");
     run(&mut i, "(switch-to-buffer-internal \"*scratch*\")");
     do_shell_command(&mut i, &ed, "sleep 0.3; echo done-m79");

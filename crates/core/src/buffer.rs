@@ -6,6 +6,7 @@ use elisp::value::SymId;
 use elisp::Value;
 
 use crate::gapbuffer::GapBuffer;
+use crate::treesit::{Lang, TsTreeData};
 
 pub struct MarkerData {
     pub buffer: Weak<RefCell<Buffer>>,
@@ -212,6 +213,30 @@ pub struct Buffer {
     /// from `&self` (buffers are usually only reachable through
     /// `Rc<RefCell<Buffer>>` anyway, but builtins here take `&Buffer`).
     pub search_snapshot: RefCell<Option<(u64, Rc<str>)>>,
+    /// M108: cached tree-sitter parse, keyed the same way as
+    /// `search_snapshot` — `(edit_ticks generation, language, tree)`.
+    /// This is NOT the incremental `Tree::edit` reuse `treesit.rs`'s
+    /// module doc explains was rejected in M12 for correctness risk
+    /// (byte-accounted edits threaded through insert/delete/undo, easy
+    /// to get subtly wrong and corrupt node ranges without any visible
+    /// symptom). This is the much narrower, much safer claim "the text
+    /// hasn't changed since the last parse, so re-parsing from scratch
+    /// would produce byte-for-byte the same tree" — same shape and same
+    /// staleness key as `search_snapshot`, which already established
+    /// the pattern for a different O(N)-per-call cost (there, every
+    /// search call re-materializing the whole buffer; here, every
+    /// highlight/indent/`treesit-*` call re-running the parser). Keying
+    /// on `edit_ticks` means every text-mutation entry point counts as
+    /// invalidating -- insert, delete, AND undo (which bypasses the
+    /// first two; see `undo_step_from`) -- so there's no separate
+    /// invalidation path to keep in sync by hand. The language is part
+    /// of the key (not just an assumption) because nothing stops two
+    /// different `treesit-parser-create` calls against the same buffer
+    /// from naming different languages (e.g. an embedded-language
+    /// experiment, or simply a stale parser object left over from
+    /// before a major-mode change) -- caching only by generation would
+    /// silently hand back a tree parsed under the wrong grammar.
+    pub ts_tree: RefCell<Option<(u64, Lang, Rc<TsTreeData>)>>,
     /// M62 (local)/M75 (`/ssh:` remote): what's known about the on-disk
     /// file the last time it's known this buffer's contents matched it
     /// (or didn't exist yet) -- set when the file is read
@@ -369,6 +394,7 @@ impl Buffer {
             default_directory: None,
             edit_ticks: 0,
             search_snapshot: RefCell::new(None),
+            ts_tree: RefCell::new(None),
             disk_state: DiskState::Unknown,
             save_conflict_ack: None,
         }

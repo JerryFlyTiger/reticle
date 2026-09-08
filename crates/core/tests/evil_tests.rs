@@ -2457,10 +2457,10 @@ fn capital_j_then_dot_repeats_the_join_elsewhere() {
 #[test]
 fn echo_area_shows_a_vim_style_state_indicator_that_disappears_in_normal_state() {
     let (mut i, ed) = setup_evil("hello world");
-    // Startup's `(load-theme 'dark)' (themes.el) leaves an unrelated
-    // "Theme: dark" `editor.echo' message sitting from BEFORE any real
-    // keypress -- ordinarily cleared by the first `handle_key' call
-    // (see commands.rs), same as it is here.
+    // Startup's `(load-theme 'dracula)' (themes.el, M107) leaves an
+    // unrelated "Theme: dracula" `editor.echo' message sitting from
+    // BEFORE any real keypress -- ordinarily cleared by the first
+    // `handle_key' call (see commands.rs), same as it is here.
     ed.borrow_mut().echo = None;
     assert_eq!(run(&mut i, "evil--state"), "normal");
     assert_eq!(
@@ -2741,5 +2741,50 @@ fn normal_state_real_bindings_still_dispatch_under_inhibit_self_insert() {
             .and_then(|m| m.panel.as_ref())
             .is_some(),
         "C-x b must still open the buffer-switch panel under evil's normal state"
+    );
+}
+
+/// M120 E3: `evil--halfpage` (C-d/C-u) must use the SELECTED window's own
+/// text height, not the frame's -- in a split those differ, and before
+/// this fix C-d/C-u scrolled by half the frame even in a short window.
+/// The frame is 41 rows tall (`windows_height` = 40, one row reserved for
+/// the echo area), so the pre-fix `frame-height'/2 = 20. The window is
+/// split down to 6 rows (`window-height` includes its own mode-line row,
+/// so text height = 5); the correct half-page count is 5/2 = 2, not 20.
+#[test]
+fn evil_scroll_down_uses_selected_windows_height_not_frames() {
+    // 20 lines of "x\n" (2 chars each) so point position is
+    // `1 + line_index * 2`, letting the expected point be computed
+    // arithmetically rather than pinned to a magic number.
+    let text = "x\n".repeat(20);
+    let (mut i, ed) = setup_evil(&text);
+    ed.borrow_mut().frame = (50, 41);
+    run(&mut i, "(goto-char (point-min))");
+    assert_eq!(pt(&mut i), 1);
+
+    run(&mut i, "(split-window-below 6)");
+    assert_eq!(run(&mut i, "(window-count)"), "2");
+    // The original (top) window stays selected after splitting, and is
+    // the short one.
+    assert_eq!(run(&mut i, "(window-height 0)"), "6");
+    assert_eq!(run(&mut i, "(selected-window)"), "0");
+
+    // Sanity check on the numbers this test's expectation depends on.
+    assert_eq!(run(&mut i, "(frame-height)"), "41");
+    assert_eq!(
+        run(&mut i, "(max 1 (/ (frame-height) 2))"),
+        "20",
+        "pre-fix formula, kept here only to document what this test would \
+         have wrongly accepted before M120"
+    );
+
+    run(&mut i, "(evil-scroll-down)");
+    // Selected window's text height is 6 - 1 = 5; half of that is 2, so
+    // point moves from line 1 to line 3 (0-indexed line 2): 1 + 2*2 = 5.
+    assert_eq!(
+        pt(&mut i),
+        5,
+        "C-d must scroll by half the SELECTED window's text height (2 \
+         lines here), not half the frame's (20 lines)"
     );
 }

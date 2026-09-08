@@ -14,6 +14,15 @@ use elisp::{Interp, Value};
 fn setup() -> (Interp, Rc<RefCell<Editor>>) {
     let mut interp = elisp::new_interp();
     let ed = core::init_editor(&mut interp);
+    // M104 fix round: this file saves real .v files, and M104's
+    // `format-on-save' defaults to `t'. Whether that then actually
+    // reformats anything depends on whether THIS MACHINE happens to
+    // have `verible-verilog-format' on PATH -- exactly the kind of
+    // "green or red depending on what tools are installed" a test must
+    // never be. This file tests AUTOINST/AUTOWIRE/AUTOARG expansion, not
+    // formatting, so it opts out unconditionally.
+    let r = interp.eval_source("(setq format-on-save nil)");
+    assert!(r.is_ok(), "setq format-on-save nil failed");
     (interp, ed)
 }
 
@@ -2834,5 +2843,102 @@ fn autotemplate_parse_warnings_reset_across_two_verilog_auto_runs() {
         second_msg.contains("1 AUTO_TEMPLATE line(s) not recognized"),
         "second run must ALSO report exactly 1, not 2 -- proving the warning list reset between runs: {}",
         second_msg
+    );
+}
+
+// --- M124 Part C: AUTOINST files an interface-typed port under its own --
+// `// Interfaces' category (real GNU `verilog-mode.el' 30.2 parity,
+// `verilog-auto-inst', :12852-12862 -- `// Interfaces' emitted BEFORE
+// `// Outputs'/`// Inouts'/`// Inputs'). Reproduced (M124) against the
+// real `demo/verif/axi4_lite_monitor.sv' port shape
+// (`axi4_lite_if.monitor bus'): before this fix, AUTOINST filed that
+// port under `// Inputs' -- `verilog-auto--port-direction-of' fell back
+// to 'input for any port with no `port_direction' descendant, which an
+// `interface_port_header' structurally never has.
+
+#[test]
+fn autoinst_interface_typed_port_gets_its_own_interfaces_category() {
+    let (mut i, _ed) = setup();
+    let inst_line = "  axi4_lite_monitor u_mon (/*AUTOINST*/);\n";
+    let indent = " ".repeat("  axi4_lite_monitor u_mon (".len());
+    insert_src(
+        &mut i,
+        &format!(
+            "module axi4_lite_monitor (\n  axi4_lite_if.monitor bus\n);\nendmodule\n\nmodule top;\n  axi4_lite_if bus();\n{}endmodule\n",
+            inst_line
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected_block = format!(
+        "/*AUTOINST*/\n{indent}// Interfaces\n{c1});",
+        indent = indent,
+        c1 = conn(&indent, "bus", "bus"),
+    );
+    assert!(
+        text.contains(&expected_block),
+        "expected block:\n{}\n\ngot buffer:\n{}",
+        expected_block,
+        text
+    );
+}
+
+#[test]
+fn autoinst_interface_plus_input_plus_output_gets_all_groups_in_gnu_order() {
+    let (mut i, _ed) = setup();
+    let inst_line = "  sub_mod u1 (/*AUTOINST*/);\n";
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    insert_src(
+        &mut i,
+        &format!(
+            "module sub_mod (\n  axi4_lite_if.monitor bus,\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  axi4_lite_if bus();\n  wire clk;\n  wire done;\n{}endmodule\n",
+            inst_line
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected_block = format!(
+        "/*AUTOINST*/\n{indent}// Interfaces\n{c1},\n{indent}// Outputs\n{c2},\n{indent}// Inputs\n{c3});",
+        indent = indent,
+        c1 = conn(&indent, "bus", "bus"),
+        c2 = conn(&indent, "done", "done"),
+        c3 = conn(&indent, "clk", "clk"),
+    );
+    assert!(
+        text.contains(&expected_block),
+        "expected block (GNU order: Interfaces, Outputs, Inouts, Inputs):\n{}\n\ngot buffer:\n{}",
+        expected_block,
+        text
+    );
+}
+
+/// AUTOARG must keep exactly its pre-M124 three-category output --
+/// catches a shared-helper change (`verilog-auto--group-by-direction'/
+/// `verilog-auto--grouped-lines') leaking an `// Interfaces' category
+/// into AUTOARG, which real GNU's own `verilog-auto-arg' never has
+/// (`verilog-mode.el' :12124-12143). AUTOARG can't actually be handed an
+/// interface-typed port at all (its own port source,
+/// `verilog-auto--nonansi-port-info', only ever reads body
+/// input/output/inout declarations), so this is a regression pin, not a
+/// new behavior test.
+#[test]
+fn autoarg_output_unchanged_by_the_interfaces_bucket() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (/*AUTOARG*/);\n  input a;\n  input b;\n  output c;\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTOARG*/\n    // Outputs\n    c,\n    // Inputs\n    a,\n    b);";
+    assert!(
+        text.contains(expected),
+        "AUTOARG's own three-category output must be byte-for-byte unchanged: {}",
+        text
+    );
+    assert!(
+        !text.contains("// Interfaces"),
+        "AUTOARG must never emit an Interfaces category: {}",
+        text
     );
 }

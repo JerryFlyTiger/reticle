@@ -256,6 +256,47 @@ fn prog_mode_hook_default_can_be_overridden_by_the_user() {
     );
 }
 
+/// M116: `prog-mode-hook`'s two new default hook functions (same
+/// buffer-local-default-on-for-prog-buffers convention as the
+/// `display-line-numbers` test above) -- `show-trailing-whitespace` and
+/// `display-fill-column-indicator-mode` both flip on, buffer-locally,
+/// the moment a `.rs` file is opened.
+#[test]
+fn prog_mode_hook_turns_on_trailing_whitespace_and_fill_column_indicator_by_default() {
+    let (mut i, _ed) = setup();
+    let dir = temp_dir("progdefaults");
+    let r = write_and_open(&mut i, &dir, "d.rs", "fn d() {}\n");
+    assert!(!r.starts_with("ERROR"), "find-file failed: {}", r);
+    assert_eq!(run(&mut i, "(major-mode-internal-get)"), "rust-mode");
+
+    assert_eq!(run(&mut i, "show-trailing-whitespace"), "t");
+    assert_eq!(
+        run(&mut i, "(local-variable-p 'show-trailing-whitespace)"),
+        "t",
+        "must be buffer-local, not a global flip -- a second buffer \
+         should not inherit this from opening the .rs file"
+    );
+    assert_eq!(run(&mut i, "display-fill-column-indicator-mode"), "t");
+    assert_eq!(
+        run(
+            &mut i,
+            "(local-variable-p 'display-fill-column-indicator-mode)"
+        ),
+        "t"
+    );
+}
+
+/// M116: `fill-column` defaults to 100 (verible's own default
+/// `--line_length`), not GNU's 70 -- and this is a plain global default,
+/// not something `prog-mode-hook` sets per-buffer (unlike the mode
+/// toggle above), so a brand-new `*scratch*` buffer with no mode setup
+/// at all already sees it.
+#[test]
+fn fill_column_defaults_to_100_not_gnus_70() {
+    let (mut i, _ed) = setup();
+    assert_eq!(run(&mut i, "fill-column"), "100");
+}
+
 /// The core M24 regression guard: `display-line-numbers` is commonly
 /// buffer-local (prog-mode-hook sets it per-buffer), and two windows can
 /// show two buffers with different local values at once. `render_window`

@@ -295,7 +295,18 @@ fn lsp_wait_returns_message_with_or_without_timeout_arg() {
     let mut i = setup();
     let r = run(&mut i, &format!("(setq conn (lsp-start {:?}))", script));
     assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
-    assert_eq!(run(&mut i, "(gethash \"id\" (lsp-wait conn 5))"), "1");
+    // 30, not 5. The number is arbitrary for what this test checks -- that
+    // an explicit TIMEOUT does not delay a message that is already ready --
+    // so it should be generous, and 5 was not. Observed failing once during
+    // M116, immediately after a cargo build finished, with exactly the shape
+    // a timeout produces: `lsp-wait` returned nil and `gethash` reported
+    // "Wrong type argument: hash-table-p, nil". Twelve consecutive runs
+    // afterwards were green, which is why the number matters rather than the
+    // logic. Same family as the 2-second `wait_for_file_contents` budget in
+    // this file that M111 replaced with a 30-second deadline, and the same
+    // reasoning: five seconds covers spawning a process, starting a script
+    // and receiving its first message only on an idle machine.
+    assert_eq!(run(&mut i, "(gethash \"id\" (lsp-wait conn 30))"), "1");
     run(&mut i, "(lsp-kill conn)");
 
     // With TIMEOUT omitted: unchanged pre-M65 behavior (unbounded
@@ -754,10 +765,41 @@ fn write_pwd_script(dir: &std::path::Path, name: &str, output_file: &std::path::
 /// budget) and returns its trimmed contents, or an empty string if it
 /// never appeared -- the caller asserts non-empty itself so a timeout
 /// produces a readable failure message instead of a panic here.
+/// Poll until the spawned server writes `path`, or give up.
+///
+/// **Bounded by elapsed time, not by an iteration count.** It used to be
+/// `for _ in 0..100` with a 20 ms sleep -- a hard 2-second budget for
+/// spawning a shell script, running it, and having it write a file. That is
+/// generous on an idle machine and is not generous at all inside
+/// `cargo test --workspace`, where 97 test binaries run concurrently: on
+/// 2026-09-05 this returned empty under a full-workspace run and the caller
+/// failed with "server never wrote its pwd", while 12 name-filtered runs and
+/// 4 whole-file runs of the same test passed immediately afterwards. The
+/// distinguishing observation is that the failure mode here is a fixed
+/// wall-clock cap, and the assertion message is exactly what a timeout
+/// produces -- not a logic error.
+///
+/// Note the asymmetry that made it stand out: the other two poll loops in
+/// this same file allow 30 seconds (`0..60` at 500 ms). This one allowed 2.
+/// A test that fails under CPU contention is a test that will fail in CI,
+/// and it costs nothing to wait longer, because the loop still returns the
+/// instant the file appears.
 fn wait_for_file_contents(path: &std::path::Path) -> String {
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        // The file EXISTING is not the same event as the file having been
+        // WRITTEN: the helper script's redirection creates it empty and the
+        // shell writes into it a moment later. Returning on mere existence
+        // hands back "" and the caller reports "server never wrote its pwd"
+        // -- observed once during M122's gate run (2240 passed, this one
+        // failed), while 12 consecutive filtered runs of the same test were
+        // green, which is exactly the shape of a create/write race rather
+        // than a timeout. Wait for non-empty content instead.
         if let Ok(s) = std::fs::read_to_string(path) {
-            return s.trim().to_string();
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

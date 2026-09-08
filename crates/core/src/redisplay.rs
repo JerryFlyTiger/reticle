@@ -7,6 +7,8 @@ use elisp::{Interp, Value};
 
 use crate::buffer::Buffer;
 use crate::editor::Editor;
+use crate::gapbuffer::GapBuffer;
+use crate::scope::Scope;
 
 pub mod display_width;
 use display_width::wide_char_width;
@@ -396,10 +398,42 @@ impl Grid {
     ///   also the fallback for any `col` that doesn't land inside a
     ///   positive-width run for another reason.
     pub fn buffer_pos_at(&self, row: usize, col: usize) -> Option<usize> {
+        // M118 review fix round (found while writing FIX-1's own test,
+        // not itself one of the nine numbered findings): `self.runs` is
+        // frame-global, and this function used to search it row-wide
+        // with no window boundary at all. That is harmless for the
+        // "which run covers `col`" loop below (windows never overlap
+        // columns, so a covering run always belongs to the right
+        // window on its own), but the "past the end of this row's
+        // runs" FALLBACK further down picks whichever run has the
+        // HIGHEST column ANYWHERE on the row -- normally the query
+        // window's own trailing run, since its columns are numerically
+        // highest among windows to its right. A header row breaks that
+        // implicit assumption on purpose (FIX-1's `retain` empties a
+        // header row's `src`-bearing runs for exactly its own window):
+        // on a side-by-side split, a click past a SHORT line's text in
+        // the header row of the RIGHT window then fell back to the
+        // LEFT window's own last run, resolving to a buffer position in
+        // the wrong window entirely. Scoping the search to the window
+        // that actually contains `(row, col)` (when one does) keeps the
+        // fallback from ever crossing a window boundary.
+        let window_bounds = self
+            .windows
+            .iter()
+            .find(|w| row >= w.row && row < w.row + w.rows && col >= w.col && col < w.col + w.cols)
+            .map(|w| (w.col, w.col + w.cols));
+
         let mut row_runs: Vec<&PaintRun> = self
             .runs
             .iter()
-            .filter(|r| r.row == row && r.src.is_some())
+            .filter(|r| {
+                r.row == row
+                    && r.src.is_some()
+                    && match window_bounds {
+                        Some((lo, hi)) => r.col >= lo && r.col < hi,
+                        None => true,
+                    }
+            })
             .collect();
         if row_runs.is_empty() {
             return None;
@@ -544,6 +578,11 @@ struct ModeLineParts<'a> {
     diags: usize,
     line: usize,
     col: usize,
+    /// M118 (F2, scope breadcrumb): already-formatted `"[a > b > c]"`
+    /// string (see `format_breadcrumb`), or empty for "nothing to show"
+    /// -- empty, not GNU's `"n/a"` `which-func-unknown` placeholder; see
+    /// this field's use below for why.
+    breadcrumb: &'a str,
 }
 
 /// Laid-out mode line, ready to draw. `left` and `right` are already
@@ -663,9 +702,12 @@ fn ml_truncate_head(s: &str, budget: usize) -> String {
 /// 3. `LSP` — just a connection status light.
 /// 4. `dir` — the buffers that show this (dired, eshell) already spell
 ///    out their full path in the buffer's own first line or prompt
-///    string, so this is the one genuinely redundant field; it's
-///    checked last and is therefore the first one dropped once `width`
-///    can't fit everything.
+///    string, so this is the one genuinely redundant field.
+/// 5. (M118) the scope breadcrumb — checked last of all, i.e. dropped
+///    before every one of the above: it's the newest, least-essential
+///    field (every editor got by without it before this milestone), and
+///    it's redundant with `L{line}:{col}` in the sense that both answer
+///    "where am I", just at different granularity.
 ///
 /// `L{line}:{col}` itself is never dropped or reordered away as an
 /// optional segment — it's the one field this milestone exists to
@@ -673,6 +715,30 @@ fn ml_truncate_head(s: &str, budget: usize) -> String {
 /// narrowest frames it can still be shortened by the gap-reservation
 /// step at the end of this function (see `ML_GAP`'s doc comment and
 /// PLAN.md M69's F3 fix) — that's a last resort, not a priority tier.
+/// M118 (F2, scope breadcrumb): `"[a > b > c]"` from `labels`,
+/// outermost first, innermost last, capped to the innermost 4 elements
+/// when `labels` is deeper than that (the immediately enclosing
+/// construct is the one worth keeping; see `scope.rs`'s doc for the
+/// same "keep the innermost" call F1's header makes). Empty string for
+/// an empty `labels` -- callers pass that straight through as
+/// `ModeLineParts::breadcrumb`, which drops the whole segment.
+///
+/// **Deliberate divergence from GNU's `which-function-mode`** (already
+/// run, see the M118 spec): GNU shows only the innermost name as
+/// `[name]`, and shows the literal string `"n/a"` when it can't tell.
+/// We show the full path instead, and nothing at all rather than
+/// `"n/a"` -- this segment is already dropped under width pressure (see
+/// `compose_mode_line`'s priority order), so an "unknown" placeholder
+/// would be noise in exactly the buffers (plain text, no grammar) where
+/// it is permanently unknown, not an occasional state worth flagging.
+fn format_breadcrumb(labels: &[&str]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let start = labels.len().saturating_sub(4);
+    format!("[{}]", labels[start..].join(" > "))
+}
+
 fn compose_mode_line(p: &ModeLineParts, width: usize) -> ModeLine {
     let prefix = ml_sanitize(p.prefix);
     let mode_name = ml_sanitize(p.mode_name);
@@ -742,18 +808,24 @@ fn compose_mode_line(p: &ModeLineParts, width: usize) -> ModeLine {
     if let Some(d) = &dir {
         let seg_w = ml_width(&format!("{}  ", d));
         if used + seg_w <= width {
-            // `dir` is the last of the four priority checks, so nothing
-            // reads `used` again after this -- the assignment is
-            // genuinely dead by clippy's lights. Kept anyway (with the
-            // `#[allow]` scoped to just this line) so the four branches
-            // stay symmetric: a future fifth priority tier inserted
-            // here would silently read a stale `used` if this branch
-            // were the odd one out. M69 review F5.
-            #[allow(unused_assignments)]
-            {
-                used += seg_w;
-            }
+            used += seg_w;
             show_dir = true;
+        }
+    }
+
+    // M118 (F2, scope breadcrumb): checked LAST, i.e. lowest priority --
+    // dropped before diagnostics, mode name, LSP, and dir, all of which
+    // are checked (and therefore kept) ahead of it above. Placed in
+    // `left`, after the mode name, per the milestone spec. `used` is
+    // genuinely read here (unlike `dir`'s check above pre-M118, which
+    // needed an `#[allow(unused_assignments)]` because it *was* the last
+    // check at the time) -- no such allow needed now.
+    if !p.breadcrumb.is_empty() {
+        let seg = format!("  {}", ml_sanitize(p.breadcrumb));
+        let seg_w = ml_width(&seg);
+        if used + seg_w <= width {
+            left.push_str(&seg);
+            left_suffix_w += seg_w;
         }
     }
 
@@ -791,6 +863,15 @@ fn compose_mode_line(p: &ModeLineParts, width: usize) -> ModeLine {
     // for), before this fallback accounted for `ML_GAP` (M69 review
     // F3). `ml_truncate_head` is idempotent when `left` already fits,
     // so this always runs rather than only under a size check.
+    //
+    // M118 note: `ml_truncate_head` truncates from the HEAD, keeping the
+    // tail (see its own doc) -- for the scope breadcrumb, appended at
+    // the very end of `left` above, that's the right behavior for THIS
+    // fallback specifically: if this last-resort trim ever has to eat
+    // into a breadcrumb that the priority check above already decided
+    // to show, the innermost scope (the tail of `"[a > b > c]"`, the
+    // most useful part) survives longest, and the outer path segments
+    // erode first.
     let right_w = ml_width(&right);
     let avail_left = width.saturating_sub(right_w + ML_GAP);
     left = ml_truncate_head(&left, avail_left);
@@ -1409,16 +1490,94 @@ pub(crate) struct Rect {
     pub(crate) height: usize,
 }
 
+/// M102: minimum window height in screen rows -- one text row plus one
+/// mode-line row. Deliberately smaller than GNU Emacs's default (4): this
+/// editor's windows still show one line of text plus a mode line at 2
+/// rows, and several existing tests already run against very small
+/// frames, so a larger floor would make those windows disappear (or force
+/// this milestone to touch tests outside its scope) without buying
+/// anything real.
+pub(crate) const WINDOW_MIN_HEIGHT: usize = 2;
+/// M102: minimum window width in columns. Smaller than GNU Emacs's
+/// default (10) for the same reason as `WINDOW_MIN_HEIGHT` -- this is a
+/// hard floor to keep the split math from producing a zero- or negative-
+/// width window, not an attempt to guarantee a comfortable width.
+pub(crate) const WINDOW_MIN_WIDTH: usize = 4;
+
+/// M102: split `avail` screen cells into an `(a, b)` pair according to
+/// `frac` (the share given to `a`), with a minimum-size clamp applied to
+/// both sides. This is the ONLY place that turns a `Layout::Split`'s
+/// `frac` into cell counts -- `compute_rects` (rendering) and
+/// `resize_in_layout` (the M102 resize builtins) both call it, so the
+/// split math can never drift between "what's drawn" and "what a resize
+/// computes against".
+///
+/// When `avail < 2 * min` the frame is too small to honor the floor at
+/// all; rather than panic or produce a nonsensical clamp range, this
+/// falls back to the pre-M102 unclamped behavior (split raw by `frac`)
+/// so tiny-frame tests keep working and very small splits degrade
+/// gracefully instead of crashing.
+///
+/// **Nudges by a small epsilon before truncating** (fix after
+/// cold-review, M102 fix round) -- plain truncation was WRONG, but a
+/// blind `.round()` is also wrong: it would flip every EXACT half
+/// (`frac == 0.5`, `avail` odd -- e.g. `89.0 * 0.5 == 44.5` precisely,
+/// no float error at all) from floor (44, the pre-M102 and current
+/// default-split behavior, asserted byte-for-byte by
+/// `layout_golden_tests.rs`) up to 45, silently changing every existing
+/// default split's `a` side by one cell. `resize_in_layout` and
+/// `split-window-internal`'s SIZE handling both derive `frac` as `n as
+/// f32 / avail as f32` for an intended-exact integer `n`; that division
+/// is often NOT exact in f32, so multiplying back by `avail` can land
+/// a hair below `n` (observed: a true `21` coming back as `20.999998`)
+/// -- and since `resize_in_layout` reads this count back out, adds
+/// `delta`, and writes a new `frac` right back on every call, plain
+/// truncation compounds that hair-short error every press, stalling
+/// `enlarge-window` well short of `WINDOW_MIN_HEIGHT` (confirmed by
+/// hand: repeated presses on an 80x42 frame stalled after the 11th,
+/// `window-height` stuck at 31; on 80x24 it stalled after the 2nd).
+/// The fix distinguishes the two cases with a fixed epsilon far smaller
+/// than the 0.5 an intentional half-cell split needs to cross, but
+/// comfortably larger than f32's error at any `avail` this editor
+/// deals with. Measured directly (a brute-force scan of every `(n,
+/// avail)` pair with `avail` from 2 to 2000, computing `|avail as f32
+/// * (n as f32 / avail as f32) - n as f32|` for each): the worst
+/// deviation found was `6.1e-5` (at `n=838, avail=1027`) -- about 16x
+/// smaller than `EPS`, comfortably enough margin, but nowhere near
+/// "five orders of magnitude" (a since-corrected earlier draft of this
+/// comment claimed 1e-7/five-orders-of-magnitude from a back-of-
+/// envelope relative-error estimate rather than measuring it, per
+/// this project's own M101 lesson about not fixing one inaccurate
+/// claim by writing a new one): add `EPS` before flooring, so a
+/// product like `20.999998` clears the next integer boundary (becomes
+/// `21.000998`, floors to `21`) while an exact `44.5` does not (becomes
+/// `44.501`, still floors to `44`).
+const SPLIT_LEN_EPS: f32 = 1e-3;
+
+pub(crate) fn split_lengths(frac: f32, avail: usize, min: usize) -> (usize, usize) {
+    let raw_a = ((((avail as f32) * frac) + SPLIT_LEN_EPS).floor() as usize).min(avail);
+    if avail < 2 * min {
+        return (raw_a, avail - raw_a);
+    }
+    let a = raw_a.clamp(min, avail - min);
+    (a, avail - a)
+}
+
 /// Flatten the window layout tree into (window_id, screen_rect) pairs.
 fn compute_rects(layout: &crate::editor::Layout, rect: Rect, out: &mut Vec<(usize, Rect)>) {
     use crate::editor::Layout;
     match layout {
         Layout::Leaf(id) => out.push((*id, rect)),
-        Layout::Split { horizontal, a, b } => {
+        Layout::Split {
+            horizontal,
+            frac,
+            a,
+            b,
+        } => {
             if *horizontal {
                 let sep = if rect.width > 2 { 1 } else { 0 };
-                let aw = (rect.width.saturating_sub(sep)) / 2;
-                let bw = rect.width.saturating_sub(aw + sep);
+                let avail = rect.width.saturating_sub(sep);
+                let (aw, bw) = split_lengths(*frac, avail, WINDOW_MIN_WIDTH);
                 compute_rects(a, Rect { width: aw, ..rect }, out);
                 compute_rects(
                     b,
@@ -1430,8 +1589,7 @@ fn compute_rects(layout: &crate::editor::Layout, rect: Rect, out: &mut Vec<(usiz
                     out,
                 );
             } else {
-                let ah = rect.height / 2;
-                let bh = rect.height - ah;
+                let (ah, bh) = split_lengths(*frac, rect.height, WINDOW_MIN_HEIGHT);
                 compute_rects(a, Rect { height: ah, ..rect }, out);
                 compute_rects(
                     b,
@@ -1444,6 +1602,158 @@ fn compute_rects(layout: &crate::editor::Layout, rect: Rect, out: &mut Vec<(usiz
                 );
             }
         }
+    }
+}
+
+/// Clamp a resize's proposed new side length (in cells) back into the
+/// legal range, mirroring `split_lengths`'s own degenerate-frame
+/// fallback: when the parent split can't honor the minimum-size floor on
+/// both sides at all (`avail < 2 * min`), just clamp to `[0, avail]`
+/// instead of panicking on an inverted `clamp` range.
+fn clamp_side_len(new_len: i64, avail: usize, min: usize) -> usize {
+    let new_len = new_len.max(0) as usize;
+    let new_len = new_len.min(avail);
+    if avail >= 2 * min {
+        new_len.clamp(min, avail - min)
+    } else {
+        new_len
+    }
+}
+
+/// M102 `window-resize-selected`: walk `layout` looking for `target`,
+/// and once found, apply `delta` cells (positive = grow) to the nearest
+/// ancestor `Split` whose `horizontal` matches `want_horizontal`,
+/// updating that split's `frac` in place.
+///
+/// Returns:
+/// - `None` if `target` is not a leaf anywhere in this subtree.
+/// - `Some(true)` if a resize was applied somewhere in this subtree.
+/// - `Some(false)` if `target` was found in this subtree but no
+///   matching-orientation `Split` has been found yet -- the caller (the
+///   parent frame in the recursion, i.e. the next split out) must check
+///   whether IT matches and apply the resize there instead. This is how
+///   "nearest ancestor" resolves to the deepest matching split: children
+///   are visited first, so the first match found while unwinding the
+///   recursion is the closest one to `target`.
+///
+/// Known gap: if the selected window is itself further split on the
+/// same axis, this moves the nearest same-axis ancestor's divider, and
+/// the selected window's own size changes only by whatever share its
+/// own subtree's fixed `frac` happens to give it -- it is not
+/// guaranteed to move by exactly `delta`. GNU Emacs redistributes the
+/// whole subtree in this case; this version does not. This is now the
+/// ONLY case where a resize doesn't land exactly on `delta`: the
+/// read-modify-write round trip through `frac` (read a cell count via
+/// `split_lengths`, add/subtract `delta`, convert back to `frac`) is
+/// exact as of the M102 fix round -- see `split_lengths`'s own doc
+/// comment for why the epsilon nudge makes that round trip lossless.
+/// Before that fix, plain `f32` truncation ALSO silently dropped whole
+/// cells on repeated resizes even outside the nested case above; that
+/// is fixed now, not merely documented as a limitation.
+pub(crate) fn resize_in_layout(
+    layout: &mut crate::editor::Layout,
+    rect: Rect,
+    target: usize,
+    delta: i64,
+    want_horizontal: bool,
+) -> Option<bool> {
+    use crate::editor::Layout;
+    match layout {
+        Layout::Leaf(id) => {
+            if *id == target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Layout::Split {
+            horizontal,
+            frac,
+            a,
+            b,
+        } => {
+            let is_horiz = *horizontal;
+            let (sep, avail, min) = if is_horiz {
+                let sep = if rect.width > 2 { 1 } else { 0 };
+                (sep, rect.width.saturating_sub(sep), WINDOW_MIN_WIDTH)
+            } else {
+                (0, rect.height, WINDOW_MIN_HEIGHT)
+            };
+            let (a_len, b_len) = split_lengths(*frac, avail, min);
+            let a_rect = if is_horiz {
+                Rect {
+                    width: a_len,
+                    ..rect
+                }
+            } else {
+                Rect {
+                    height: a_len,
+                    ..rect
+                }
+            };
+            let b_rect = if is_horiz {
+                Rect {
+                    col: rect.col + a_len + sep,
+                    width: b_len,
+                    ..rect
+                }
+            } else {
+                Rect {
+                    row: rect.row + a_len,
+                    height: b_len,
+                    ..rect
+                }
+            };
+
+            if let Some(found_in_a) = resize_in_layout(a, a_rect, target, delta, want_horizontal) {
+                if found_in_a {
+                    return Some(true);
+                }
+                if is_horiz == want_horizontal {
+                    let new_a = clamp_side_len((a_len as i64).saturating_add(delta), avail, min);
+                    *frac = if avail == 0 {
+                        *frac
+                    } else {
+                        new_a as f32 / avail as f32
+                    };
+                    return Some(true);
+                }
+                return Some(false);
+            }
+            if let Some(found_in_b) = resize_in_layout(b, b_rect, target, delta, want_horizontal) {
+                if found_in_b {
+                    return Some(true);
+                }
+                if is_horiz == want_horizontal {
+                    // Target is on side `b`; growing `b` by `delta` shrinks
+                    // `a` (the only side whose length `frac` records) by
+                    // the same amount.
+                    let new_a = clamp_side_len((a_len as i64).saturating_sub(delta), avail, min);
+                    *frac = if avail == 0 {
+                        *frac
+                    } else {
+                        new_a as f32 / avail as f32
+                    };
+                    return Some(true);
+                }
+                return Some(false);
+            }
+            None
+        }
+    }
+}
+
+/// M102: the root rectangle `compute_rects`/`resize_in_layout` are
+/// applied against -- the same tiled-window area `window_rects` computes,
+/// exposed separately because the resize builtins need the ROOT rect (to
+/// recurse from) rather than a specific window's rect.
+pub(crate) fn windows_root_rect(editor: &Editor) -> Rect {
+    let (cols, _rows, _panel_h, windows_height) = frame_layout(editor);
+    Rect {
+        row: 0,
+        col: 0,
+        width: cols,
+        height: windows_height,
     }
 }
 
@@ -1475,13 +1785,7 @@ fn frame_layout(editor: &Editor) -> (usize, usize, usize, usize) {
 /// windows geometrically without duplicating the split math or the panel/
 /// echo-row height deduction above.
 pub(crate) fn window_rects(editor: &Editor) -> Vec<(usize, Rect)> {
-    let (cols, _rows, _panel_h, windows_height) = frame_layout(editor);
-    let root = Rect {
-        row: 0,
-        col: 0,
-        width: cols,
-        height: windows_height,
-    };
+    let root = windows_root_rect(editor);
     let mut rects = Vec::new();
     compute_rects(&editor.layout, root, &mut rects);
     rects
@@ -1574,6 +1878,23 @@ fn var_on(interp: &Interp, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// M118 (`scope-header-max-lines`): the global integer value of `name`,
+/// or `default` when unbound or not an integer. Not buffer-local-aware
+/// (unlike `buffer_var_on`/`frontend-gui`'s `buffer_int_var`) because
+/// this milestone's three `defvar`s (`simple.el`) are plain globals, not
+/// buffer-local settings -- same shape as `var_on` above, just for an
+/// int instead of a truthy check.
+fn var_int(interp: &Interp, name: &str, default: i64) -> i64 {
+    interp
+        .intern_soft(name)
+        .and_then(|id| interp.sym_value(id))
+        .and_then(|v| match v {
+            Value::Int(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 /// Truthy check on a variable as seen by `buf` specifically (M24),
 /// honoring buffer-local bindings the same way the `buffer-local-value`
 /// builtin does — needed for per-window toggles like
@@ -1595,6 +1916,36 @@ pub(crate) fn buffer_var_on(
         .and_then(|id| crate::editor::buffer_local_value(interp, ed, id, buf))
         .map(|v| v.truthy())
         .unwrap_or(false)
+}
+
+/// The char-index start of the trailing-whitespace run at the end of the
+/// buffer line spanning `[line_start, line_end)` (M116,
+/// `show-trailing-whitespace` -- `line_end` is `GapBuffer::line_end`'s
+/// convention: the position of the line's newline, or buffer end, never
+/// included itself). GNU's own notion of "whitespace" for this feature is
+/// space and tab only (confirmed against `trailing-whitespace' face's
+/// use in real Emacs -- it does not, for instance, treat form-feed as
+/// trailing whitespace).
+///
+/// Scans backward from `line_end` one char at a time; bounded by the
+/// line's own length, so this is no more expensive than the per-line
+/// work the render loop already does elsewhere (e.g. `line_start`/
+/// `line_end` themselves). Three edge cases the milestone spec calls out
+/// by name: an empty line (`line_start == line_end`) returns
+/// `line_start` immediately, since the loop range is empty; a line that
+/// is entirely whitespace returns `line_start` (the whole line is the
+/// trailing run); a line with no trailing whitespace returns `line_end`
+/// unchanged (the loop's first `char_at` is non-whitespace, breaking
+/// before `ws_start` is ever moved).
+fn trailing_whitespace_start(text: &GapBuffer, line_start: usize, line_end: usize) -> usize {
+    let mut ws_start = line_end;
+    for pos in (line_start..line_end).rev() {
+        match text.char_at(pos) {
+            Some(' ') | Some('\t') => ws_start = pos,
+            _ => break,
+        }
+    }
+    ws_start
 }
 
 /// A buffer-local string variable's value (M28 `mode-line-prefix`), the
@@ -1628,7 +1979,13 @@ fn face_or(interp: &Interp, ed: &Editor, name: &str, fallback: Style) -> Style {
 /// `diagnostic-warning` / `diagnostic-info` faces (M-visual-quality) so
 /// it's theme-driven; falls back to the original hard-coded tuples when
 /// the face is absent, following `face_or`'s pattern.
-fn severity_color(interp: &Interp, ed: &Editor, sev: u8) -> Color {
+///
+/// `pub` (M115): the overview-ruler diagnostic marks in
+/// `frontend-gui::lib` need this exact mapping, and a second copy of it
+/// there would drift with zero test coverage on either end (its only
+/// call site is inside `App::update`, which nothing in that crate can
+/// drive) -- exposing this one is cheaper than maintaining a duplicate.
+pub fn severity_color(interp: &Interp, ed: &Editor, sev: u8) -> Color {
     let (face_name, fallback) = match sev {
         1 => ("diagnostic-error", (244, 71, 71)),   // error: red
         2 => ("diagnostic-warning", (255, 204, 0)), // warning: yellow
@@ -1727,6 +2084,42 @@ fn render_window(
     } else {
         editor.windows[&win_id].point
     };
+
+    // M113 (show-paren-mode): which bracket pair (if any) is adjacent to
+    // point, resolved once per window per frame from the highlight
+    // engine's cached parse (`Engine::matching_pair` -- see its doc for
+    // the exact GNU-matching adjacency rule and why an unmatched bracket
+    // yields `None`). Deliberately gated the same way `hl-line-mode` is
+    // below: only the SELECTED window's real buffer point counts, not a
+    // background window's saved `point`, since that's not where the
+    // cursor actually is. `paren_bg` is resolved once here (not once per
+    // character) since it's the same color for both members of the pair
+    // every frame; the per-character loop below only ever compares a
+    // position, never touches a face table.
+    let paren_pair: Option<(usize, usize)> = if is_selected && var_on(interp, "show-paren-mode") {
+        editor
+            .hl
+            .as_ref()
+            .and_then(|hl| hl.matching_pair(&buf, point))
+    } else {
+        None
+    };
+    let paren_bg = paren_pair.and_then(|_| {
+        face_or(
+            interp,
+            editor,
+            "show-paren-match",
+            Style {
+                // Fallback only; every theme defines `show-paren-match`
+                // (see themes.el) -- this amber tone is that same
+                // derivation's dark-theme value, used here only if a
+                // theme somehow left the face undefined.
+                bg: Some((66, 58, 46)),
+                ..Style::default()
+            },
+        )
+        .bg
+    });
 
     // Line-number gutter (M16): `NN │`-style prefix column, giving the
     // text area the remaining width. Diagnostics show as a colored dot
@@ -1841,6 +2234,24 @@ fn render_window(
     .bg;
 
     let point_line = b.text.line_number(point);
+    // M118 (F1/F2 review fix, FIX-5): computed once here and shared by
+    // both the sticky header below and the breadcrumb further down
+    // (`compose_mode_line`'s caller) -- both used to call
+    // `hl.scope_chain(&buf, point)` separately with identical
+    // arguments, doing their own filter/sort pass on an equal result.
+    // Gated on either consumer being on, so a buffer with both
+    // `scope-header` and `scope-breadcrumb` nil never pays for a chain
+    // nobody reads.
+    let chain: Vec<Scope> = if var_on(interp, "scope-header") || var_on(interp, "scope-breadcrumb")
+    {
+        editor
+            .hl
+            .as_ref()
+            .map(|hl| hl.scope_chain(&buf, point))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut line_no = b.text.line_number(window_start);
     let at_line_start =
         window_start == 0 || b.text.char_at(window_start.saturating_sub(1)) == Some('\n');
@@ -1975,6 +2386,40 @@ fn render_window(
 
     paint_gutter(grid, 0, at_line_start.then_some(line_no), gutter_w);
 
+    // M116 (show-trailing-whitespace): the current buffer line's
+    // trailing-whitespace run and whether point sits at its end, both
+    // recomputed every time the loop below crosses into a new line (the
+    // `'\n'` branch) rather than per-character -- `line_start`/
+    // `line_end` are bounded by distance to the nearest newline, same
+    // cost class as every other per-line call already in this loop.
+    // `window_start` need not itself be a buffer-line start (a wrapped
+    // line can scroll to start mid-way through it), so this is derived
+    // from `pos` via the buffer's own line boundaries, not from `row`/
+    // `col`, which only track the SCREEN line.
+    let show_trailing_ws = buffer_var_on(interp, editor, &buf, "show-trailing-whitespace");
+    let mut cur_line_end = b.text.line_end(pos);
+    let mut trailing_ws_start = if show_trailing_ws {
+        trailing_whitespace_start(&b.text, b.text.line_start(pos), cur_line_end)
+    } else {
+        cur_line_end
+    };
+    // GNU's own rule (see `simple.el`'s `show-trailing-whitespace' doc,
+    // verified against real `emacs -Q --batch`/its info manual): the
+    // highlight does not apply when point is at the END of the line
+    // containing the whitespace -- narrower than "point is anywhere on
+    // that line".
+    let mut point_at_line_end = point == cur_line_end;
+    let trailing_ws_bg = face_or(
+        interp,
+        editor,
+        "trailing-whitespace",
+        Style {
+            bg: Some((90, 45, 45)),
+            ..Style::default()
+        },
+    )
+    .bg;
+
     let mut chars = b.text.chars_from(pos);
     // Task 1 (mouse support): accumulates `grid.runs` for the buffer
     // text painted below -- see `RunBuilder`'s doc. Chrome (gutter, the
@@ -2002,6 +2447,21 @@ fn render_window(
             break;
         }
         if let Some(end) = invisible_end(pos, &inv) {
+            // KNOWN GAP (M116 review, recorded rather than fixed): this
+            // branch jumps `pos` past a folded span without recomputing
+            // `cur_line_end'/`trailing_ws_start'/`point_at_line_end' the
+            // way the `'\n'` branch below does -- if the fold spans a
+            // real newline, the line(s) after it are painted with the
+            // PREVIOUS line's trailing-whitespace boundaries. This is
+            // low severity and not new: `line_no` is already not
+            // corrected across a fold either (a pre-existing limitation
+            // of this same branch), and `org.el`'s fold overlay is the
+            // only thing in this codebase that spans lines this way --
+            // it never reaches a `prog-mode' buffer, where folding does
+            // not exist, so it can never interact with the
+            // default-on-for-prog-mode behavior this feature actually
+            // ships with. Left alone rather than fixed to keep this
+            // milestone's diff to the feature it was scoped for.
             if point > pos && point < end && cursor.is_none() {
                 cursor = Some((rect.row + row, tx + col.min(cols.saturating_sub(1))));
             }
@@ -2042,12 +2502,60 @@ fn render_window(
             if row < text_rows {
                 run.start_marker(grid, rect.row + row, tx, b.text.char_to_byte(pos));
             }
+            // M116: this is exactly the "a line just finished, the next
+            // one is starting" moment -- recompute the new line's own
+            // trailing-whitespace state here, same timing as
+            // `line_no += 1` right above it.
+            if show_trailing_ws {
+                cur_line_end = b.text.line_end(pos);
+                trailing_ws_start = trailing_whitespace_start(&b.text, pos, cur_line_end);
+                point_at_line_end = point == cur_line_end;
+            }
             continue;
         }
         let mut style = style_scan.at(pos);
+        // M113 (show-paren-mode): before region, so region still wins
+        // where they'd overlap (matches this file's existing
+        // region-beats-hl-line precedent below) -- and before hl-line's
+        // own bg fill, since that only ever fills a cell whose bg is
+        // still `None`, so setting it here already keeps hl-line from
+        // stomping it later without hl-line needing to know this exists.
+        if let (Some((op, cp)), Some(bg)) = (paren_pair, paren_bg) {
+            if pos == op || pos == cp {
+                style.bg = Some(bg);
+            }
+        }
         if let Some((rs, re)) = region {
             if pos >= rs && pos < re {
                 style.bg = region_bg.or(style.bg);
+            }
+        }
+        // M116 (show-trailing-whitespace): AFTER region, deliberately --
+        // review fix, verified against real Emacs (`-nw -Q`, a region
+        // dragged across a line's trailing whitespace, raw ANSI
+        // decoded): GNU keeps the trailing-whitespace background
+        // visible INSIDE an active selection, it does not let the
+        // region blank it out. Selecting old trailing spaces further up
+        // a line one is actively editing is the ordinary case, not an
+        // exotic one, so getting this backwards would erase exactly the
+        // indicator the feature exists to show. hl-line still loses
+        // unconditionally regardless of where this sits in this
+        // sequence, since hl-line's own fill (below, after this whole
+        // loop) only ever touches a cell whose bg is still `None`.
+        //
+        // Guarded with `if let Some(bg)` rather than an unconditional
+        // `style.bg = trailing_ws_bg` (review fix): a `trailing-whitespace'
+        // face defined with only a `:foreground' (none of the five
+        // shipped themes do this, but a user's own theme could) leaves
+        // `trailing_ws_bg' as `None' here, and an unconditional
+        // assignment would silently wipe out whatever background this
+        // cell already had -- `lsp-highlight' or an isearch match, both
+        // real backgrounds this codebase sets elsewhere in this same
+        // `style'.
+        if show_trailing_ws && !point_at_line_end && pos >= trailing_ws_start && pos < cur_line_end
+        {
+            if let Some(bg) = trailing_ws_bg {
+                style.bg = Some(bg);
             }
         }
         let w = char_width(c, col);
@@ -2144,6 +2652,137 @@ fn render_window(
             rect.row + row.min(text_rows.saturating_sub(1)),
             tx + col.min(cols.saturating_sub(1)),
         ));
+    }
+
+    // M118 (F1, sticky scope header): paint over the TOP of this
+    // window's already-finished text area, after the draw loop above --
+    // deliberately NOT a reserved row budget (no `text_rows`/`window_start`
+    // change anywhere in this function): the milestone spec requires no
+    // scroll/vertical-space code changes at all (`ensure_point_visible`,
+    // `scan_forward_for_point`, `recenter`, `compute_rects`/`split_lengths`
+    // -- see PLAN.md's M87 stage 3 record for why "reserve rows" was
+    // rejected as a permanent version of an already-occasional gap: none
+    // of those functions have any concept of a non-buffer row). The
+    // price of that choice, paid deliberately: a pinned row HIDES the
+    // real buffer line underneath it rather than pushing it down, same
+    // as VS Code's own sticky scroll.
+    if var_on(interp, "scope-header") {
+        // Only the constructs whose OWN opening line has actually
+        // scrolled off the top of this window -- an enclosing construct
+        // whose header line is still on screen is not pinned; that is
+        // what makes this "sticky" rather than a permanent banner.
+        //
+        // M118 review fix (FIX-2): compares CHAR OFFSETS
+        // (`s.start`/`window_start`), not line numbers. This editor
+        // soft-wraps, so `window_start` can sit mid-line on a
+        // continuation row; a line-number comparison would say "still
+        // on screen" for a construct whose declaration is one long
+        // wrapped line whose beginning has genuinely scrolled off,
+        // because `s.start_line` and the window's start line still
+        // compare equal. `<` (strict), not `<=`: a scope starting
+        // exactly at `window_start` is the first thing visible, so it
+        // must not be pinned.
+        let mut scrolled_off: Vec<&Scope> =
+            chain.iter().filter(|s| s.start < window_start).collect();
+        // `scope_chain` returns outermost first; when there are more
+        // than the cap allows, drop from the FRONT (outermost) so the
+        // rows kept are the innermost ones -- the immediately enclosing
+        // construct is the useful one to keep visible, per the spec.
+        let max_lines = var_int(interp, "scope-header-max-lines", 3).max(0) as usize;
+        if scrolled_off.len() > max_lines {
+            let drop = scrolled_off.len() - max_lines;
+            scrolled_off.drain(0..drop);
+        }
+        let mut n = scrolled_off.len();
+        // Cap so the header can never cover the row THIS window's point
+        // was painted on -- only meaningful for the selected window
+        // (`cursor` here is the local variable this whole function has
+        // been tracking, always `Some` by this point thanks to the
+        // fallback just above; a non-selected window has no visible
+        // cursor and needs no cap). This is the reason no scroll margin
+        // is needed anywhere else: it is the sole guarantee that a
+        // pinned header row can never hide point.
+        if is_selected {
+            if let Some((crow, _)) = cursor {
+                let point_row = crow.saturating_sub(rect.row);
+                n = n.min(point_row);
+            }
+        }
+        // A two-row window (one text row + mode line) must never be
+        // entirely header.
+        n = n.min(text_rows.saturating_sub(1));
+        if n > 0 {
+            let header_face = face_or(
+                interp,
+                editor,
+                "scope-header",
+                Style {
+                    bg: Some((40, 44, 54)),
+                    fg: Some((175, 182, 196)),
+                    ..Style::default()
+                },
+            );
+            for (i, scope) in scrolled_off[..n].iter().enumerate() {
+                let r = rect.row + i;
+                // Same call the block-row precedent (`emit_block_rows`,
+                // `redisplay.rs:2232`) uses for "no line number, no
+                // diagnostic dot" -- immediately overwritten below by
+                // the whole-row header style, but keeps this row's
+                // gutter going through the one shared code path rather
+                // than a second hand-rolled blanking loop.
+                paint_gutter(grid, i, None, gutter_w);
+                for c in 0..rect.width {
+                    grid.put(r, rect.col + c, ' ', header_face);
+                }
+                // Original leading indentation preserved: the slice
+                // starts at the LINE's start, not the node's own start
+                // byte (a construct's node typically begins after its
+                // own indentation).
+                let ls = b.text.line_start(scope.start);
+                let le = b.text.line_end(scope.start);
+                let mut cc = 0usize;
+                for ch in b.text.chars_from(ls).take(le - ls) {
+                    let w = wide_char_width(ch);
+                    if tx + cc + w > rect.col + rect.width {
+                        break;
+                    }
+                    if w == 2 {
+                        grid.put_wide(r, tx + cc, ch, header_face);
+                    } else {
+                        grid.put(r, tx + cc, ch, header_face);
+                    }
+                    cc += w;
+                }
+            }
+            // Chrome, not buffer text: every `PaintRun` the text loop
+            // above already pushed for these rows must be REMOVED, not
+            // replaced with a `src: None` run -- `Grid::buffer_pos_at`
+            // filters on `src.is_some()`, so a leftover text run would
+            // still win over "no run at all" for a click on a header
+            // row. `fill_chrome_runs` (called once after every window
+            // finishes, see `render`) then synthesizes the `src: None`
+            // chrome runs these rows need from whatever `retain` leaves
+            // uncovered, same as every other chrome row.
+            // M118 review fix (FIX-1): bounded by COLUMN as well as row.
+            // `grid.runs` is frame-global, not per-window, and
+            // `compute_rects` always pushes split side `a` before side
+            // `b` regardless of which side is selected -- so on a
+            // side-by-side split (`C-x 3`) the left window's runs for
+            // these absolute rows are already in `grid.runs` by the time
+            // the right window (rendered second) paints its own header.
+            // A row-only predicate deleted the LEFT window's runs too
+            // (same rows, different columns), leaving its top rows
+            // visually correct (`grid.put` already wrote the glyphs) but
+            // unclickable (`buffer_pos_at` found no run and returned
+            // `None`).
+            let hdr_lo = rect.row;
+            let hdr_hi = rect.row + n;
+            let col_lo = rect.col;
+            let col_hi = rect.col + rect.width;
+            grid.runs.retain(|r| {
+                !(r.row >= hdr_lo && r.row < hdr_hi && r.col >= col_lo && r.col < col_hi)
+            });
+        }
     }
 
     // Current-line highlight (M16, hl-line-mode): tint the cursor row's
@@ -2302,6 +2941,21 @@ fn render_window(
         None
     };
 
+    // M118 (F2, scope breadcrumb): the FULL enclosing chain for this
+    // window's own `point` -- deliberately not filtered by what has
+    // scrolled off the way F1's header rows are above (the breadcrumb
+    // answers "where am I", the header answers "what did I lose").
+    // `chain` is the same value F1 above computed (FIX-5: hoisted to one
+    // `scope_chain` call per window per frame, shared by both
+    // consumers) -- empty here whenever `scope-breadcrumb` was off at
+    // that computation, same effect the old per-consumer gate had.
+    let breadcrumb_labels: Vec<&str> = if var_on(interp, "scope-breadcrumb") {
+        chain.iter().map(|s| s.label.as_str()).collect()
+    } else {
+        Vec::new()
+    };
+    let breadcrumb = format_breadcrumb(&breadcrumb_labels);
+
     let parts = ModeLineParts {
         prefix: prefix.as_str(),
         title: &title,
@@ -2309,6 +2963,7 @@ fn render_window(
         mode_name: &mode_name,
         dir,
         home: home.as_deref(),
+        breadcrumb: &breadcrumb,
         lsp: lsp_state,
         diags: diag_count,
         line: point_line,
@@ -3404,6 +4059,7 @@ mod tests {
             diags: 3,
             line: 42,
             col: 7,
+            breadcrumb: "",
         };
         let lc = "L42:7";
         for width in 1..=200 {
@@ -3612,5 +4268,168 @@ mod tests {
         // this function's own job is only the split/cap, not the
         // blank-skip policy.
         assert_eq!(diag_message_lines(""), vec![""]);
+    }
+
+    // M116 (show-trailing-whitespace): `trailing_whitespace_start` is
+    // the pure half of that feature -- "which columns of a line count as
+    // trailing whitespace" -- independent of the render loop's own
+    // per-frame plumbing (buffer-local toggle, point-at-eol exclusion,
+    // face lookup). The milestone spec names three cases by name: a
+    // line that is entirely whitespace, an empty line, and a line with
+    // no trailing whitespace at all; all three are covered below,
+    // alongside the ordinary "some text then trailing spaces/tabs" case
+    // the feature exists for.
+
+    #[test]
+    fn trailing_ws_start_line_with_no_trailing_whitespace() {
+        let g = GapBuffer::from_str("hello\nworld");
+        let line_start = g.line_start(0);
+        let line_end = g.line_end(0);
+        assert_eq!(
+            trailing_whitespace_start(&g, line_start, line_end),
+            line_end
+        );
+    }
+
+    #[test]
+    fn trailing_ws_start_some_trailing_spaces() {
+        let g = GapBuffer::from_str("hello   \nworld");
+        let line_start = g.line_start(0);
+        let line_end = g.line_end(0); // points at the '\n', byte-index 8
+        assert_eq!(trailing_whitespace_start(&g, line_start, line_end), 5);
+    }
+
+    #[test]
+    fn trailing_ws_start_trailing_tabs_and_spaces_mixed() {
+        let g = GapBuffer::from_str("a\t \t\nb");
+        let line_start = g.line_start(0);
+        let line_end = g.line_end(0);
+        // "a" then three whitespace chars ('\t', ' ', '\t') before the
+        // newline -- the run starts right after "a", at char index 1.
+        assert_eq!(trailing_whitespace_start(&g, line_start, line_end), 1);
+    }
+
+    #[test]
+    fn trailing_ws_start_entirely_whitespace_line() {
+        let g = GapBuffer::from_str("   \t  \nnext");
+        let line_start = g.line_start(0);
+        let line_end = g.line_end(0);
+        assert_eq!(
+            trailing_whitespace_start(&g, line_start, line_end),
+            line_start
+        );
+    }
+
+    #[test]
+    fn trailing_ws_start_empty_line() {
+        let g = GapBuffer::from_str("one\n\nthree");
+        let empty_line_pos = g.line_start(4); // the blank second line
+        let line_start = g.line_start(empty_line_pos);
+        let line_end = g.line_end(empty_line_pos);
+        assert_eq!(line_start, line_end, "sanity: an empty line has zero width");
+        assert_eq!(
+            trailing_whitespace_start(&g, line_start, line_end),
+            line_start
+        );
+    }
+
+    #[test]
+    fn trailing_ws_start_last_line_no_terminating_newline() {
+        // `GapBuffer::line_end`'s own documented fallback: with no `\n`
+        // to find, it returns `len_chars` (buffer end) -- confirming
+        // this function's behavior composes correctly with that, since
+        // the render loop's "buffer ends mid-line" path (`pos >= len`)
+        // relies on exactly this for the last line of a file with no
+        // trailing newline.
+        let g = GapBuffer::from_str("one\ntwo   ");
+        let line_start = g.line_start(4);
+        let line_end = g.line_end(4);
+        assert_eq!(line_end, g.len());
+        assert_eq!(trailing_whitespace_start(&g, line_start, line_end), 7);
+    }
+
+    // --- M118 (F2, scope breadcrumb) ---
+
+    #[test]
+    fn breadcrumb_two_element_chain_renders_in_the_composed_line() {
+        let crumb = format_breadcrumb(&["soc_top", "always_ff"]);
+        assert_eq!(crumb, "[soc_top > always_ff]");
+        let p = ModeLineParts {
+            title: "soc_top.sv",
+            mode_name: "verilog-mode",
+            line: 1,
+            breadcrumb: &crumb,
+            ..Default::default()
+        };
+        let ml = compose_mode_line(&p, 120);
+        assert!(
+            ml.left.contains("[soc_top > always_ff]"),
+            "left segment must contain the composed breadcrumb: {:?}",
+            ml.left
+        );
+    }
+
+    #[test]
+    fn breadcrumb_empty_chain_renders_no_bracket_at_all() {
+        let crumb = format_breadcrumb(&[]);
+        assert_eq!(crumb, "");
+        let p = ModeLineParts {
+            title: "plain.txt",
+            mode_name: "fundamental-mode",
+            line: 1,
+            breadcrumb: &crumb,
+            ..Default::default()
+        };
+        let ml = compose_mode_line(&p, 120);
+        assert!(
+            !ml.left.contains('[') && !ml.left.contains(']'),
+            "an empty chain must not add any bracket at all: {:?}",
+            ml.left
+        );
+    }
+
+    #[test]
+    fn breadcrumb_is_dropped_before_the_mode_name_under_width_pressure() {
+        // Lowest priority of every optional segment (see
+        // `compose_mode_line`'s own priority-order doc): checked (and
+        // therefore dropped) before diagnostics, the mode name, LSP, and
+        // dir. Pick a width that fits `title` + the mode name but not
+        // both the mode name AND the breadcrumb, and confirm the mode
+        // name survives while the breadcrumb does not, with `L:C`
+        // unconditionally intact either way.
+        let crumb = format_breadcrumb(&["soc_top", "always_ff", "case x"]);
+        let p = ModeLineParts {
+            title: "t",
+            mode_name: "verilog-mode",
+            line: 1,
+            breadcrumb: &crumb,
+            ..Default::default()
+        };
+        // " t" (2) + "  verilog-mode" (14) + gap(2) + "L1:0" (4) = 22 --
+        // fits the mode name with nothing left over for the breadcrumb
+        // (which alone needs another `ml_width("  [soc_top > always_ff \
+        // > case x]")` columns).
+        let width = 22;
+        let ml = compose_mode_line(&p, width);
+        assert!(
+            ml.left.contains("verilog-mode"),
+            "mode name must survive at this width: {:?}",
+            ml.left
+        );
+        assert!(
+            !ml.left.contains('['),
+            "breadcrumb must already be dropped at this width: {:?}",
+            ml.left
+        );
+        assert_eq!(ml.right, "L1:0", "L:C is never dropped");
+    }
+
+    #[test]
+    fn breadcrumb_six_element_chain_is_capped_to_the_innermost_four() {
+        let crumb = format_breadcrumb(&["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(
+            crumb, "[c > d > e > f]",
+            "outermost two (a, b) must be dropped, innermost four kept, in order"
+        );
     }
 }

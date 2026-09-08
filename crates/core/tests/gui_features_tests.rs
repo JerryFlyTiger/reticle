@@ -139,12 +139,13 @@ fn hl_line_mode_is_on_by_default() {
     run(&mut i, "(insert \"aaa\\nbbb\\nccc\")");
     run(&mut i, "(goto-char 5)"); // on line 2
     let grid = render(&i, &ed);
-    // Assert the exact hl-line face color (dark theme #20232a), not
-    // just is_some(): a wrong face (e.g. region's) must fail here
-    // (M32 review: the Option-only assertions couldn't tell).
+    // Assert the exact hl-line face color (M112: dracula theme #363848,
+    // the default), not just is_some(): a wrong face (e.g. region's)
+    // must fail here (M32 review: the Option-only assertions couldn't
+    // tell).
     assert_eq!(
         grid.lines[1][0].style.bg,
-        Some((0x20, 0x23, 0x2a)),
+        Some((0x36, 0x38, 0x48)),
         "cursor row should carry the hl-line face bg with no setq at all"
     );
 }
@@ -163,13 +164,13 @@ fn region_wins_over_hl_line_inside_the_selection_on_the_same_row() {
     let grid = render(&i, &ed);
     assert_eq!(
         grid.lines[0][0].style.bg,
-        Some((0x2c, 0x44, 0x63)),
-        "inside the region: the region face (dark #2c4463), not hl-line"
+        Some((0x44, 0x47, 0x5a)),
+        "inside the region: the region face (M107: dracula #44475a), not hl-line"
     );
     assert_eq!(
         grid.lines[0][8].style.bg,
-        Some((0x20, 0x23, 0x2a)),
-        "outside the region on the cursor row: the hl-line face"
+        Some((0x36, 0x38, 0x48)),
+        "outside the region on the cursor row: the hl-line face (M112: #363848)"
     );
 }
 
@@ -240,6 +241,136 @@ fn active_region_gets_the_region_background() {
     assert!(grid.lines[0][0].style.bg.is_some(), "region start tinted");
     assert!(grid.lines[0][4].style.bg.is_some(), "region end tinted");
     assert_eq!(grid.lines[0][6].style.bg, None, "outside region untinted");
+}
+
+/// M116 render-level tests: nothing before these drove `render` with
+/// `show-trailing-whitespace` on and inspected the resulting grid --
+/// a cold review demonstrated the hole concretely (deleting the whole
+/// highlight block, or hardcoding the point-at-end-of-line exemption to
+/// `false`, passed every test that existed before these). Dracula is
+/// this editor's default theme (`default_theme_on_startup_is_dracula`);
+/// its `trailing-whitespace` background is `#7e4f47` (themes.el).
+const DRACULA_TRAILING_WS_BG: (u8, u8, u8) = (0x7e, 0x4f, 0x47);
+
+#[test]
+fn trailing_whitespace_highlights_the_run_at_end_of_line() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"foo   \\nbar\")");
+    run(&mut i, "(setq hl-line-mode nil)");
+    run(&mut i, "(setq-local show-trailing-whitespace t)");
+    run(&mut i, "(goto-char 1)"); // line 1, not at its own end
+    let grid = render(&i, &ed);
+    assert_eq!(
+        grid.lines[0][2].style.bg, None,
+        "the 'o' itself is not trailing whitespace"
+    );
+    for c in 3..6 {
+        assert_eq!(
+            grid.lines[0][c].style.bg,
+            Some(DRACULA_TRAILING_WS_BG),
+            "column {c} is inside the trailing run"
+        );
+    }
+}
+
+#[test]
+fn trailing_whitespace_point_at_line_end_is_exempted() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"foo   \\nbar\")");
+    run(&mut i, "(setq hl-line-mode nil)");
+    run(&mut i, "(setq-local show-trailing-whitespace t)");
+    run(&mut i, "(goto-char 7)"); // char index 6 -- the line's own end (the '\n')
+    let grid = render(&i, &ed);
+    for c in 3..6 {
+        assert_eq!(
+            grid.lines[0][c].style.bg, None,
+            "GNU's own exclusion: point at THIS line's end exempts it,              column {c}"
+        );
+    }
+}
+
+#[test]
+fn trailing_whitespace_exemption_is_recomputed_on_a_later_line() {
+    // The exemption is computed once before the per-character loop and then
+    // recomputed at every '\n'. A test that puts point on the FIRST line
+    // exercises only the initial computation, and that is what the sibling
+    // test above does -- so mutating the recompute to a constant `false`
+    // survived the entire suite until this test existed. Found by the
+    // mutation runner, not by reading.
+    let (mut i, ed) = setup();
+    // chars: f0 o1 o2 \n3 b4 a5 r6 sp7 sp8 sp9 \n10 b11 a12 z13
+    run(&mut i, "(insert \"foo\\nbar   \\nbaz\")");
+    run(&mut i, "(setq hl-line-mode nil)");
+    run(&mut i, "(setq-local show-trailing-whitespace t)");
+    // point at char index 10 -- the SECOND line's own end (its '\n')
+    run(&mut i, "(goto-char 11)");
+    let grid = render(&i, &ed);
+    for c in 3..6 {
+        assert_eq!(
+            grid.lines[1][c].style.bg, None,
+            "point at line 2's end must exempt line 2's trailing run, column {c}"
+        );
+    }
+}
+
+#[test]
+fn trailing_whitespace_leaves_a_clean_line_untouched() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"foo\\nbar   \")"); // trailing ws only on line 2
+    run(&mut i, "(setq hl-line-mode nil)");
+    run(&mut i, "(setq-local show-trailing-whitespace t)");
+    run(&mut i, "(goto-char 1)");
+    let grid = render(&i, &ed);
+    for c in 0..3 {
+        assert_eq!(
+            grid.lines[0][c].style.bg, None,
+            "line 1 (\"foo\") has no trailing whitespace at all, column {c}"
+        );
+    }
+}
+
+#[test]
+fn trailing_whitespace_off_by_default_draws_nothing() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"foo   \")");
+    run(&mut i, "(setq hl-line-mode nil)");
+    run(&mut i, "(goto-char 1)");
+    let grid = render(&i, &ed);
+    for c in 0..6 {
+        assert_eq!(
+            grid.lines[0][c].style.bg, None,
+            "show-trailing-whitespace defaults off outside prog-mode, column {c}"
+        );
+    }
+}
+
+/// GNU review fix (see redisplay.rs's ordering comment): trailing
+/// whitespace must stay visible INSIDE an active region, not be erased
+/// by it -- verified against real Emacs (`-nw -Q`) driving a region
+/// across a line's own trailing run and decoding the raw ANSI. `mark`
+/// is placed past the trailing run (char index 6, right before the
+/// newline) and `point` at the buffer start (index 0) rather than the
+/// other way around, specifically so the point-at-line-end exemption
+/// does NOT fire here -- this test is about the region/trailing-ws
+/// priority, not about re-testing the exemption above.
+#[test]
+fn trailing_whitespace_wins_over_region_where_they_overlap() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(insert \"foo   \\nbar\")");
+    run(&mut i, "(setq-local show-trailing-whitespace t)");
+    {
+        let e = ed.borrow();
+        let mut b = e.current.borrow_mut();
+        b.mark = Some(6);
+        b.mark_active = true;
+        b.point = 0;
+    }
+    let grid = render(&i, &ed);
+    assert_eq!(
+        grid.lines[0][4].style.bg,
+        Some(DRACULA_TRAILING_WS_BG),
+        "trailing-whitespace must win over an active region where they          overlap -- selecting old trailing spaces further up a line one          is editing is the ordinary case, not an exotic one"
+    );
 }
 
 #[test]
@@ -329,23 +460,24 @@ fn synthetic_buffers_never_show_the_modified_marker_on_the_modeline() {
 #[test]
 fn themes_switch_the_default_face_live() {
     let (mut i, ed) = setup();
-    let dark_bg = core::redisplay::frame_base_style(&i, &ed.borrow()).bg;
+    // M107: Dracula is the default (was `dark`).
+    let dracula_bg = core::redisplay::frame_base_style(&i, &ed.borrow()).bg;
     assert_eq!(
-        dark_bg,
-        Some((0x19, 0x1b, 0x20)),
-        "dark theme is the default"
+        dracula_bg,
+        Some((0x28, 0x2a, 0x36)),
+        "dracula theme is the default"
     );
     run(&mut i, "(load-theme 'light)");
     let light = core::redisplay::frame_base_style(&i, &ed.borrow());
     assert_eq!(light.bg, Some((0xfb, 0xfb, 0xfd)));
     assert_eq!(light.fg, Some((0x2c, 0x31, 0x3a)));
     // And back.
-    run(&mut i, "(load-theme 'dark)");
+    run(&mut i, "(load-theme 'dracula)");
     assert_eq!(
         core::redisplay::frame_base_style(&i, &ed.borrow()).bg,
-        Some((0x19, 0x1b, 0x20))
+        Some((0x28, 0x2a, 0x36))
     );
-    assert_eq!(run(&mut i, "current-theme"), "dark");
+    assert_eq!(run(&mut i, "current-theme"), "dracula");
 }
 
 #[test]
@@ -651,61 +783,615 @@ fn echo_row_picks_up_the_echo_area_face() {
     );
 }
 
-/// M-visual-quality: both built-in themes must define the exact same
-/// set of face names -- catches a future edit that adds a face to one
-/// theme's function and forgets the other, silently leaving that face
-/// unstyled whenever the forgotten theme is active.
+// M112 review: the two theme-parsing tests below (`every_theme_defines_
+// the_same_set_of_faces` and `theme_chrome_faces_clear_the_visibility_
+// bar`) used to each carry their own copy of "find one theme's body in
+// themes.el's source", and the shared idiom cut a theme's body at the
+// next literal `"\n(defun "` rather than at that theme's own closing
+// paren -- for `theme--light` that ran roughly 3,300 characters into
+// `theme--dracula`'s header comment, which is to say clean through the
+// whole of it, since no other `"\n(defun "` occurs before its end. (An
+// earlier version of this comment said "about 370", a dropped digit
+// caught by cold reading -- measured by replaying the removed logic
+// against the file's actual bytes.) Harmless only because no comment
+// in the file happens to contain `(set-face '...)`-shaped text.
+// Factored into one paren-matching helper, shared by both tests plus
+// the org-face-color test below, that stops at the defun's own actual
+// end.
+
+/// Discover every `(defun theme--NAME (...)` top-level form in
+/// `themes.el`'s source, instead of a hard-coded list of names -- so a
+/// theme added later is picked up automatically rather than silently
+/// skipped by every test that uses this.
+fn theme_defun_names(src: &str) -> Vec<String> {
+    src.match_indices("(defun theme--")
+        .map(|(i, m)| {
+            let rest = &src[i + m.len()..];
+            let end = rest.find(' ').unwrap_or(rest.len());
+            format!("theme--{}", &rest[..end])
+        })
+        .collect()
+}
+
+/// The exact source text of one `(defun theme--NAME (...) ...)` form,
+/// from its own opening paren to its own matching closing paren --
+/// found by tracking paren depth (skipping `;`-to-end-of-line comments
+/// and `"..."` string contents, neither of which can hide a real paren
+/// in this file: no hex color or docstring here contains one), not by
+/// guessing where the next theme's defun starts.
+fn theme_defun_body<'a>(src: &'a str, defun: &str) -> &'a str {
+    let needle = format!("(defun {defun} (");
+    let start = src
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{defun} not found in themes.el"));
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    loop {
+        assert!(
+            i < bytes.len(),
+            "{defun}: ran off the end of the file with unbalanced parens"
+        );
+        let c = bytes[i];
+        if in_string {
+            if c == b'"' {
+                in_string = false;
+            }
+        } else {
+            match c {
+                b';' => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'"' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[start..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Every `(set-face 'FACE ...)` name defined directly inside one
+/// theme's body.
+fn faces_set_by(body: &str) -> std::collections::BTreeSet<String> {
+    body.match_indices("(set-face '")
+        .map(|(i, m)| {
+            let rest = &body[i + m.len()..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == ')')
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        })
+        .collect()
+}
+
+/// Pull the value of one `:foreground`/`:background` keyword off one
+/// theme's `(set-face 'FACE ...)` call. `indent-guide`/`scroll-bar` are
+/// stored under `:foreground` in this codebase even though they're
+/// rendered as a fill color, not text -- callers pass whichever keyword
+/// each face actually uses.
+fn face_color(body: &str, face: &str, keyword: &str) -> String {
+    let start = body
+        .find(&format!("(set-face '{face} "))
+        .unwrap_or_else(|| panic!("(set-face '{face} ...) not found"));
+    let rest = &body[start..];
+    let end = rest
+        .find(')')
+        .unwrap_or_else(|| panic!("no closing paren for (set-face '{face} ...)"));
+    let call = &rest[..end];
+    let kw_start = call
+        .find(&format!(":{keyword} \""))
+        .unwrap_or_else(|| panic!("{face} has no :{keyword} in {call}"))
+        + keyword.len()
+        + 3;
+    let kw_rest = &call[kw_start..];
+    let kw_end = kw_rest.find('"').unwrap();
+    kw_rest[..kw_end].to_string()
+}
+
+/// Every `#rrggbb` hex literal appearing anywhere in a theme's body,
+/// lower-cased. Used to check that a face's color is drawn from the
+/// theme's own palette rather than fat-fingered or copy-pasted from a
+/// different theme.
+/// Every `#RRGGBB` literal in `body`, lower-cased.
+///
+/// Two things this deliberately does NOT do, both found by cold reading
+/// the first version:
+///
+/// * It does not slice a fixed seven bytes off `body` at each `#`. That
+///   panics with "byte index is not a char boundary" the day someone
+///   puts a multi-byte character within six bytes after a `#` in a
+///   theme comment. There is exactly one non-ASCII character in
+///   `themes.el` today and it happens to sit outside every theme body,
+///   which is not a property worth relying on.
+/// * It does not accept a run of more than six hex digits. An
+///   eight-digit `#RRGGBBAA` appears in `theme--dracula`'s indent-guide
+///   comment (`#FFFFFF1A`, Dracula's published white-at-10% guide
+///   colour), and taking its leading six would have inserted a
+///   `#ffffff` into the derived palette that no face actually uses --
+///   inert today, but a false-pass waiting for a fat-fingered face
+///   colour whose value happens to match some comment's leading six.
+fn all_hex_colors_in(body: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (start, _) in body.match_indices('#') {
+        let run: String = body[start + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if run.len() == 6 {
+            out.insert(format!("#{}", run.to_ascii_lowercase()));
+        }
+    }
+    out
+}
+
+/// M107: every built-in theme (`theme--dark`, `theme--light`,
+/// `theme--dracula`, `theme--xcode`, `theme--vscode`, and any future
+/// `theme--*` defun) must define the exact same set of face names --
+/// catches a future edit that adds a face to one theme's function and
+/// forgets another, silently leaving that face unstyled whenever the
+/// forgotten theme is active. This supersedes the old M-visual-quality
+/// version, which hard-coded just `theme--dark` and `theme--light` by
+/// name -- M107 added three more theme functions that version would
+/// never have looked at, so a face dropped from any of them would have
+/// gone undetected.
 #[test]
-fn both_themes_define_the_same_set_of_faces() {
+fn every_theme_defines_the_same_set_of_faces() {
     // This reads the source rather than the running face table, and that
     // is not squeamishness -- the obvious runtime version of this test is
-    // vacuous. `themes.el` calls `(load-theme 'dark)` at eval time, so by
-    // the time a test can call `(load-theme 'light)` the face table
-    // already holds everything the dark theme set. Loading light on top
-    // only ever adds or overwrites, never removes, so the light set is
-    // unconditionally a superset of the dark one and deleting a face from
-    // `theme--light` is invisible. Caught by mutation C3 in
-    // dev/mutations/m86.py, which survived the earlier runtime version of
-    // this test.
+    // vacuous. `themes.el` calls `(load-theme 'dracula)` at eval time, so
+    // by the time a test can call `(load-theme 'light)` the face table
+    // already holds everything the dracula theme set. Loading another
+    // theme on top only ever adds or overwrites, never removes, so any
+    // later theme's face set is unconditionally a superset of every
+    // theme loaded before it, and deleting a face from one theme's own
+    // defun is invisible. Caught by mutation C3 in dev/mutations/m86.py,
+    // which survived the earlier runtime version of this test.
     let src = include_str!("../lisp/themes.el");
 
-    fn faces_set_by(src: &str, defun: &str) -> std::collections::BTreeSet<String> {
-        let body = src
-            .split_once(&format!("(defun {defun} ("))
-            .unwrap_or_else(|| panic!("{defun} not found in themes.el"))
-            .1;
-        // Each theme is one top-level defun, so the next one starts at the
-        // next column-zero `(defun`; take everything before that.
-        let body = body.split("\n(defun ").next().unwrap_or(body);
-        body.match_indices("(set-face '")
-            .map(|(i, m)| {
-                let rest = &body[i + m.len()..];
-                let end = rest
-                    .find(|c: char| c.is_whitespace() || c == ')')
-                    .unwrap_or(rest.len());
-                rest[..end].to_string()
-            })
-            .collect()
+    let theme_names = theme_defun_names(src);
+    assert!(
+        theme_names.len() >= 5,
+        "expected at least 5 theme--* defuns (dark, light, dracula, xcode, \
+         vscode), the parser found only {:?}",
+        theme_names
+    );
+
+    let face_sets: Vec<(String, std::collections::BTreeSet<String>)> = theme_names
+        .iter()
+        .map(|name| (name.clone(), faces_set_by(theme_defun_body(src, name))))
+        .collect();
+
+    for (name, faces) in &face_sets {
+        assert!(
+            !faces.is_empty(),
+            "parsed no faces at all for {name} -- the parser, not the theme, is broken"
+        );
     }
 
-    let dark_names = faces_set_by(src, "theme--dark");
-    let light_names = faces_set_by(src, "theme--light");
-    assert!(
-        !dark_names.is_empty() && !light_names.is_empty(),
-        "parsed no faces at all -- the parser, not the themes, is broken \
-         (dark={}, light={})",
-        dark_names.len(),
-        light_names.len()
-    );
+    let (reference_name, reference_faces) = &face_sets[0];
+    for (name, faces) in &face_sets[1..] {
+        let missing: Vec<_> = reference_faces.difference(faces).collect();
+        let extra: Vec<_> = faces.difference(reference_faces).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "face sets differ between {reference_name} and {name}: \
+             missing-from-{name}={missing:?} extra-in-{name}={extra:?}"
+        );
+    }
 
-    let dark_only: Vec<_> = dark_names.difference(&light_names).collect();
-    let light_only: Vec<_> = light_names.difference(&dark_names).collect();
-    assert!(
-        dark_only.is_empty() && light_only.is_empty(),
-        "face sets differ: dark-only={:?} light-only={:?}",
-        dark_only,
-        light_only
+    // A floor, because comparing the themes only against EACH OTHER is
+    // blind in one direction: a face missing from all five is perfectly
+    // consistent, and this test would report nothing.
+    //
+    // That is not hypothetical. A cold reviewer named it as a theoretical
+    // gap during M112; during M116 it happened. Two new faces were added
+    // to the Rust side and to no theme at all, so they silently fell back
+    // to hard-coded defaults and stopped following the active theme --
+    // exactly the `org-*` defect M112 had just finished fixing -- and this
+    // test stayed green throughout, because 57 == 57 == 57 == 57 == 57.
+    //
+    // Same lesson as `dev/test_pixdiff.py`'s MINIMUM_TESTS floor: a check
+    // that decides what to compare has to fail loudly when it decides to
+    // compare nothing. Raise this number when faces are added; lower it
+    // only in a commit that says which face went away and why.
+    // M118: +1 for `scope-header` (sticky scope header / breadcrumb).
+    const MINIMUM_FACES: usize = 60;
+    for (name, faces) in &face_sets {
+        assert!(
+            faces.len() >= MINIMUM_FACES,
+            "{name} defines {} faces, expected at least {MINIMUM_FACES}. Either a \
+             face was deliberately removed (lower the floor in a commit that says \
+             which and why) or one was added to the Rust side and to no theme, \
+             which the set comparison above cannot see because it only checks the \
+             themes against each other",
+            faces.len()
+        );
+    }
+}
+
+// WCAG 2.x relative luminance / contrast ratio -- see
+// https://www.w3.org/TR/WCAG21/#dfn-relative-luminance. No such helper
+// existed anywhere in the tree; this is a pure function, so per this
+// project's testing conventions it belongs here, not in product code.
+//
+// The formula is exactly WCAG's, but the numeric bands the test below
+// checks against (roughly 1.20-1.45) are NOT a WCAG conformance claim:
+// WCAG's own threshold for non-text UI components is 3:1, well above
+// every value here. This project's editor chrome is deliberately quiet
+// -- these bands are this project's own design targets, using the WCAG
+// formula only as a consistent ruler for "how far a color sits from
+// the background", not as a pass/fail accessibility check.
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    fn channel(c: u8) -> f64 {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
+    let hex = hex.trim_start_matches('#');
+    (
+        u8::from_str_radix(&hex[0..2], 16).unwrap(),
+        u8::from_str_radix(&hex[2..4], 16).unwrap(),
+        u8::from_str_radix(&hex[4..6], 16).unwrap(),
+    )
+}
+
+fn contrast_ratio(a: &str, b: &str) -> f64 {
+    let (l1, l2) = (
+        relative_luminance(hex_to_rgb(a)),
+        relative_luminance(hex_to_rgb(b)),
     );
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// M112: the chrome-visibility fix. `hl-line`, `indent-guide`,
+/// `scroll-bar`, `mode-line`, and `mode-line-inactive` used to be set so
+/// close to each theme's own background (measured from a screenshot:
+/// contrast ratios of 1.03-1.16, several within three RGB units per
+/// channel of the background) that they were invisible in practice even
+/// though the drawing code ran every frame. This computes the same
+/// relative-luminance contrast ratio the milestone was scoped from
+/// (see `relative_luminance' above for what these numbers do and don't
+/// claim) and checks every theme landed in the target bands, reading
+/// colors straight out of themes.el's source the same way
+/// `every_theme_defines_the_same_set_of_faces' above does (parsing, not
+/// the live face table, for the same reason that test gives: loading a
+/// second theme only ever adds/overwrites the runtime table, so a
+/// runtime read can't tell a theme's own value from one left over from
+/// `load-theme''s startup call).
+/// `themes.el` states, per theme, that `completions-selected` and
+/// `panel-selected` reuse `region`'s own background, so that a chosen
+/// completion row and an active selection read as the same "this one"
+/// affordance. That was true in all five themes and asserted nowhere.
+///
+/// It nearly stopped being true: M112's fix round raised `light`'s
+/// `region` substantially (it was capping how strong that theme's
+/// indent guide and scrollbar could be), and these two faces had to
+/// move with it. A cold reviewer named this as the one value in that
+/// diff for which no mutation could be designed, because no test read
+/// it. This is that test.
+/// `show-paren-match` must stay visually apart from the two other
+/// surfaces that can sit under point: `region` and `hl-line`.
+///
+/// This exists because the claim was twice made in prose and twice
+/// wrong. M113 shipped a 20% blend of each theme's own
+/// `diagnostic-warning` into its background; a cold read measured
+/// Dracula's at **1.011** against `region` -- the closest two faces this
+/// project shipped anywhere. The fix round re-derived Dracula and then
+/// asserted, again without measuring, that the other four "already clear
+/// a reasonable margin". A second cold read measured them: `light` was
+/// **1.051** against `hl-line`, which is worse in practice than the
+/// Dracula case it followed, because `hl-line-mode` is on by default and
+/// point is nearly always on the current line.
+///
+/// So the bar is 1.30 against both, and it is checked here rather than
+/// claimed in a comment. The blend fraction differs per theme as a
+/// result -- it is whatever that theme's own warning hue needs.
+#[test]
+fn show_paren_match_separates_from_region_and_hl_line() {
+    let src = include_str!("../lisp/themes.el");
+    const BAR: f64 = 1.30;
+
+    for name in [
+        "theme--dark",
+        "theme--light",
+        "theme--dracula",
+        "theme--xcode",
+        "theme--vscode",
+    ] {
+        let body = theme_defun_body(src, name);
+        let paren = face_color(body, "show-paren-match", "background");
+        for other in ["region", "hl-line"] {
+            let c = face_color(body, other, "background");
+            let r = contrast_ratio(&paren, &c);
+            assert!(
+                r >= BAR,
+                "{name}: show-paren-match {paren} is only {r:.3} from {other} {c}; \
+                 the bar is {BAR} and a highlight that vanishes into the \
+                 selection or the current line is not a highlight"
+            );
+        }
+    }
+}
+
+/// M116 sibling of `show_paren_match_separates_from_region_and_hl_line`,
+/// same bar and same reasoning: `trailing-whitespace' is a genuine grid
+/// cell background (`redisplay.rs` sets `style.bg` in the per-character
+/// loop, same mechanism `show-paren-match'/`region' use), and it can sit
+/// on point's own current line -- wherever point is not at that line's
+/// end, per `show-trailing-whitespace''s own exclusion rule -- at the
+/// same time `hl-line-mode' tints the rest of that row, and inside an
+/// active selection at the same time as `region' (both of which fully
+/// overwrite it where they overlap, exactly the way `show-paren-match'
+/// is overwritten by `region' -- see redisplay.rs's ordering comments).
+/// Without this bar, a theme could pick a trailing-whitespace color that
+/// reads identically to the current-line tint it usually sits inside,
+/// making the "look here, verible will reject this" signal invisible in
+/// exactly the situation (typing on a line with old trailing spaces
+/// further up it) it exists to catch.
+///
+/// `fill-column-indicator' is deliberately NOT covered by this test: it
+/// is never a grid-cell background at all -- `frontend-gui/src/lib.rs`
+/// paints it as a standalone pixel rectangle over the finished frame,
+/// the same mechanism `indent-guide' uses (see that block's own
+/// comment), not a `Style::bg' a per-character loop can be racing
+/// `region'/`hl-line'/`show-paren-match' to set. Its own visual-overlap
+/// concern (colliding with `indent-guide', not with `region'/`hl-line')
+/// is checked below as a separate `vs-indent-guide' comment recorded
+/// next to each theme's `fill-column-indicator' definition, not by a
+/// test in this file, because -- unlike a `Style::bg' collision, which
+/// is a per-cell either/or `redisplay.rs` resolves at render time -- an
+/// indent guide and the fill-column ruler landing on the same column is
+/// a per-buffer-content coincidence with no fixed resolution to assert
+/// on beyond "paint order picks a winner", which the `lib.rs` comment
+/// at that block already states plainly.
+#[test]
+fn trailing_whitespace_separates_from_region_and_hl_line() {
+    let src = include_str!("../lisp/themes.el");
+    const BAR: f64 = 1.30;
+
+    for name in [
+        "theme--dark",
+        "theme--light",
+        "theme--dracula",
+        "theme--xcode",
+        "theme--vscode",
+    ] {
+        let body = theme_defun_body(src, name);
+        let tw = face_color(body, "trailing-whitespace", "background");
+        for other in ["region", "hl-line"] {
+            let c = face_color(body, other, "background");
+            let r = contrast_ratio(&tw, &c);
+            assert!(
+                r >= BAR,
+                "{name}: trailing-whitespace {tw} is only {r:.3} from {other} {c}; \
+                 the bar is {BAR} and a highlight that vanishes into the \
+                 selection or the current line is not a highlight"
+            );
+        }
+    }
+}
+
+/// M116 review fix: `fill-column-indicator` is a pixel overlay, not a
+/// grid-cell background (see the comment on the test above for why it's
+/// excluded from THAT one), but it is painted immediately after
+/// `indent-guide` in `frontend-gui/src/lib.rs` and both are the exact
+/// same kind of overlay (a thin rule filled from a `:foreground` value)
+/// -- so a future theme edit could still make the ruler vanish into the
+/// guides on any column both land on. Same bar and formula as every
+/// other separation test in this file.
+#[test]
+fn fill_column_indicator_separates_from_indent_guide() {
+    let src = include_str!("../lisp/themes.el");
+    const BAR: f64 = 1.30;
+
+    for name in [
+        "theme--dark",
+        "theme--light",
+        "theme--dracula",
+        "theme--xcode",
+        "theme--vscode",
+    ] {
+        let body = theme_defun_body(src, name);
+        let fc = face_color(body, "fill-column-indicator", "foreground");
+        let ig = face_color(body, "indent-guide", "foreground");
+        let r = contrast_ratio(&fc, &ig);
+        assert!(
+            r >= BAR,
+            "{name}: fill-column-indicator {fc} is only {r:.3} from indent-guide              {ig}; the bar is {BAR} and a ruler that vanishes into the indent              guides on the columns where they coincide is not a ruler"
+        );
+    }
+}
+
+#[test]
+fn selected_row_backgrounds_mirror_the_selection() {
+    let src = include_str!("../lisp/themes.el");
+
+    for name in [
+        "theme--dark",
+        "theme--light",
+        "theme--dracula",
+        "theme--xcode",
+        "theme--vscode",
+    ] {
+        let body = theme_defun_body(src, name);
+        let region = face_color(body, "region", "background");
+        for face in ["completions-selected", "panel-selected"] {
+            let got = face_color(body, face, "background");
+            assert_eq!(
+                got, region,
+                "{name}: {face}'s background {got} must mirror region's {region} -- \
+                 a selected row and an active selection are the same affordance, \
+                 and themes.el says so in prose next to both"
+            );
+        }
+    }
+}
+
+#[test]
+fn theme_chrome_faces_clear_the_visibility_bar() {
+    let src = include_str!("../lisp/themes.el");
+
+    for name in [
+        "theme--dark",
+        "theme--light",
+        "theme--dracula",
+        "theme--xcode",
+        "theme--vscode",
+    ] {
+        let body = theme_defun_body(src, name);
+        let bg = face_color(body, "default", "background");
+        let region = face_color(body, "region", "background");
+        let hl_line = face_color(body, "hl-line", "background");
+        let indent_guide = face_color(body, "indent-guide", "foreground");
+        let scroll_bar = face_color(body, "scroll-bar", "foreground");
+        let mode_line = face_color(body, "mode-line", "background");
+        let mode_line_inactive = face_color(body, "mode-line-inactive", "background");
+
+        let r_region = contrast_ratio(&region, &bg);
+        let r_hl_line = contrast_ratio(&hl_line, &bg);
+        let r_indent_guide = contrast_ratio(&indent_guide, &bg);
+        let r_scroll_bar = contrast_ratio(&scroll_bar, &bg);
+        let r_mode_line = contrast_ratio(&mode_line, &bg);
+        let r_mode_line_inactive = contrast_ratio(&mode_line_inactive, &bg);
+
+        // hl-line must never read as loud as an actual selection, in
+        // every theme without exception -- this is a correctness rule,
+        // not just a visibility target.
+        assert!(
+            r_hl_line < r_region,
+            "{name}: hl-line ({r_hl_line:.3}) must be strictly weaker than region ({r_region:.3})"
+        );
+
+        // theme--xcode's hl-line is excluded from the visibility band on
+        // purpose: it's disclosed in themes.el as copied verbatim from
+        // Xcode's own .xccolortheme Current Line color (verified against
+        // the installed application, not just trusted -- see that
+        // face's own comment in themes.el), and M112's own scope rules
+        // forbid overriding a value marked as upstream-sourced.
+        if name != "theme--xcode" {
+            assert!(
+                (1.20..=1.35).contains(&r_hl_line),
+                "{name}: hl-line ratio {r_hl_line:.3} outside the 1.20-1.35 target band"
+            );
+        }
+
+        // indent-guide: this used to carry a theme--light-specific
+        // carve-out here, because that theme's own `region' was only
+        // ~1.30 (far weaker than every other theme's), capping how
+        // strong indent-guide/scroll-bar could get below it. That was
+        // fixed at the source (`region' itself raised to ~1.73, see its
+        // own comment in themes.el) rather than special-cased in this
+        // test, so every theme now shares one band with no exception.
+        assert!(
+            (1.30..=1.45).contains(&r_indent_guide),
+            "{name}: indent-guide ratio {r_indent_guide:.3} outside the 1.30-1.45 target band"
+        );
+
+        // scroll-bar: at least as visible as indent-guide, no louder
+        // than the selection -- regardless of which of indent-guide's
+        // and region's ratios happens to be larger in this theme.
+        let (lo, hi) = if r_indent_guide < r_region {
+            (r_indent_guide, r_region)
+        } else {
+            (r_region, r_indent_guide)
+        };
+        assert!(
+            r_scroll_bar >= lo - 0.001 && r_scroll_bar <= hi + 0.001,
+            "{name}: scroll-bar ratio {r_scroll_bar:.3} not between indent-guide's \
+             {r_indent_guide:.3} and region's {r_region:.3}"
+        );
+
+        // mode-line is a distinct chrome surface in every theme.
+        assert!(
+            r_mode_line >= 1.20,
+            "{name}: mode-line ratio {r_mode_line:.3} below the 1.20 chrome-visibility bar"
+        );
+
+        // mode-line-inactive is also a distinct surface (M112 review:
+        // this face is a named target of the milestone and was
+        // previously untested here at all), but it must read as LESS
+        // prominent than the active mode-line, with a real margin --
+        // an inactive window's status line outshining the active one's
+        // is backwards. A first attempt at `theme--dark' got this
+        // exactly backwards by 0.0007 while its own comment claimed the
+        // opposite; 0.02 is comfortably larger than that kind of
+        // rounding-distance mistake.
+        assert!(
+            (1.05..=1.30).contains(&r_mode_line_inactive),
+            "{name}: mode-line-inactive ratio {r_mode_line_inactive:.3} outside the 1.05-1.30 band"
+        );
+        assert!(
+            r_mode_line - r_mode_line_inactive >= 0.02,
+            "{name}: mode-line-inactive ({r_mode_line_inactive:.3}) must be visibly weaker than \
+             mode-line ({r_mode_line:.3}), margin was only {:.4}",
+            r_mode_line - r_mode_line_inactive
+        );
+    }
+}
+
+/// M112 review: nothing checked org-face *colors*, only their names
+/// (`every_theme_defines_the_same_set_of_faces' above only proves the
+/// nine org faces exist in every theme, not that their values are
+/// sane) -- a fat-fingered hex or a color accidentally copy-pasted from
+/// a different theme's org section would pass every other check here.
+/// Each theme's nine org faces are documented as reusing that same
+/// theme's own existing palette (see e.g. `theme--dark''s org-faces
+/// comment), so this asserts exactly that property: every org face's
+/// color also appears somewhere else in that same theme's body.
+#[test]
+fn org_face_colors_are_drawn_from_their_own_theme() {
+    let src = include_str!("../lisp/themes.el");
+    let org_faces = [
+        "org-level-1",
+        "org-level-2",
+        "org-level-3",
+        "org-level-4",
+        "org-todo",
+        "org-done",
+        "org-table",
+        "org-date",
+        "org-link",
+    ];
+
+    for name in theme_defun_names(src) {
+        let body = theme_defun_body(src, &name);
+        let palette = all_hex_colors_in(body);
+        for face in org_faces {
+            let color = face_color(body, face, "foreground");
+            // Every org face's color must occur at least twice in the
+            // body: once on its own `org-*' line, and at least once
+            // more on some other face's line -- i.e. it is a reuse of
+            // an existing role color, not a one-off value unique to
+            // the org face (which is exactly what a fat-fingered or
+            // cross-theme-copied hex would look like).
+            let occurrences = body.matches(&color).count();
+            assert!(
+                palette.contains(&color) && occurrences >= 2,
+                "{name}: {face}'s color {color} does not reappear elsewhere in this theme's own \
+                 body (found {occurrences} occurrence(s)) -- looks fat-fingered or copied from a \
+                 different theme"
+            );
+        }
+    }
 }
 
 /// GUI fix 2: `Grid::windows` is the layout metadata the GUI reads to
@@ -1162,5 +1848,195 @@ fn moving_point_after_a_wheel_scroll_resumes_normal_recentring() {
     assert!(
         point >= after_move_start,
         "point ({point}) must be visible (>= window_start {after_move_start}) again"
+    );
+}
+
+// M105: user-selectable GUI font. These exercise the elisp side only
+// (`crates/core/lisp/gui.el`) -- the embedded-bytes/atlas-rebuild side
+// lives in `crates/frontend-gui/tests/font_tests.rs`, which is a
+// separate crate this one has no dependency on.
+
+#[test]
+fn gui_font_and_related_vars_have_the_documented_defaults() {
+    let (mut i, _ed) = setup();
+    assert_eq!(run(&mut i, "gui-font"), "jetbrains-mono");
+    assert_eq!(run(&mut i, "gui-font-family"), "nil");
+    assert_eq!(run(&mut i, "gui-font-size"), "16");
+    assert_eq!(run(&mut i, "gui-padding-x"), "10");
+    assert_eq!(run(&mut i, "gui-padding-y"), "6");
+    assert_eq!(run(&mut i, "gui-line-spacing"), "100");
+    assert_eq!(run(&mut i, "gui-indent-guide-step"), "nil");
+    assert_eq!(run(&mut i, "gui-cursor-blinks"), "10");
+    assert_eq!(run(&mut i, "gui-debug-overlay"), "nil");
+    assert_eq!(run(&mut i, "gui-opacity"), "100");
+}
+
+#[test]
+fn set_font_is_interactive_and_updates_gui_font_via_completing_read() {
+    let (mut i, _ed) = setup();
+    assert_eq!(run(&mut i, "(fboundp 'set-font)"), "t");
+    // Stub `completing-read` the same way `format_tests.rs`'s
+    // `format-set-style` tests do: `fset` a fixed-choice replacement,
+    // since there is no real minibuffer in this headless test.
+    run(&mut i, "(setq gui-font 'jetbrains-mono)");
+    run(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (funcall callback \"fira-code\")))",
+    );
+    run(&mut i, "(set-font)");
+    assert_eq!(run(&mut i, "gui-font"), "fira-code");
+}
+
+#[test]
+fn set_font_rejects_sf_mono_when_not_installed() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(setq gui-font 'jetbrains-mono)");
+    run(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (funcall callback \"sf-mono\")))",
+    );
+    // Force the "not installed" branch regardless of what's actually on
+    // the machine running this test, by redefining the availability
+    // check itself -- `gui--sf-mono-available-p` is a plain `defun`, and
+    // `fset` overwrites it the same way `format-set-style`'s tests
+    // overwrite `completing-read`.
+    run(&mut i, "(fset 'gui--sf-mono-available-p (lambda () nil))");
+    run(&mut i, "(set-font)");
+    assert_eq!(
+        run(&mut i, "gui-font"),
+        "jetbrains-mono",
+        "gui-font must be left unchanged when sf-mono isn't available"
+    );
+}
+
+/// M107: all five built-in themes (the two pre-existing plus the three
+/// new dark ones) actually load and take effect -- `current-theme` is
+/// updated and the `default` face's fg/bg match that theme's real hex
+/// values, not just "some color changed".
+#[test]
+fn all_five_themes_load_and_set_the_default_face() {
+    let (mut i, ed) = setup();
+    // A named triple rather than a bare tuple: clippy's type_complexity
+    // fires on the inline form, and the names say which end is which.
+    struct ThemeCase {
+        name: &'static str,
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+    }
+    let cases: [ThemeCase; 5] = [
+        ThemeCase {
+            name: "dracula",
+            fg: (0xf8, 0xf8, 0xf2),
+            bg: (0x28, 0x2a, 0x36),
+        },
+        ThemeCase {
+            name: "xcode",
+            fg: (0xff, 0xff, 0xff),
+            bg: (0x1f, 0x1f, 0x24),
+        },
+        ThemeCase {
+            name: "vscode",
+            fg: (0xd4, 0xd4, 0xd4),
+            bg: (0x1e, 0x1e, 0x1e),
+        },
+        ThemeCase {
+            name: "dark",
+            fg: (0xc5, 0xca, 0xd3),
+            bg: (0x19, 0x1b, 0x20),
+        },
+        ThemeCase {
+            name: "light",
+            fg: (0x2c, 0x31, 0x3a),
+            bg: (0xfb, 0xfb, 0xfd),
+        },
+    ];
+    for ThemeCase { name, fg, bg } in cases {
+        run(&mut i, &format!("(load-theme '{name})"));
+        assert_eq!(
+            run(&mut i, "current-theme"),
+            name,
+            "current-theme did not update after loading {name}"
+        );
+        let style = core::redisplay::frame_base_style(&i, &ed.borrow());
+        assert_eq!(style.fg, Some(fg), "{name}: default face fg mismatch");
+        assert_eq!(style.bg, Some(bg), "{name}: default face bg mismatch");
+    }
+}
+
+/// M107: dracula must be the theme a freshly started interpreter is
+/// already on, with no `load-theme` call from the test at all.
+#[test]
+fn default_theme_on_startup_is_dracula() {
+    let (mut i, ed) = setup();
+    assert_eq!(run(&mut i, "current-theme"), "dracula");
+    let style = core::redisplay::frame_base_style(&i, &ed.borrow());
+    assert_eq!(
+        style.bg,
+        Some((0x28, 0x2a, 0x36)),
+        "default face background must be dracula's, with no load-theme call"
+    );
+}
+
+/// M107: an unrecognized theme name is still rejected, and the error
+/// message names all five known themes (not just the original two), so
+/// a user mistyping a name gets a useful list of valid choices.
+#[test]
+fn load_theme_rejects_unknown_names_and_lists_all_five() {
+    let (mut i, _ed) = setup();
+    let result = run(&mut i, "(load-theme 'nonexistent-theme)");
+    assert!(
+        result.starts_with("ERROR"),
+        "expected an error, got {result:?}"
+    );
+    for name in ["dracula", "xcode", "vscode", "dark", "light"] {
+        assert!(
+            result.contains(name),
+            "error message should list {name:?} as a valid choice, got {result:?}"
+        );
+    }
+}
+
+/// M107 sanity check: none of the three new themes forgot to set a
+/// background at all -- a face left completely unstyled would silently
+/// fall back to whatever `Style::default()` renders as (typically pure
+/// black or the terminal's own background), so require the three new
+/// dark themes' `default` background to be neither pure black nor pure
+/// white.
+#[test]
+fn new_dark_themes_have_a_real_background_not_black_or_white() {
+    let (mut i, ed) = setup();
+    for name in ["dracula", "xcode", "vscode"] {
+        run(&mut i, &format!("(load-theme '{name})"));
+        let bg = core::redisplay::frame_base_style(&i, &ed.borrow())
+            .bg
+            .unwrap_or_else(|| panic!("{name}: default face has no background at all"));
+        assert_ne!(bg, (0x00, 0x00, 0x00), "{name}: background is pure black");
+        assert_ne!(bg, (0xff, 0xff, 0xff), "{name}: background is pure white");
+    }
+}
+
+/// M107: `load-theme` called interactively (no argument) prompts via
+/// `completing-read` over the five theme names, the same pattern
+/// `set-font`/`format-set-style` already use, and applies whichever
+/// theme the user picked.
+#[test]
+fn load_theme_is_interactive_and_applies_the_chosen_theme() {
+    let (mut i, ed) = setup();
+    assert_eq!(run(&mut i, "current-theme"), "dracula");
+    run(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (funcall callback \"xcode\")))",
+    );
+    run(&mut i, "(load-theme)");
+    assert_eq!(run(&mut i, "current-theme"), "xcode");
+    assert_eq!(
+        core::redisplay::frame_base_style(&i, &ed.borrow()).bg,
+        Some((0x1f, 0x1f, 0x24))
     );
 }

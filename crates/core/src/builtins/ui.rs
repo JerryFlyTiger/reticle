@@ -9,6 +9,7 @@ use elisp::{Interp, Value};
 use super::{buffer_arg, cur, ed_handle, get_pos, int_pos, MARKER_TAG, OVERLAY_TAG};
 use crate::buffer::{trace_overlay, MarkerData, OverlayData};
 use crate::commands::{ArgSpec, Key, PendingArgs};
+use crate::editor::Editor;
 use crate::keymap::{as_keymap, make_keymap, parse_kbd, Keymap};
 
 pub fn register(interp: &mut Interp) {
@@ -308,13 +309,19 @@ pub fn register(interp: &mut Interp) {
     // #1: cursor-anchored LSP completion candidate popup, drawn on the
     // shared character grid so TUI and GUI render it identically (unlike
     // `hover_popup`'s free text, which each frontend presents its own
-    // way). ITEMS is a list of (LABEL INSERT START FILTER) proper lists,
-    // server order: LABEL/INSERT/FILTER are strings, START is a buffer
-    // position (elisp, so 1-based like every other position argument —
-    // see `get_pos`) THIS candidate's own replacement start, used ONLY
-    // by `accept_completion`'s deletion range — a `textEdit`-bearing
-    // candidate can start earlier than another in the same list, so this
-    // is per-item, not a single popup-wide value (see `PopupItem`).
+    // way). ITEMS is a list of (LABEL INSERT START FILTER &optional
+    // PAYLOAD) proper lists, server order: LABEL/INSERT/FILTER are
+    // strings, START is a buffer position (elisp, so 1-based like every
+    // other position argument — see `get_pos`) THIS candidate's own
+    // replacement start, used ONLY by `accept_completion`'s deletion
+    // range — a `textEdit`-bearing candidate can start earlier than
+    // another in the same list, so this is per-item, not a single
+    // popup-wide value (see `PopupItem`). PAYLOAD (M123, a string, the
+    // list's 5th element) is optional — a 4-element item list builds a
+    // `PopupItem` with `payload: None`, byte-identical to every item
+    // before this milestone (`verilog-complete.el`'s items stay
+    // 4-element, unmodified) — see `PopupItem::payload`'s own doc
+    // comment for what a 5th element means to `accept_completion`.
     // PREFIX-START (also a buffer position) is the identifier-run prefix
     // start `commands::refilter_completion_popup` filters EVERY item
     // against as one shared span (`CompletionPopup::prefix_start`, see
@@ -329,8 +336,8 @@ pub fn register(interp: &mut Interp) {
     //
     // Silently a no-op when buffer-local `inhibit-self-insert' (M34) is
     // non-nil or ITEMS parses to nothing (an empty list, or every
-    // element failing to parse as a well-shaped 4-element list): the
-    // former means this buffer has already left insert state (evil
+    // element failing to parse as a well-shaped 4- or 5-element list):
+    // the former means this buffer has already left insert state (evil
     // normal/visual/operator-pending) by the time this runs — most
     // likely a stale async LSP completion callback racing an ESC — so
     // nothing would ever accept the popup this would open; opening it
@@ -389,9 +396,21 @@ pub fn register(interp: &mut Interp) {
             let Some(fields) = item.list_to_vec() else {
                 continue;
             };
-            if fields.len() != 4 {
+            // M123: a 5th element (PAYLOAD, a string) is optional --
+            // `verilog-complete.el`'s items stay 4-element and need no
+            // change; `lsp.el` adds a 5th only for a candidate that
+            // needs accept-time handling beyond plain literal insertion
+            // (see `PopupItem::payload`'s own doc comment).
+            if fields.len() != 4 && fields.len() != 5 {
                 continue;
             }
+            let payload = match fields.len() {
+                5 => match &fields[4] {
+                    Value::Str(p) => Some(p.to_string()),
+                    _ => continue,
+                },
+                _ => None,
+            };
             if let (Value::Str(label), Value::Str(insert), Value::Str(filter)) =
                 (&fields[0], &fields[1], &fields[3])
             {
@@ -404,6 +423,7 @@ pub fn register(interp: &mut Interp) {
                     insert: insert.to_string(),
                     start,
                     filter: filter.to_string(),
+                    payload,
                 });
             }
         }
@@ -718,11 +738,59 @@ pub fn register(interp: &mut Interp) {
         Ok(cur(i).borrow().major_mode.clone())
     });
     // Windows.
-    defun(interp, "split-window-internal", 1, Some(1), |i, a| {
+    // M102: `(split-window-internal HORIZONTAL &optional SIZE)`. SIZE is
+    // the resulting length (rows for a vertical split, columns for a
+    // horizontal one) of side `a` -- the ORIGINAL window, which keeps the
+    // selected window's id -- matching GNU's `split-window` SIZE
+    // argument. `nil` means an even half, same as before this milestone.
+    //
+    // Two DISTINCT failure returns (M102 fix round, cold-review defect):
+    // returning bare `nil` for both "window too small to split at all"
+    // and "SIZE argument out of range" made `split-window-below`/
+    // `split-window-right` (simple.el) report "Window too small to
+    // split" even when the window was plenty big and the SIZE argument
+    // was simply invalid -- e.g. `(split-window-right 1000)` on an
+    // 89-column-avail window blamed the window, not the argument.
+    // - `nil`: the window itself is too small (`raw < 2 * min + sep`);
+    //   no `SIZE` value could have made this split succeed.
+    // - the symbol `bad-size`: the window is big enough, but the given
+    //   `SIZE` falls outside `[min, avail - min]`.
+    // - `t`: success.
+    defun(interp, "split-window-internal", 1, Some(2), |i, a| {
         let horizontal = a[0].truthy();
+        let size = opt(a, 1);
         let ed = ed_handle(i);
-        crate::editor::split_selected(&ed, horizontal);
-        Ok(Value::Nil)
+        let rect = {
+            let editor = ed.borrow();
+            let rects = crate::redisplay::window_rects(&editor);
+            let sel = editor.selected_window;
+            rects.into_iter().find(|(id, _)| *id == sel).map(|(_, r)| r)
+        };
+        let Some(rect) = rect else {
+            return Ok(Value::Nil);
+        };
+        let (raw, sep, min) = if horizontal {
+            let sep = if rect.width > 2 { 1 } else { 0 };
+            (rect.width, sep, crate::redisplay::WINDOW_MIN_WIDTH)
+        } else {
+            (rect.height, 0, crate::redisplay::WINDOW_MIN_HEIGHT)
+        };
+        if raw < 2 * min + sep {
+            return Ok(Value::Nil);
+        }
+        let avail = raw - sep;
+        let frac = match size {
+            Value::Nil => None,
+            v => {
+                let sz = need_int(i, &v)?;
+                if sz < min as i64 || sz > (avail - min) as i64 {
+                    return Ok(Value::Sym(i.intern("bad-size")));
+                }
+                Some(sz as f32 / avail as f32)
+            }
+        };
+        crate::editor::split_selected(&ed, horizontal, frac);
+        Ok(Value::Sym(i.syms.t))
     });
     defun(interp, "other-window", 0, Some(1), |i, a| {
         let n = match opt(a, 0) {
@@ -820,6 +888,199 @@ pub fn register(interp: &mut Interp) {
             None => Ok(Value::Nil),
         }
     });
+
+    // M102: `(window-resize-selected DELTA HORIZONTAL)`. Grows (positive
+    // DELTA) or shrinks (negative) the SELECTED window by DELTA cells
+    // along the axis named by HORIZONTAL, by moving the nearest enclosing
+    // `Split` of matching orientation (see `redisplay::resize_in_layout`'s
+    // own doc comment for the "nearest ancestor" rule and its one known
+    // gap: a selected window that is itself split again on the same axis
+    // doesn't move by exactly DELTA, only its enclosing split does).
+    // Returns `nil` with no side effect when the selected window has no
+    // enclosing split on that axis (i.e. it is the sole window, or every
+    // split above it runs the other way) -- `enlarge-window` et al.
+    // (simple.el) turn that into a "Cannot resize a single window"
+    // message.
+    defun(interp, "window-resize-selected", 2, Some(2), |i, a| {
+        let delta = need_int(i, &a[0])?;
+        let horizontal = a[1].truthy();
+        let ed = ed_handle(i);
+        let mut editor = ed.borrow_mut();
+        let root = crate::redisplay::windows_root_rect(&editor);
+        let sel = editor.selected_window;
+        match crate::redisplay::resize_in_layout(&mut editor.layout, root, sel, delta, horizontal) {
+            Some(true) => Ok(Value::Sym(i.syms.t)),
+            _ => Ok(Value::Nil),
+        }
+    });
+
+    // M102 `(window-balance)`: reset every split in the layout tree to an
+    // even 50/50 (`balance-windows`, `C-x +`).
+    defun(interp, "window-balance", 0, Some(0), |i, _| {
+        let ed = ed_handle(i);
+        ed.borrow_mut().layout.balance();
+        Ok(Value::Sym(i.syms.t))
+    });
+
+    // M102 `(window-height &optional WINDOW-ID)` / `(window-width ...)`:
+    // the on-screen size of a window pane, in rows/columns, from the SAME
+    // geometry `render`/`select-window-in-direction` use
+    // (`redisplay::window_rects`) -- never a second copy of the split
+    // math. Height includes the window's own mode-line row, matching GNU
+    // Emacs's `window-height`. `nil` when WINDOW-ID (default: the
+    // selected window) names no live window.
+    defun(interp, "window-height", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let editor = ed.borrow();
+        let id = match opt(a, 0) {
+            Value::Nil => editor.selected_window,
+            v => need_int(i, &v)? as usize,
+        };
+        let rects = crate::redisplay::window_rects(&editor);
+        match rects.into_iter().find(|(wid, _)| *wid == id) {
+            Some((_, r)) => Ok(Value::Int(r.height as i64)),
+            None => Ok(Value::Nil),
+        }
+    });
+    defun(interp, "window-width", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let editor = ed.borrow();
+        let id = match opt(a, 0) {
+            Value::Nil => editor.selected_window,
+            v => need_int(i, &v)? as usize,
+        };
+        let rects = crate::redisplay::window_rects(&editor);
+        match rects.into_iter().find(|(wid, _)| *wid == id) {
+            Some((_, r)) => Ok(Value::Int(r.width as i64)),
+            None => Ok(Value::Nil),
+        }
+    });
+
+    // M103: the five window-introspection/mutation primitives
+    // `display-buffer`/`pop-to-buffer` (window.el) are built out of.
+    //
+    // `(window-list)`: every live window id, sorted ascending -- the SAME
+    // order `other-window` cycles through above, so "the next window
+    // after selected" means the same thing everywhere.
+    defun(interp, "window-list", 0, Some(0), |i, _| {
+        let ed = ed_handle(i);
+        let mut ids: Vec<usize> = ed.borrow().windows.keys().copied().collect();
+        ids.sort_unstable();
+        Ok(Value::list(
+            ids.into_iter().map(|id| Value::Int(id as i64)).collect(),
+        ))
+    });
+    // `(window-buffer &optional WINDOW-ID)`: the buffer WINDOW-ID (default:
+    // selected) is showing, or nil if WINDOW-ID names no live window.
+    defun(interp, "window-buffer", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let editor = ed.borrow();
+        let id = match opt(a, 0) {
+            Value::Nil => editor.selected_window,
+            v => need_int(i, &v)? as usize,
+        };
+        match editor.windows.get(&id) {
+            Some(win) => Ok(Editor::buffer_value(&win.buffer)),
+            None => Ok(Value::Nil),
+        }
+    });
+    // `(set-window-buffer WINDOW-ID BUFFER)`: make WINDOW-ID show BUFFER,
+    // WITHOUT touching `selected_window` -- the one thing that
+    // distinguishes this from `switch-to-buffer-internal`
+    // (`show_buffer_in_selected_window`, editor.rs), whose semantics this
+    // otherwise matches exactly (point <- buffer's point, window_start <-
+    // 0). Returns `nil` with no side effect if WINDOW-ID names no live
+    // window; `t` on success.
+    defun(interp, "set-window-buffer", 2, Some(2), |i, a| {
+        let id = need_int(i, &a[0])? as usize;
+        let buf = buffer_arg(i, &a[1])?;
+        let ed = ed_handle(i);
+        let mut editor = ed.borrow_mut();
+        match editor.windows.get_mut(&id) {
+            Some(win) => {
+                win.buffer = buf.clone();
+                win.point = buf.borrow().point;
+                win.window_start = 0;
+                Ok(Value::Sym(i.syms.t))
+            }
+            None => Ok(Value::Nil),
+        }
+    });
+    // `(select-window WINDOW-ID)`: thin elisp-visible wrapper around the
+    // Rust-only `editor::select_window` (point save/restore +
+    // `set_current_buffer`, already used by `other-window`/`delete-
+    // window`/`select-window-in-direction` above) -- `nil` with no side
+    // effect if WINDOW-ID names no live window, `t` on success.
+    defun(interp, "select-window", 1, Some(1), |i, a| {
+        let id = need_int(i, &a[0])? as usize;
+        let ed = ed_handle(i);
+        if !ed.borrow().windows.contains_key(&id) {
+            return Ok(Value::Nil);
+        }
+        crate::editor::select_window(i, &ed, id);
+        Ok(Value::Sym(i.syms.t))
+    });
+    // `(get-buffer-window BUFFER)`: the first (lowest-id) live window
+    // showing BUFFER, or nil if none does -- `display-buffer`'s step 1
+    // ("a window already shows this buffer, reuse it verbatim").
+    defun(interp, "get-buffer-window", 1, Some(1), |i, a| {
+        let buf = buffer_arg(i, &a[0])?;
+        let ed = ed_handle(i);
+        let mut ids: Vec<usize> = ed.borrow().windows.keys().copied().collect();
+        ids.sort_unstable();
+        let editor = ed.borrow();
+        for id in ids {
+            if Rc::ptr_eq(&editor.windows[&id].buffer, &buf) {
+                return Ok(Value::Int(id as i64));
+            }
+        }
+        Ok(Value::Nil)
+    });
+    // M103 (third fix round): the per-WINDOW `created_for_display` flag
+    // (`Editor::Window`, editor.rs -- see its own doc comment for why
+    // this replaced a buffer-local elisp variable). `(window-created-
+    // for-display-p &optional WINDOW-ID)`: t/nil, default the selected
+    // window; nil (not an error) if WINDOW-ID names no live window.
+    defun(
+        interp,
+        "window-created-for-display-p",
+        0,
+        Some(1),
+        |i, a| {
+            let ed = ed_handle(i);
+            let editor = ed.borrow();
+            let id = match opt(a, 0) {
+                Value::Nil => editor.selected_window,
+                v => need_int(i, &v)? as usize,
+            };
+            match editor.windows.get(&id) {
+                Some(win) => Ok(Value::bool(win.created_for_display, i.syms.t)),
+                None => Ok(Value::Nil),
+            }
+        },
+    );
+    // `(set-window-created-for-display WINDOW-ID FLAG)`: sets the flag;
+    // nil (no side effect) if WINDOW-ID names no live window, t on
+    // success.
+    defun(
+        interp,
+        "set-window-created-for-display",
+        2,
+        Some(2),
+        |i, a| {
+            let id = need_int(i, &a[0])? as usize;
+            let flag = a[1].truthy();
+            let ed = ed_handle(i);
+            let mut editor = ed.borrow_mut();
+            match editor.windows.get_mut(&id) {
+                Some(win) => {
+                    win.created_for_display = flag;
+                    Ok(Value::Sym(i.syms.t))
+                }
+                None => Ok(Value::Nil),
+            }
+        },
+    );
 
     // Incremental search: the modal key handling lives in commands.rs
     // (isearch_key) since it needs to intercept keys before normal

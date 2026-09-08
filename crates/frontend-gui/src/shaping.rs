@@ -30,7 +30,8 @@
 //!   back. See this crate's `install_fonts` for why the two copies must
 //!   come from the same read.
 //! - [`ShapeCache`] -- caches the *shaping* result (glyph ids + offsets)
-//!   per `(FaceRole, text)`. Shaping is independent of pixel size (it
+//!   per `(FaceRole, text, enable_calt)` (the last component added M116
+//!   for `gui-ligatures`). Shaping is independent of pixel size (it
 //!   operates in font design units), so this cache is never invalidated
 //!   by a font-size or DPI change -- only capped, since buffer text is
 //!   unbounded over a long session.
@@ -79,9 +80,20 @@ pub enum FaceRole {
     Italic,
 }
 
-/// A face ready for both shaping (`rustybuzz`, from `loaded.bytes`) and
-/// rasterizing (`ab_glyph`, from `ab`, built once at load time since
-/// `ab_glyph::FontArc` construction is not free).
+/// A face ready for both shaping (`rustybuzz`, from `loaded.bytes` at
+/// `loaded.index`) and rasterizing (`ab_glyph`, from `ab`, built once at
+/// load time since `ab_glyph::FontArc` construction is not free).
+/// `loaded.index` and `ab` MUST point at the same face within the source
+/// bytes: `shape_calt_only` looks up glyph ids against `loaded.index`'s
+/// face, and `build_shaped_mesh`/`rasterize_glyph` then draw those glyph
+/// ids against `ab` -- if the two disagreed, glyph ids computed against
+/// one face's cmap/GSUB tables would be drawn against a different face's
+/// glyph outlines, which is wrong even when the two faces happen to share
+/// a glyph count (M106: this drew every collection-indexed face as the
+/// collection's face 0, so Fira Code's italic rendered upright and
+/// `sf-mono`'s bold rendered regular-weight -- fixed by threading `index`
+/// into `ab_glyph`'s own collection constructor below instead of
+/// discarding it).
 #[derive(Clone)]
 pub struct ShapingFace {
     pub loaded: LoadedFont,
@@ -90,7 +102,10 @@ pub struct ShapingFace {
 
 impl ShapingFace {
     pub fn new(bytes: Arc<[u8]>, index: u32) -> Option<ShapingFace> {
-        let ab = ab_glyph::FontArc::try_from_vec(bytes.to_vec()).ok()?;
+        let ab: ab_glyph::FontArc =
+            ab_glyph::FontVec::try_from_vec_and_index(bytes.to_vec(), index)
+                .ok()?
+                .into();
         Some(ShapingFace {
             loaded: LoadedFont { bytes, index },
             ab,
@@ -159,7 +174,22 @@ pub fn validate_shaped_run(
 /// doesn't merge cells outside the `calt` lookups this milestone's
 /// measurement was scoped to. Returns `None` when shaping's result fails
 /// [`validate_shaped_run`] -- the caller's cue to fall back.
-pub fn shape_calt_only(face: &LoadedFont, text: &str) -> Option<Vec<ShapedGlyph>> {
+///
+/// `enable_calt` (M116, `gui-ligatures`): when `false`, the `calt`
+/// feature is requested with value 0 instead of 1 -- the run still goes
+/// through `rustybuzz`/`validate_shaped_run` (so ordinary per-character
+/// shaping still benefits from correct advances), it just never
+/// substitutes a ligature glyph. This is threaded into [`ShapeCache`]'s
+/// key rather than handled by clearing the cache on toggle: a stale
+/// cache entry is then impossible by construction (flipping the flag
+/// changes the key, so the old ligature-shaped entries simply become
+/// unreachable, not wrong), which is safer than remembering to clear on
+/// every place the variable could change.
+pub fn shape_calt_only(
+    face: &LoadedFont,
+    text: &str,
+    enable_calt: bool,
+) -> Option<Vec<ShapedGlyph>> {
     let rb_face = rustybuzz::Face::from_slice(&face.bytes, face.index)?;
 
     let char_count = text.chars().count();
@@ -189,7 +219,11 @@ pub fn shape_calt_only(face: &LoadedFont, text: &str) -> Option<Vec<ShapedGlyph>
     buffer.guess_segment_properties();
 
     let features = [
-        rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"calt"), 1, ..),
+        rustybuzz::Feature::new(
+            rustybuzz::ttf_parser::Tag::from_bytes(b"calt"),
+            enable_calt as u32,
+            ..,
+        ),
         rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..),
         rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"dlig"), 0, ..),
         rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"clig"), 0, ..),
@@ -237,14 +271,28 @@ pub fn shape_calt_only(face: &LoadedFont, text: &str) -> Option<Vec<ShapedGlyph>
 const SHAPE_CACHE_CAP: usize = 8192;
 
 /// Caches shaping results (glyph ids + offsets, in font design units) by
-/// `(FaceRole, text)`. Never invalidated by font size or DPI -- shaping
-/// happens in font units and is independent of both -- only capped (see
-/// `SHAPE_CACHE_CAP`). `None` is cached too (a run whose shaping fails
-/// [`validate_shaped_run`] would otherwise be re-shaped, and re-rejected,
-/// every single frame it stays on screen).
+/// `(FaceRole, text, enable_calt)`. Never invalidated by font size or DPI
+/// -- shaping happens in font units and is independent of both -- only
+/// capped (see `SHAPE_CACHE_CAP`). `None` is cached too (a run whose
+/// shaping fails [`validate_shaped_run`] would otherwise be re-shaped,
+/// and re-rejected, every single frame it stays on screen).
+///
+/// The `enable_calt` component of the key (M116, `gui-ligatures`) is
+/// what keeps this cache from ever serving a stale ligature-shaped
+/// result after the variable is turned off: toggling it doesn't hit any
+/// entry the other setting produced, since the key itself differs, so
+/// there is nothing to remember to invalidate on the toggle (unlike a
+/// font switch, which does need an explicit `apply_font_switch` reset,
+/// because the key there carries no font identity at all).
+/// `(role, text, enable_calt)` -> shaped result, or the cached `None` for
+/// a run that failed [`validate_shaped_run`]. Named so clippy's
+/// `type_complexity` lint has something short to point at instead of the
+/// three-tuple key spelled out inline.
+type ShapeCacheKey = (FaceRole, String, bool);
+
 #[derive(Default)]
 pub struct ShapeCache {
-    map: HashMap<(FaceRole, String), Option<Arc<[ShapedGlyph]>>>,
+    map: HashMap<ShapeCacheKey, Option<Arc<[ShapedGlyph]>>>,
 }
 
 impl ShapeCache {
@@ -253,15 +301,17 @@ impl ShapeCache {
         role: FaceRole,
         face: &LoadedFont,
         text: &str,
+        enable_calt: bool,
     ) -> Option<Arc<[ShapedGlyph]>> {
-        let key = (role, text.to_string());
+        let key = (role, text.to_string(), enable_calt);
         if let Some(hit) = self.map.get(&key) {
             return hit.clone();
         }
         if self.map.len() >= SHAPE_CACHE_CAP {
             self.map.clear();
         }
-        let shaped = shape_calt_only(face, text).map(|v| Arc::from(v.into_boxed_slice()));
+        let shaped =
+            shape_calt_only(face, text, enable_calt).map(|v| Arc::from(v.into_boxed_slice()));
         self.map.insert(key, shaped.clone());
         shaped
     }
@@ -634,7 +684,7 @@ mod tests {
             index: 0,
         };
         let mut cache = ShapeCache::default();
-        let first = cache.get_or_shape(FaceRole::Regular, &bogus, "ab");
+        let first = cache.get_or_shape(FaceRole::Regular, &bogus, "ab", true);
         assert!(first.is_none());
         // Corrupt the face bytes further would panic `from_slice`'s
         // `Option` path (it already returns `None` gracefully) -- but a
@@ -643,7 +693,7 @@ mod tests {
         // without instrumentation, so this test instead pins the cache's
         // map key/lookup contract: the same `(role, text)` key must
         // return the identical `None` both times.
-        let second = cache.get_or_shape(FaceRole::Regular, &bogus, "ab");
+        let second = cache.get_or_shape(FaceRole::Regular, &bogus, "ab", true);
         assert_eq!(first, second);
     }
 
@@ -654,9 +704,9 @@ mod tests {
             index: 0,
         };
         let mut cache = ShapeCache::default();
-        cache.get_or_shape(FaceRole::Regular, &bogus, "x");
+        cache.get_or_shape(FaceRole::Regular, &bogus, "x", true);
         assert_eq!(cache.map.len(), 1);
-        cache.get_or_shape(FaceRole::Bold, &bogus, "x");
+        cache.get_or_shape(FaceRole::Bold, &bogus, "x", true);
         assert_eq!(cache.map.len(), 2);
     }
 
@@ -668,10 +718,10 @@ mod tests {
         };
         let mut cache = ShapeCache::default();
         for i in 0..SHAPE_CACHE_CAP {
-            cache.get_or_shape(FaceRole::Regular, &bogus, &format!("t{i}"));
+            cache.get_or_shape(FaceRole::Regular, &bogus, &format!("t{i}"), true);
         }
         assert_eq!(cache.map.len(), SHAPE_CACHE_CAP);
-        cache.get_or_shape(FaceRole::Regular, &bogus, "overflow");
+        cache.get_or_shape(FaceRole::Regular, &bogus, "overflow", true);
         // The cap triggered a full clear before inserting the new entry,
         // so the map holds exactly the one new entry, not
         // `SHAPE_CACHE_CAP + 1`.
@@ -844,7 +894,7 @@ mod tests {
             bytes: Arc::from(bytes.into_boxed_slice()),
             index: 0,
         };
-        let shaped = shape_calt_only(&face, "assign a = b != c;");
+        let shaped = shape_calt_only(&face, "assign a = b != c;", true);
         let shaped = shaped.expect("plain assignment text should shape validly");
         assert_eq!(shaped.len(), "assign a = b != c;".chars().count());
     }
@@ -866,8 +916,9 @@ mod tests {
         // must. This is the architect's own repro
         // ("a => b" genuinely substitutes ... "a = b" correctly does
         // not), pinned as a regression test.
-        let plain = shape_calt_only(&face, "a = b").expect("plain '=' should still validate");
-        let arrow = shape_calt_only(&face, "a => b").expect("'=>' ligature should still validate");
+        let plain = shape_calt_only(&face, "a = b", true).expect("plain '=' should still validate");
+        let arrow =
+            shape_calt_only(&face, "a => b", true).expect("'=>' ligature should still validate");
         assert_ne!(plain[2].glyph_id, arrow[2].glyph_id);
     }
 
@@ -891,7 +942,7 @@ mod tests {
             bytes: Arc::from(bytes.into_boxed_slice()),
             index: 0,
         };
-        let shaped = shape_calt_only(&face, "a\u{E000}b");
+        let shaped = shape_calt_only(&face, "a\u{E000}b", true);
         assert!(
             shaped.is_none(),
             "a run containing an unmapped (.notdef) character must fail validation and fall back"

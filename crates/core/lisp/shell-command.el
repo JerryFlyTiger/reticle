@@ -277,8 +277,14 @@ function must NOT call `quit-source-of-current' itself here, because
 both call sites that matter (`shell-command''s has-output path,
 `shell-command-on-region''s failure path) only run from the idle pump,
 potentially long after the user switched to some other buffer (fix
-round, R2)."
-  (switch-to-buffer-internal buf)
+round, R2).
+
+M103: `pop-to-buffer', not `switch-to-buffer-internal' -- this is the
+single display choke point for THREE features (async shell output,
+compile/recompile, search-project/search-again all call through here),
+so switching it to split/reuse a window instead of overwriting fixes
+all three at once. See window.el's header for the full design."
+  (pop-to-buffer buf)
   (setq-local quit-source source))
 
 ;;; --- M-! -------------------------------------------------------------

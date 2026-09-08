@@ -3,14 +3,36 @@
 //! `lsp--autostart-tried`, `lsp--autostart-begin`, and the idle-tick step
 //! `lsp--autostart-tick`, all in `lsp.el`.
 //!
-//! Same "cat" transport technique as `lsp_auto_attach_tests.rs' (see that
-//! file's own header): `cat' is registered as the server command, and the
-//! `initialize' request's id echoes straight back, completing the
-//! asynchronous handshake via the ordinary `lsp-process-pending-all' pump
-//! -- no `lsp--await' anywhere on this path. For the "deaf server" tests
-//! (spawns, reads stdin, never writes anything back), `sh -c "cat >
-//! /dev/null"' stands in: a real, genuinely alive child process that will
-//! never answer.
+//! M123 fix round: `cat' used to stand in as the fake server, on the
+//! theory that echoing the `initialize' request's raw bytes straight
+//! back would look enough like a reply for the handshake to complete.
+//! It "worked" only because a message with BOTH `id' AND `method' --
+//! exactly what an echoed REQUEST carries -- fell into the old
+//! dispatcher's `id' branch, got stashed as if it were a reply, and
+//! `lsp--await'/the autostart completion callback read `(gethash
+//! "result" ...)' off it, which is nil for a request and was silently
+//! accepted as an empty result. M123 Part A's dispatcher now correctly
+//! reads `id'+`method' together as a REQUEST (answered, never
+//! stashed), so `cat' no longer produces anything the handshake
+//! recognizes as a reply and every one of these tests hung. Replaced
+//! throughout this file with `ECHO_INIT_SCRIPT'/`DELAYED_ECHO_INIT_
+//! SCRIPT' (below, both `register_cat' calls through `write_script'): a
+//! small `python3' script that reads and discards the real
+//! `initialize' request, answers it with an actual, well-formed
+//! JSON-RPC response, and only THEN echoes everything else verbatim
+//! (like the original `cat') -- see `ECHO_INIT_SCRIPT''s own doc
+//! comment for why a plain "one reply then `cat'" script is not enough
+//! on its own: this file's tests still need the client's OWN outgoing
+//! `didOpen'/`didChange' notifications echoed back for `drain_frames'/
+//! `lsp-poll' to observe. `register_cat' keeps its pre-existing NAME
+//! (every call site already reads naturally as "give me a fake server
+//! that answers") even though it no longer spawns literal `cat' as the
+//! server command.
+//!
+//! For the "deaf server" tests (spawns, reads stdin, never writes
+//! anything back), `sh -c "cat > /dev/null"' stands in: a real,
+//! genuinely alive child process that will never answer -- unaffected
+//! by the above, since these tests never expect a reply at all.
 //!
 //! `lsp--autostart-tick' no-ops entirely until `lsp--frontend-started' is
 //! set -- every test below sets it explicitly with `(setq lsp--frontend-
@@ -123,11 +145,162 @@ fn drain_frames(i: &mut Interp, conn_expr: &str, method: &str) -> usize {
         .expect("frame count should print as an integer")
 }
 
-fn register_cat(i: &mut Interp) {
+/// Writes an executable script into DIR and returns its path as a
+/// string -- same shape as `lsp_tests.rs''s own `write_script' (not
+/// shared across the two test binaries: each is `cfg(test)'-local to
+/// its own crate-external integration-test file, and there is no
+/// common home for a helper to live in that both could `include!').
+fn write_script(dir: &std::path::Path, name: &str, body: &str) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    let mut perm = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&path, perm).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// A `python3' fake server (not a `sh' one-liner, unlike `lsp_tests.rs''s
+/// own `ECHO_ONE_SCRIPT'): this file's own tests, unlike that one, still
+/// need everything AFTER the handshake echoed back too --
+/// `drain_frames'/`lsp-poll' read the client's own outgoing `didOpen'/
+/// `didChange' notifications back off this same fake connection as
+/// their only way to observe what the client sent (see `dispatch_one_
+/// pending''s own doc comment). That rules out the naive fix of just
+/// swapping `cat' for a script that prints one reply and exits into
+/// `cat >/dev/null' (discards everything, so those notifications would
+/// never come back) -- and it rules out KEEPING plain `cat' with
+/// nothing in front of it (the ORIGINAL initialize REQUEST, still
+/// sitting unread on stdin, would then also get echoed back after this
+/// script's own crafted reply, landing back at the client as a message
+/// with both `id' AND `method' -- exactly the shape M123 Part A's
+/// dispatcher now treats as an incoming REQUEST, which it would answer,
+/// producing a reply that itself gets echoed straight back into an
+/// infinite request/response ping-pong). So this script actively READS
+/// and DISCARDS exactly one framed message (the real `initialize'
+/// request) before answering it itself with a well-formed response and
+/// only THEN switching into raw echo mode for everything that follows
+/// -- a plain `sh' one-liner cannot parse a `Content-Length' header and
+/// read exactly that many body bytes without forking a subprocess per
+/// byte (see `dev/fake-lsp.py''s own header, pitfall 1, on why that
+/// path was rejected there too), so this reuses `dev/fake-lsp.py''s own
+/// `read_message'/`send' shape in miniature rather than fighting `sh'.
+///
+/// Recorded, not fixed (trailing cold review, M123 fix round):
+/// `read_message' uses buffered `sys.stdin.buffer.read()', the echo
+/// loop below it uses raw `os.read()' on the same fd -- mixing the two
+/// is only safe here because the client never pipelines a second
+/// message ahead of the `initialize' reply. This fixture also now
+/// requires `python3' on PATH and an executable temp directory, unlike
+/// the plain `cat'/`sh' it replaced.
+const ECHO_INIT_SCRIPT: &str = "#!/usr/bin/env python3
+import os
+import sys
+
+def read_message():
+    header = b''
+    while not header.endswith(b'\\r\\n\\r\\n'):
+        ch = sys.stdin.buffer.read(1)
+        if not ch:
+            return None
+        header += ch
+    length = 0
+    for line in header.decode('latin-1').split('\\r\\n'):
+        if line.lower().startswith('content-length:'):
+            length = int(line.split(':', 1)[1])
+    return sys.stdin.buffer.read(length)
+
+def send(body):
+    sys.stdout.buffer.write(b'Content-Length: %d\\r\\n\\r\\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+
+read_message()  # discard the real `initialize' request
+# No `capabilities' key (matching `lsp_tests.rs''s own `ECHO_ONE_SCRIPT',
+# `\"result\":{}}') -- an ABSENT capabilities hash is what this client's
+# M46 policy trusts as \"everything supported\"; a PRESENT-but-empty one
+# instead reads as every individual capability being unsupported, which
+# would make `(lsp)''s own connect message grow an unwanted \"(unsupported:
+# ...)\" suffix these tests don't expect.
+send(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}')
+# Echo everything else verbatim -- `didOpen'/`didChange'/`initialized'
+# notifications the client sends next, which this file's own
+# `drain_frames'/`lsp-poll' helpers read back as their only observation
+# point. None of them carry an `id', so echoing them back is never
+# misread as a request. `os.read'/`os.write' on the raw fds, NOT
+# `sys.stdin.buffer.read(4096)' -- a `BufferedReader.read(N)' on a pipe
+# blocks until N bytes actually arrive (or EOF), so a single small
+# notification well under 4096 bytes would sit forever waiting for more
+# input that never comes, and this fake server would silently never
+# echo anything back at all. `os.read' returns as soon as WHATEVER is
+# currently available, exactly the single-`read(2)'-syscall semantics an
+# actual byte-stream relay needs.
+fd_in = sys.stdin.fileno()
+fd_out = sys.stdout.fileno()
+while True:
+    chunk = os.read(fd_in, 4096)
+    if not chunk:
+        break
+    os.write(fd_out, chunk)
+";
+
+/// Same reply as `ECHO_INIT_SCRIPT', but only after a 1-second sleep --
+/// `did_change_cannot_precede_did_open' (below) depends on the fake
+/// server's reply NOT arriving within the first few, sleep-free
+/// `lsp-process-pending-all' pumps it runs; see that test's own comment
+/// for why (a race this delay forecloses by construction, not a
+/// tuned-to-pass timing coincidence).
+const DELAYED_ECHO_INIT_SCRIPT: &str = "#!/usr/bin/env python3
+import os
+import sys
+import time
+
+def read_message():
+    header = b''
+    while not header.endswith(b'\\r\\n\\r\\n'):
+        ch = sys.stdin.buffer.read(1)
+        if not ch:
+            return None
+        header += ch
+    length = 0
+    for line in header.decode('latin-1').split('\\r\\n'):
+        if line.lower().startswith('content-length:'):
+            length = int(line.split(':', 1)[1])
+    return sys.stdin.buffer.read(length)
+
+def send(body):
+    sys.stdout.buffer.write(b'Content-Length: %d\\r\\n\\r\\n' % len(body) + body)
+    sys.stdout.buffer.flush()
+
+read_message()
+time.sleep(1)
+# See `ECHO_INIT_SCRIPT''s own comment for why no `capabilities' key and
+# why the echo loop below uses `os.read'/`os.write' rather than
+# `sys.stdin.buffer.read(4096)'.
+send(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}')
+fd_in = sys.stdin.fileno()
+fd_out = sys.stdout.fileno()
+while True:
+    chunk = os.read(fd_in, 4096)
+    if not chunk:
+        break
+    os.write(fd_out, chunk)
+";
+
+/// Returns the fake server's own script path -- most callers ignore it
+/// (the pre-M123 `register_cat` returned nothing, since `"cat"` was a
+/// fixed, known literal every assertion could just spell out), but a
+/// few tests need the ACTUAL command string `lsp-server-alist` now
+/// holds (a per-test scratch-directory path, not a fixed name) to
+/// build an exact-match expectation against it.
+fn register_cat(i: &mut Interp, dir: &std::path::Path) -> String {
+    let script = write_script(dir, "echo_init.sh", ECHO_INIT_SCRIPT);
     ok(
         i,
-        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"cat\")))",
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'rust-mode (list {:?})))",
+            script
+        ),
     );
+    script
 }
 
 fn set_frontend_started(i: &mut Interp) {
@@ -139,21 +312,55 @@ fn set_frontend_started(i: &mut Interp) {
 /// does not loop until the queue is empty, so it can't self-consume a
 /// message the completion callback it triggers goes on to send. That
 /// self-consumption is a real risk ONLY because the fake transport
-/// (`cat`) echoes bytes back essentially instantly -- a real server
-/// never echoes its own `didOpen` back at all, so `lsp-process-pending-
-/// all`'s draining loop is exactly right in production; it's just the
-/// wrong tool for observing one specific outgoing frame against this
-/// particular test double.
+/// (`ECHO_INIT_SCRIPT`, formerly plain `cat`) echoes bytes back
+/// essentially instantly -- a real server never echoes its own
+/// `didOpen` back at all, so `lsp-process-pending-all`'s draining loop
+/// is exactly right in production; it's just the wrong tool for
+/// observing one specific outgoing frame against this particular test
+/// double.
+///
+/// M123 fix round (trailing cold review): this used to be "sleep a
+/// fixed amount, then poll exactly once" at every call site -- a sleep
+/// is not a synchronisation primitive (this project's own rule), so
+/// raising the fixed sleep (300ms -> 1500ms, an earlier fix-round
+/// round) only ever LOWERED the probability of a race under load,
+/// never removed the race itself. Now a bounded POLLING loop, entirely
+/// inside this one function: try `lsp-poll` immediately, and only
+/// sleep a SHORT interval between retries when nothing has arrived
+/// yet, up to a generous ceiling -- deterministic (retries until the
+/// real message actually shows up, never gives up before it does,
+/// short of the ceiling) and typically much faster than the fixed
+/// sleep it replaces (the common case answers within a few
+/// milliseconds, not 1.5 real seconds). Every call site's own
+/// preceding `std::thread::sleep' is gone -- this function is now the
+/// only place in this file that waits for a reply to physically
+/// arrive before dispatching it.
 fn dispatch_one_pending(i: &mut Interp) {
     ok(
         i,
         "(setq test--pending-client (nth 1 (cdr (car lsp--autostart-pending))))",
     );
-    ok(
-        i,
-        "(let ((msg (lsp-poll (lsp--client-conn test--pending-client))))
-           (when (hash-table-p msg) (lsp--dispatch test--pending-client msg)))",
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let dispatched = ok(
+            i,
+            "(let ((msg (lsp-poll (lsp--client-conn test--pending-client))))
+               (if (hash-table-p msg)
+                   (progn (lsp--dispatch test--pending-client msg) t)
+                 nil))",
+        );
+        if dispatched == "t" {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "dispatch_one_pending: no message arrived on the pending autostart's \
+                 own connection within the 10s polling ceiling -- either the fake \
+                 server never answered, or the poll loop has a real bug"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Same message-capturing shape used by `lsp_action_tests.rs`,
@@ -181,7 +388,7 @@ fn happy_path_spawns_attaches_and_backfills() {
     let file_b = dir.join("b.rs");
     std::fs::write(&file_a, "fn a() {}\n").unwrap();
     std::fs::write(&file_b, "fn b() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     // b.rs opened first -- no connection exists yet, so it just sits
     // there unattached.
@@ -210,7 +417,6 @@ fn happy_path_spawns_attaches_and_backfills() {
 
     // Let cat's echoed initialize reply arrive, which fires the
     // completion closure synchronously from inside `dispatch_one_pending`.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
 
     assert_eq!(run(&mut i, "lsp--autostart-pending"), "nil");
@@ -228,7 +434,7 @@ fn happy_path_spawns_attaches_and_backfills() {
     );
     assert_eq!(run(&mut i, "(eq lsp--buffer-client test--client)"), "t");
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     assert_eq!(
         drain_frames(&mut i, "test--conn", "textDocument/didOpen"),
         2,
@@ -387,7 +593,7 @@ fn two_buffers_in_one_project_produce_exactly_one_spawn() {
     let file_b = dir.join("b.rs");
     std::fs::write(&file_a, "fn a() {}\n").unwrap();
     std::fs::write(&file_b, "fn b() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(
         &mut i,
@@ -418,7 +624,7 @@ fn two_buffers_in_one_project_produce_exactly_one_spawn() {
     assert_eq!(run(&mut i, "(length lsp--clients)"), "1");
 
     // Let it complete; both buffers must end up on the SAME client.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     ok(&mut i, "(lsp-process-pending-all)");
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil"); // b.rs
     ok(&mut i, "(setq test--client-b lsp--buffer-client)");
@@ -442,7 +648,7 @@ fn lsp_autostart_nil_never_spawns() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
     ok(&mut i, "(setq lsp-autostart nil)");
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
@@ -466,7 +672,7 @@ fn lsp_auto_attach_nil_never_spawns() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
     ok(&mut i, "(setq lsp-auto-attach nil)");
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
@@ -494,7 +700,7 @@ fn frontend_flag_never_set_never_spawns() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -526,26 +732,29 @@ fn did_change_cannot_precede_did_open() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    // A deliberately DELAYED echo, not the ordinary `register_cat`
+    // A deliberately DELAYED reply, not the ordinary `register_cat`
     // helper -- forecloses a real race by construction rather than
-    // papering over its symptom. `cat` alone echoes the `initialize`
-    // request back essentially instantly, and under default (parallel)
-    // thread count, several spawned test processes contending for CPU
-    // at once, that echo can occasionally land fast enough for the
-    // THREE bare `lsp-process-pending-all` pumps below (no sleep
-    // before them, by design -- see their own comment) to already
-    // drain and dispatch it, completing the handshake from INSIDE that
-    // same drain-until-empty loop -- which then self-consumes the
-    // `didOpen` the completion callback sends, the exact failure mode
-    // `dispatch_one_pending` exists to avoid elsewhere in this file.
-    // A 1s delay before the fake server echoes anything guarantees
-    // those three quick pumps see nothing, so this test's own
-    // subsequent sleep + `dispatch_one_pending` (not
+    // papering over its symptom. An immediate reply, and under default
+    // (parallel) thread count, several spawned test processes
+    // contending for CPU at once, that reply can occasionally land
+    // fast enough for the THREE bare `lsp-process-pending-all` pumps
+    // below (no sleep before them, by design -- see their own comment)
+    // to already drain and dispatch it, completing the handshake from
+    // INSIDE that same drain-until-empty loop -- which then
+    // self-consumes the `didOpen` the completion callback sends, the
+    // exact failure mode `dispatch_one_pending` exists to avoid
+    // elsewhere in this file. A 1s delay before the fake server replies
+    // at all guarantees those three quick pumps see nothing, so this
+    // test's own subsequent sleep + `dispatch_one_pending` (not
     // `lsp-process-pending-all`) is deterministically what completes
     // the handshake, every time.
+    let script = write_script(&dir, "delayed_echo_init.sh", DELAYED_ECHO_INIT_SCRIPT);
     ok(
         &mut i,
-        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"sh\" \"-c\" \"sleep 1 && exec cat\")))",
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'rust-mode (list {:?})))",
+            script
+        ),
     );
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
@@ -568,7 +777,6 @@ fn did_change_cannot_precede_did_open() {
     }
     assert_eq!(run(&mut i, "lsp--buffer-client"), "nil");
 
-    std::thread::sleep(std::time::Duration::from_millis(1300));
     dispatch_one_pending(&mut i);
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(
@@ -576,7 +784,7 @@ fn did_change_cannot_precede_did_open() {
         "(setq test--conn (lsp--client-conn lsp--buffer-client))",
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     // One pass over the connection's whole queue, classifying every
     // frame by method, so nothing is lost to a second (empty) drain.
     let src = "(let ((opens nil) (changes nil) (msg t))
@@ -623,7 +831,7 @@ fn publish_diagnostics_before_initialize_response_does_not_panic() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -659,7 +867,7 @@ fn publish_diagnostics_before_initialize_response_does_not_panic() {
     );
 
     // The rest of the handshake must still complete normally afterward.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     ok(&mut i, "(lsp-process-pending-all)");
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
@@ -681,7 +889,7 @@ fn mode_line_signal_goes_pending_then_attached() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    let script = register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -697,12 +905,12 @@ fn mode_line_signal_goes_pending_then_attached() {
         "expected a pending marker while in flight"
     );
     assert!(
-        pending_here.contains("cat"),
+        pending_here.contains(&script),
         "pending marker should carry the command: {}",
         pending_here
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     ok(&mut i, "(lsp-process-pending-all)");
 
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
@@ -725,7 +933,7 @@ fn m_x_lsp_cancels_an_in_flight_autostart_and_wins() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    let script = register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -744,7 +952,7 @@ fn m_x_lsp_cancels_an_in_flight_autostart_and_wins() {
     // spawn its own (synchronous) connection, and attach the buffer.
     let r = run(&mut i, "(lsp)");
     assert!(!r.starts_with("ERROR"), "(lsp) signaled: {}", r);
-    assert_eq!(r, "\"LSP: connected to cat\"");
+    assert_eq!(r, format!("\"LSP: connected to {}\"", script));
 
     assert_eq!(run(&mut i, "lsp--autostart-pending"), "nil");
     assert_eq!(
@@ -788,7 +996,7 @@ fn autostart_completion_defers_to_an_already_registered_connection() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    let script = register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -811,21 +1019,33 @@ fn autostart_completion_defers_to_an_already_registered_connection() {
     // live connection: `lsp--get-connection' self-heals a dead/fake
     // one (prunes it and returns nil), which would silently defeat
     // this test by falling through to the ordinary success path
-    // instead of exercising the defensive branch at all.
+    // instead of exercising the defensive branch at all. The KEY
+    // (COMMAND . ROOT) must match the PRIMARY's own -- COMMAND is now
+    // this test's own script path (M123 fix round), not a fixed "cat"
+    // literal, so the stand-in's own key has to use the SAME variable
+    // or `lsp--get-connection' would never find it and this test would
+    // silently stop testing the defensive branch at all. The spawned
+    // stand-in PROCESS itself can still be plain `cat' -- it only needs
+    // to be genuinely alive, never speak the LSP handshake.
     ok(&mut i, "(setq test--other-conn (lsp-start \"cat\" nil))");
     ok(
         &mut i,
-        "(setq test--other-client (make-lsp--client :conn test--other-conn :command \"cat\"))",
+        &format!(
+            "(setq test--other-client (make-lsp--client :conn test--other-conn :command {:?}))",
+            script
+        ),
     );
     ok(
         &mut i,
-        "(push (cons (cons \"cat\" (lsp--project-root (buffer-file-name))) \
-                test--other-client)
-              lsp--connections)",
+        &format!(
+            "(push (cons (cons {:?} (lsp--project-root (buffer-file-name))) \
+                    test--other-client)
+                  lsp--connections)",
+            script
+        ),
     );
 
     // Now let the pending handshake's reply arrive and dispatch.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
 
     // The pending entry must be gone, the buffer must NOT be attached
@@ -867,7 +1087,7 @@ fn pending_marker_clears_even_after_the_buffer_stops_matching() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -882,7 +1102,6 @@ fn pending_marker_clears_even_after_the_buffer_stops_matching() {
     // have silently skipped clearing this buffer's marker forever.
     ok(&mut i, "(major-mode-internal-set 'fundamental-mode)");
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
 
     assert_eq!(
@@ -919,13 +1138,20 @@ fn pending_marker_requires_exact_mode_like_backfill_does() {
     // Two DIFFERENT modes sharing the SAME command -- the exact shape
     // of the default `lsp-server-alist' (c-mode/c++-mode both -> clangd)
     // the reviewer's finding was about.
+    let script = write_script(&dir, "echo_init.sh", ECHO_INIT_SCRIPT);
     ok(
         &mut i,
-        "(add-to-list 'lsp-server-alist (cons 'c-mode (list \"cat\")))",
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'c-mode (list {:?})))",
+            script
+        ),
     );
     ok(
         &mut i,
-        "(add-to-list 'lsp-server-alist (cons 'c++-mode (list \"cat\")))",
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'c++-mode (list {:?})))",
+            script
+        ),
     );
 
     ok(
@@ -968,7 +1194,6 @@ fn pending_marker_requires_exact_mode_like_backfill_does() {
         &mut i,
         &format!("(find-file {:?})", file_c.to_str().unwrap()),
     );
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(
@@ -1012,7 +1237,7 @@ fn idle_tick_completes_a_near_deadline_handshake_before_reaping_it() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -1028,7 +1253,7 @@ fn idle_tick_completes_a_near_deadline_handshake_before_reaping_it() {
 
     // Let cat actually echo the initialize request back into the
     // connection's channel.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
 
     // Force the deadline into the past -- "just barely made its
     // deadline" without depending on real-time scheduling to land the
@@ -1114,7 +1339,7 @@ fn dead_process_before_deadline_is_reaped_via_liveness_not_deadline() {
     assert_eq!(run(&mut i, "(length lsp--autostart-pending)"), "1");
 
     // Give the child a moment to actually exit.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
 
     let before = std::time::Instant::now();
     core::idle_tick(&mut i, std::time::Duration::ZERO);
@@ -1157,7 +1382,7 @@ fn pending_marker_is_set_and_cleared_on_the_non_current_buffer_too() {
     let file_b = dir.join("b.rs");
     std::fs::write(&file_a, "fn a() {}\n").unwrap();
     std::fs::write(&file_b, "fn b() {}\n").unwrap();
-    register_cat(&mut i);
+    let script = register_cat(&mut i, &dir);
 
     // b.rs opened first -- it will be the NON-current buffer for the
     // rest of this test.
@@ -1193,7 +1418,7 @@ fn pending_marker_is_set_and_cleared_on_the_non_current_buffer_too() {
         "the NON-current buffer (b.rs) must also be marked while pending"
     );
     assert!(
-        b_pending_marker.contains("cat"),
+        b_pending_marker.contains(&script),
         "b.rs's pending marker should carry the command: {}",
         b_pending_marker
     );
@@ -1206,7 +1431,6 @@ fn pending_marker_is_set_and_cleared_on_the_non_current_buffer_too() {
         &mut i,
         &format!("(find-file {:?})", file_a.to_str().unwrap()),
     );
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     assert_eq!(
@@ -1259,7 +1483,7 @@ fn cancelling_one_projects_autostart_leaves_a_different_projects_alone() {
     let file2 = dir2.join("b.rs");
     std::fs::write(&file1, "fn a() {}\n").unwrap();
     std::fs::write(&file2, "fn b() {}\n").unwrap();
-    register_cat(&mut i);
+    let script = register_cat(&mut i, &root);
 
     // Buffer 1: project 1, autostart begins FIRST -- its entry ends up
     // at the TAIL of `lsp--autostart-pending' (each new entry is
@@ -1302,7 +1526,7 @@ fn cancelling_one_projects_autostart_leaves_a_different_projects_alone() {
     );
     let r = run(&mut i, "(lsp)");
     assert!(!r.starts_with("ERROR"), "(lsp) signaled: {}", r);
-    assert_eq!(r, "\"LSP: connected to cat\"");
+    assert_eq!(r, format!("\"LSP: connected to {}\"", script));
 
     assert_eq!(
         run(&mut i, "(length lsp--autostart-pending)"),
@@ -1345,7 +1569,10 @@ fn cancelling_one_projects_autostart_leaves_a_different_projects_alone() {
     assert_eq!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(
         &mut i,
-        "(setq test--proj2-pending-conn (nth 0 (cdr (assoc (cons \"cat\" (lsp--project-root (buffer-file-name))) lsp--autostart-pending))))",
+        &format!(
+            "(setq test--proj2-pending-conn (nth 0 (cdr (assoc (cons {:?} (lsp--project-root (buffer-file-name))) lsp--autostart-pending))))",
+            script
+        ),
     );
     assert_eq!(
         run(&mut i, "(lsp-live-p test--proj2-pending-conn)"),
@@ -1355,7 +1582,6 @@ fn cancelling_one_projects_autostart_leaves_a_different_projects_alone() {
 
     // Let project 2's own handshake complete too, for cleanup and as a
     // final sanity check that it was never disturbed.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(
@@ -1384,7 +1610,7 @@ fn secondary_autostart_is_not_blocked_by_an_already_attached_primary() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    let primary_script = register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
@@ -1394,7 +1620,6 @@ fn secondary_autostart_is_not_blocked_by_an_already_attached_primary() {
     // registered for rust-mode yet.
     ok(&mut i, "(lsp--autostart-tick)");
     assert_eq!(run(&mut i, "(length lsp--autostart-pending)"), "1");
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_eq!(
         run(&mut i, "(and (lsp--live-buffer-client) t)"),
@@ -1407,9 +1632,13 @@ fn secondary_autostart_is_not_blocked_by_an_already_attached_primary() {
     // tick again. The old `(not (lsp--live-buffer-client))' guard would
     // have skipped this call entirely from here on, forever, since the
     // primary is already live.
+    let secondary_script = write_script(&dir, "echo_init_secondary.sh", ECHO_INIT_SCRIPT);
     ok(
         &mut i,
-        "(add-to-list 'lsp-secondary-server-alist (cons 'rust-mode (list \"sh\" \"-c\" \"cat\")))",
+        &format!(
+            "(add-to-list 'lsp-secondary-server-alist (cons 'rust-mode (list {:?})))",
+            secondary_script
+        ),
     );
     ok(&mut i, "(lsp--autostart-tick)");
     assert_eq!(
@@ -1419,19 +1648,21 @@ fn secondary_autostart_is_not_blocked_by_an_already_attached_primary() {
     );
     assert_eq!(
         run(&mut i, "(car (car (car lsp--autostart-pending)))"),
-        "\"sh\"",
+        format!("{:?}", secondary_script),
         "the pending entry must be keyed on the SECONDARY's own command"
     );
 
     // Let it complete too: both clients end up attached, and the
     // primary is untouched.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_eq!(run(&mut i, "(length lsp--buffer-clients)"), "2");
     assert_eq!(
         run(
             &mut i,
-            "(equal (lsp--client-command lsp--buffer-client) \"cat\")"
+            &format!(
+                "(equal (lsp--client-command lsp--buffer-client) {:?})",
+                primary_script
+            )
         ),
         "t",
         "the primary must still be the original cat client, not the secondary"
@@ -1454,14 +1685,13 @@ fn secondary_autostart_short_circuits_immediately_for_a_mode_with_no_secondary_r
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    register_cat(&mut i, &dir);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
     ok(&mut i, "(major-mode-internal-set 'rust-mode)");
     set_frontend_started(&mut i);
 
     ok(&mut i, "(lsp--autostart-tick)");
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_eq!(run(&mut i, "(and (lsp--live-buffer-client) t)"), "t");
 
@@ -1508,10 +1738,20 @@ fn pending_marker_holds_both_keys_and_only_fully_clears_once_both_complete() {
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let file = dir.join("a.rs");
     std::fs::write(&file, "fn a() {}\n").unwrap();
-    register_cat(&mut i);
+    let primary_script = register_cat(&mut i, &dir);
+    // The secondary needs its OWN answering fake server too -- it used
+    // to be raw `sh -c "cat"` (the same echo defect `register_cat`
+    // fixes for the primary, see this file's own header), and this
+    // test's own assertions below (the secondary's pending key clears
+    // once its handshake completes) depend on that handshake actually
+    // completing.
+    let secondary_script = write_script(&dir, "echo_init_secondary.sh", ECHO_INIT_SCRIPT);
     ok(
         &mut i,
-        "(add-to-list 'lsp-secondary-server-alist (cons 'rust-mode (list \"sh\" \"-c\" \"cat\")))",
+        &format!(
+            "(add-to-list 'lsp-secondary-server-alist (cons 'rust-mode (list {:?})))",
+            secondary_script
+        ),
     );
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
@@ -1534,15 +1774,20 @@ fn pending_marker_holds_both_keys_and_only_fully_clears_once_both_complete() {
         &mut i,
         "(sort (mapcar 'car lsp--autostart-pending-here) 'string<)",
     );
-    assert_eq!(commands, "(\"cat\" \"sh\")");
+    let mut expected_commands = [primary_script.clone(), secondary_script.clone()];
+    expected_commands.sort();
+    assert_eq!(
+        commands,
+        format!("({:?} {:?})", expected_commands[0], expected_commands[1])
+    );
 
     // The secondary was BEGUN second, so it's at the HEAD of
     // `lsp--autostart-pending' (each new entry is `push'ed onto the
     // front) -- dispatching the head completes the SECONDARY first,
     // exactly the ordering AA1 is about: nothing orders two independent
-    // subprocess startups, and this project's own `cat`-echo transport
-    // makes the second-begun one answer first deterministically.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // subprocess startups, and this project's own echoing fake-server
+    // transport makes the second-begun one answer first
+    // deterministically.
     dispatch_one_pending(&mut i);
 
     assert_eq!(
@@ -1565,14 +1810,16 @@ fn pending_marker_holds_both_keys_and_only_fully_clears_once_both_complete() {
     assert_eq!(
         run(
             &mut i,
-            "(equal (car (car lsp--autostart-pending-here)) \"cat\")"
+            &format!(
+                "(equal (car (car lsp--autostart-pending-here)) {:?})",
+                primary_script
+            )
         ),
         "t",
         "the surviving key must be the primary's"
     );
 
     // Let the primary complete too.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     dispatch_one_pending(&mut i);
     assert_ne!(
         run(&mut i, "lsp--buffer-client"),
@@ -1582,7 +1829,10 @@ fn pending_marker_holds_both_keys_and_only_fully_clears_once_both_complete() {
     assert_eq!(
         run(
             &mut i,
-            "(equal (lsp--client-command lsp--buffer-client) \"cat\")"
+            &format!(
+                "(equal (lsp--client-command lsp--buffer-client) {:?})",
+                primary_script
+            )
         ),
         "t"
     );

@@ -35,6 +35,25 @@ use elisp::Interp;
 fn setup() -> (Interp, Rc<RefCell<Editor>>) {
     let mut interp = elisp::new_interp();
     let ed = core::init_editor(&mut interp);
+    // M104 fix round: this file saves real .v files via
+    // `apply_edits'/`search--edit-apply-to-file' (17 call sites), and
+    // M104's `format-on-save' defaults to `t'. Every fixture here
+    // happens to be invalid Verilog (e.g. "l1\nOLD\nl3\n"), and this
+    // machine's `verible-verilog-format' happens to degrade gracefully
+    // on a parse failure (exit 0, output unchanged) -- so today nothing
+    // actually reformats. That is a coincidence of (a) what these
+    // fixtures look like and (b) what one version of one external tool
+    // does with bad input, not a property this file is actually
+    // testing (it tests search/replace-across-files, not formatting).
+    // `search_edit_apply_rolls_back_in_memory_edit_when_save_buffer_
+    // fails' in particular relies on an `undo-boundary' placed after the
+    // edit and before `save-buffer' -- if formatting ever DID touch the
+    // buffer, that undo would roll back the formatting step instead of
+    // the search edit under test. Opting out unconditionally, same as
+    // `verilog_auto_tests.rs'/`lsp_save_close_tests.rs'/
+    // `lsp_mode_tests.rs' before it.
+    let r = interp.eval_source("(setq format-on-save nil)");
+    assert!(r.is_ok(), "setq format-on-save nil failed");
     (interp, ed)
 }
 

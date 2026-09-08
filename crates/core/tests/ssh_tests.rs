@@ -23,6 +23,20 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
 fn setup() -> (Interp, Rc<RefCell<Editor>>) {
     let mut interp = elisp::new_interp();
     let ed = core::init_editor(&mut interp);
+    // M104 fix round: some tests here save real .v files over the
+    // fake-ssh transport (see e.g. the manual_e2e-style save-buffer
+    // call), and M104's `format-on-save' defaults to `t'. The fixture
+    // content happens not to be valid Verilog, and this machine's
+    // `verible-verilog-format' happens to exit 0 with unchanged output
+    // on a parse failure -- so nothing actually reformats today, but
+    // that is a coincidence of the fixture content and one external
+    // tool's current behavior, not something this file (remote-file
+    // save/kill semantics) is actually testing. Opting out
+    // unconditionally, same as `verilog_auto_tests.rs'/
+    // `lsp_save_close_tests.rs'/`lsp_mode_tests.rs'/`search_tests.rs'
+    // before it.
+    let r = interp.eval_source("(setq format-on-save nil)");
+    assert!(r.is_ok(), "setq format-on-save nil failed");
     (interp, ed)
 }
 

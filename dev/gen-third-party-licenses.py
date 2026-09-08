@@ -76,6 +76,28 @@ appear in the macOS, Linux or Windows build graphs at all.
 
 """
 
+BUNDLED_FONTS_SECTION = """
+## Bundled fonts
+
+Beyond the egui-default font set noted above, `crates/frontend-gui` embeds two
+additional monospace font families as `gui-font` choices (M105), vendored into
+`assets/fonts/` and compiled into the binary with `include_bytes!`. Both are
+licensed under the SIL Open Font License, Version 1.1 (`OFL-1.1`), which
+permits redistribution as part of a larger work, including a commercial one,
+and requires that this attribution travel with the binary. The full license
+text for each is shipped alongside the font files themselves.
+
+| File | Upstream | Version | Copyright | License text |
+| --- | --- | --- | --- | --- |
+| `JetBrainsMono-Regular.ttf`, `JetBrainsMono-Bold.ttf`, `JetBrainsMono-Italic.ttf` | https://github.com/JetBrains/JetBrainsMono | v2.304 | Copyright 2020 The JetBrains Mono Project Authors | `assets/fonts/JetBrainsMono-OFL.txt` |
+| `FiraCode-Regular.ttf`, `FiraCode-Bold.ttf` | https://github.com/tonsky/FiraCode | 6.2 | Copyright (c) 2014, The Fira Code Project Authors | `assets/fonts/FiraCode-OFL.txt` |
+
+Fira Code's upstream release ships no italic face (only Bold/Light/Medium/
+Regular/Retina/SemiBold), so none is bundled here either -- `gui-font`'s
+`fira-code` choice falls back to a system font for italic text, exactly as it
+already does for any other font missing a same-family italic.
+"""
+
 MIT_TEXT = """
 ## Full license texts
 
@@ -193,6 +215,8 @@ def main() -> int:
     print()
 
     print(DERIVED_FILES_SECTION.strip())
+    print()
+    print(BUNDLED_FONTS_SECTION.strip())
     print()
     print('## Crates')
     print()

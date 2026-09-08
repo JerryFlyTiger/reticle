@@ -674,6 +674,76 @@ fn move_completion_selection(ed: &Rc<RefCell<Editor>>, delta: i64) {
     }
 }
 
+/// Decode a `PopupItem`'s `insert`/`payload` pair (M123 Part B, review
+/// round: moved off a Private-Use-Area-prefixed `insert` string into
+/// `PopupItem`'s own dedicated field -- see its doc comment for why)
+/// into the literal TEXT to insert and the cursor OFFSET (chars from
+/// the insertion start) point should land at afterward -- `None`
+/// meaning "end of TEXT", the ONLY behavior that existed before this
+/// milestone and still the outcome whenever PAYLOAD is `None`, the
+/// overwhelmingly common case: INSERT is returned unchanged.
+///
+/// `lsp.el` produces exactly two non-`None` PAYLOAD shapes today, both
+/// `"KIND:N"`:
+///   - `"offset:N"`: N is the offset, INSERT is the already-fully-
+///     expanded final text -- no further work needed here beyond
+///     parsing N back out.
+///   - `"resolve:N"`: N is an index into `lsp--completion-registry`,
+///     INSERT is the fallback text to use if resolve fails. This calls
+///     BACK into elisp (`lsp--resolve-and-render-completion`, via
+///     `apply_function`) to actually perform the `completionItem/
+///     resolve` round trip and the snippet expansion, since both live
+///     in `lsp.el`, not here -- accepting a candidate is command-like,
+///     not a place to duplicate LSP protocol logic in Rust.
+///
+/// Any other shape (an unrecognized KIND, non-numeric N, ...) is
+/// treated as malformed and returned as literal INSERT text unchanged
+/// -- degrade to "looks a little odd" rather than lose the candidate or
+/// signal.
+fn decode_completion_insert(
+    interp: &mut Interp,
+    insert: &str,
+    payload: Option<&str>,
+) -> (String, Option<usize>) {
+    let Some(payload) = payload else {
+        return (insert.to_string(), None);
+    };
+    let Some((kind, digits)) = payload.split_once(':') else {
+        return (insert.to_string(), None);
+    };
+    let Ok(n) = digits.parse::<i64>() else {
+        return (insert.to_string(), None);
+    };
+    match kind {
+        "offset" => (insert.to_string(), Some(n.max(0) as usize)),
+        "resolve" => {
+            let sym = interp.intern("lsp--resolve-and-render-completion");
+            let args: elisp::value::Args =
+                vec![Value::Int(n), Value::string(insert.to_string())].into();
+            match apply_function(interp, &Value::Sym(sym), args) {
+                Ok(Value::Cons(c)) => {
+                    let cell = c.borrow();
+                    let text = match &cell.car {
+                        Value::Str(s) => s.to_string(),
+                        _ => insert.to_string(),
+                    };
+                    let offset = match &cell.cdr {
+                        Value::Int(off) if *off >= 0 => Some(*off as usize),
+                        _ => None,
+                    };
+                    (text, offset)
+                }
+                // `apply_function` erroring, or returning anything other
+                // than a (TEXT . OFFSET) cons, must never lose the
+                // candidate -- fall back to the fallback text carried
+                // in `insert` itself, point at its end.
+                _ => (insert.to_string(), None),
+            }
+        }
+        _ => (insert.to_string(), None),
+    }
+}
+
 /// Accept the highlighted candidate: `delete-region(start, point)` then
 /// insert its text, via the same internal `edit_delete`/`edit_insert`
 /// path `self_insert` and the `delete-region`/`insert` builtins use
@@ -703,12 +773,13 @@ fn accept_completion(interp: &mut Interp, ed: &Rc<RefCell<Editor>>) {
         let editor = ed.borrow();
         editor.completion_popup.as_ref().map(|p| {
             let item = &p.items[p.selected];
-            (item.start, item.insert.clone())
+            (item.start, item.insert.clone(), item.payload.clone())
         })
     };
-    let Some((start, text)) = extracted else {
+    let Some((start, raw_insert, payload)) = extracted else {
         return;
     };
+    let (text, offset) = decode_completion_insert(interp, &raw_insert, payload.as_deref());
     let buf = ed.borrow().current.clone();
     if crate::builtins::check_writable(interp, &buf).is_ok() {
         buf.borrow_mut().undo_boundary();
@@ -721,6 +792,16 @@ fn accept_completion(interp: &mut Interp, ed: &Rc<RefCell<Editor>>) {
         let (s, e) = (start.min(point), start.max(point));
         crate::editor::edit_delete(ed, &buf, s, e);
         crate::editor::edit_insert(ed, &buf, s, &text);
+        // M123: a snippet's `$0' places point somewhere OTHER than the
+        // end of the inserted text -- `edit_insert' above already left
+        // point at the end (see `adjust_windows_for_edit`'s `Insert`
+        // arm: point sitting AT the insertion pos moves forward by the
+        // full inserted length), so only override it when OFFSET says
+        // otherwise.
+        if let Some(off) = offset {
+            let text_len = text.chars().count();
+            buf.borrow_mut().point = s + off.min(text_len);
+        }
     } else {
         let name = buf.borrow().name.clone();
         ed.borrow_mut()

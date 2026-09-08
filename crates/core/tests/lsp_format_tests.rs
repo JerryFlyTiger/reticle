@@ -644,7 +644,14 @@ fn format_buffer_sends_correct_method_params_and_syncs_first() {
             &mut i,
             "(gethash \"tabSize\" (gethash \"options\" (nth 2 test--captured)))"
         ),
-        "4"
+        // M104 changed verilog-mode's default `standard-indent-width' from 4
+        // to 2 to match `verible-verilog-format''s own default, and
+        // `lsp--formatting-options' forwards that variable as `tabSize'. This
+        // scratch file is `.sv', so the value it observes moved with it. The
+        // assertion still guards the same property (the request carries the
+        // buffer's own indent width, not a hardcoded constant) -- only the
+        // mode default underneath it changed.
+        "2"
     );
     assert_eq!(
         run(

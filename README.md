@@ -76,16 +76,21 @@ current GNU defaults.
 
 ### Editor core
 
-Gap buffer with UTF-8 aware operations, windows, keymaps (global, buffer-local
-and an emulation layer), undo, overlays, and a single screen-grid redisplay
-model shared by both front ends.
+Gap buffer with UTF-8 aware operations, windows (split, resize, balance,
+directional movement, and GNU-style `display-buffer` so a help or output
+buffer never takes over the file you are editing), keymaps (global,
+buffer-local and an emulation layer), undo, overlays, and a single
+screen-grid redisplay model shared by both front ends.
 
 On top of that: minibuffer with completion, incremental search, Dired,
 `compile` / `recompile` / `next-error`, one-shot shell commands
 (`M-!` / `M-&` / `M-|`), Eshell, IELM, a help system
 (`describe-key` / `describe-bindings` / `describe-function`), an org-mode
-implementation that is file-format compatible with real org files, and
-TRAMP-style remote editing over SSH (`/ssh:user@host:/path`).
+implementation that is file-format compatible with real org files,
+tree-sitter driven semantic selection (`expand-region` / `contract-region`,
+`C-=` / `C--`), code formatting with selectable styles that runs on save
+(`C-c f f`, `C-c f s`), and TRAMP-style remote editing over SSH
+(`/ssh:user@host:/path`).
 
 ### Typing never blocks
 
@@ -230,6 +235,22 @@ A man page is provided at `doc/reticle.1`:
 install -m 644 doc/reticle.1 ~/.local/share/man/man1/
 man reticle
 ```
+
+### Themes
+
+Dracula Official is the default. Xcode and VS Code ship alongside it -- all
+three dark, their colours taken from the upstream sources themselves (Xcode's
+own `.xccolortheme`, `microsoft/vscode`'s `dark_plus.json`, and the theme
+Dracula's author maintains) rather than from a port. `M-x load-theme` switches
+between them, and a `light` theme is there for daylight.
+
+### Fonts
+
+JetBrains Mono ships with the editor and is the default; Fira Code ships
+alongside it, and SF Mono is used when macOS has it installed. `M-x set-font`
+switches between them, and `gui-font-family` still points at any font file on
+disk. Both bundled families are SIL OFL and their license texts travel with
+them in `assets/fonts/`.
 
 ### App icon
 
@@ -504,19 +525,12 @@ development candidates, not commitments:
 Requested, recorded, not yet scoped:
 
 - **A todo list.** The kind of task pane most IDEs and editors carry.
-- **Code formatting with a selectable style.**
 - **Multiple cursors**, in the shape of Magnar Sveen's `multiple-cursors.el`.
-- **`expand-region`**, in the shape of Magnar Sveen's package of that name.
 - **Visual design of the GUI**, promoted to second only to Verilog and
   SystemVerilog in priority.
 - **User-selectable font and theme**; a transparent window with a background
   image that can be faded and scaled, as iTerm2, VS Code and the JetBrains
   IDEs offer.
-- **Dracula Official as the default theme**, with Xcode and VS Code themes
-  offered alongside it.
-- **JetBrains Mono as the default font**, with Fira Code and SF Mono offered
-  alongside it.
-- **GNU Emacs's window-splitting behaviour.**
 
 ---
 

@@ -106,6 +106,20 @@
 ;;         -- whether the grammar exposes it as a distinct field was never
 ;;         established by M89's reconnaissance, and M89 was not asked to
 ;;         find out.
+;;   - M121 closed a real omission found by driving the real editor over
+;;     hand-written SystemVerilog: every SVA keyword (`assert`/`property`/
+;;     `cover`/`assume`/`disable`), `interface`/`endinterface`/`modport`,
+;;     `class`/`endclass`, `covergroup`/`endgroup`/`coverpoint`,
+;;     `program`/`endprogram`, and `new` (the constructor keyword) had NO
+;;     rule at all -- an omission the file's own "deliberately not covered"
+;;     list above never named -- plus two DECLARATION-name gaps this file's
+;;     M89/M97 house style already implied but never added: a `modport`'s
+;;     own name (see "modport's own declaration name" section below) and a
+;;     `coverpoint` label (see "coverpoint label" section below). All new
+;;     node/field names were dump-verified the same way as everything above
+;;     (a throwaway `#[cfg(test)]` probe over representative snippets in
+;;     `scope.rs`, printing `to_sexp()`, per this file's own established
+;;     convention -- not read off `node-types.json`).
 ;;       * A custom `nettype`'s own DECLARATION (`nettype real_net real;` --
 ;;         the `nettype` statement that introduces `real_net` as a name in
 ;;         the first place) gets no face at all here, only a subsequent USE
@@ -143,9 +157,14 @@
 ;; -- dump-verified, see header), sibling to the type_declaration's data_type
 ;; child, so this can never also reach a nested USE inside that data_type
 ;; (e.g. `typedef soc_pkg::req_t local_req_t;`'s `soc_pkg`/`req_t`).
-;; `covergroup_declaration`'s `name:` field is optional in the grammar (an
-;; unnamed covergroup is legal SV) but that's a query-time non-issue: a
-;; pattern with no matching field on a given node simply doesn't fire there.
+;; `covergroup_declaration`'s `name:` field is marked optional in
+;; `node-types.json`, but M121's own dump (`scope.rs`'s `verilog_label`
+;; comment on this same node kind) found that an unnamed covergroup is
+;; NOT actually legal SV -- `covergroup ;\nendgroup\n` parses as an ERROR
+;; both at top level and nested inside a class, and IEEE 1800's own
+;; grammar doesn't mark the identifier optional either. That's still a
+;; query-time non-issue regardless: a pattern with no matching field on a
+;; given node simply doesn't fire there.
 
 (type_declaration type_name: (simple_identifier) @type)
 (package_declaration name: (simple_identifier) @type)
@@ -153,6 +172,42 @@
 (interface_ansi_header name: (simple_identifier) @type)
 (interface_nonansi_header name: (simple_identifier) @type)
 (covergroup_declaration name: (simple_identifier) @type)
+
+;; --- M121: modport's own declaration name -> @constant ---------------------
+;; Dump-verified against `interface my_if; modport mst(input clk); endinterface`:
+;; the modport's declared name is `modport_item`'s bare, unlabeled first
+;; positional child (no `name:` field), immediately followed by that item's
+;; `modport_ports_declaration` -- anchoring with a leading `.` picks exactly
+;; the name, never a port direction/signal identifier nested inside the
+;; ports-declaration sibling. `modport_declaration` can hold several
+;; comma-separated `modport_item`s (`modport mst(...), slv(...);`,
+;; dump-verified), each with this same shape, so the rule fires once per name.
+;; Face choice: NOT @type (a modport is a fixed, named VIEW of an interface's
+;; signals, not a type of its own -- M97's header already draws this line for
+;; the *reference* site, `axi_if.mst`, giving it @constant instead of @type
+;; for exactly this reason). This is that same entity's DECLARATION, so it
+;; gets the same face as its reference for consistency, matching M97's own
+;; modport-REFERENCE rule below (`interface_port_header`'s `modport_name:`
+;; field, also @constant) -- there is no analogous enum-value-USE rule to
+;; cite here: this file's own type-references section below explicitly
+;; lists an enum value used as a value (a `hierarchical_identifier` in
+;; value position) as something its reference rule cannot reach, i.e.
+;; deliberately left uncoloured, not another @constant precedent.
+
+(modport_item . (simple_identifier) @constant)
+
+;; --- M121: coverpoint label -> @variable -------------------------------------
+;; Dump-verified against `covergroup my_cg; cp_data: coverpoint x; endgroup`:
+;; the `cp_data:` label is `cover_point`'s own `name:` field (a real field,
+;; not a bare positional child), sibling to the sampled `expression` --
+;; anchoring on the field can never also reach that expression, however it's
+;; written. Face choice: @variable, not @constant/@type -- unlike a modport
+;; name (a fixed, closed set of VIEWS an interface author enumerates once)
+;; or an enum member (a fixed value), a coverpoint label just NAMES a sampled
+;; data point for the coverage tool to report against, the same role a
+;; variable's own declared name plays elsewhere in this file.
+
+(cover_point name: (simple_identifier) @variable)
 
 ;; --- M89: enum member names -> @constant ------------------------------------
 ;; Matches java-highlights.scm's `enum_constant` and c-highlights.scm's
@@ -359,6 +414,41 @@
 "automatic" @keyword
 "genvar" @keyword
 "for" @keyword
+
+;; --- M121: SVA and OOP/coverage keywords -> @keyword ------------------------
+;; All bare anonymous tokens (dump-verified against `assert property (...)`,
+;; `cover property (...)`, `assume property (...)`, `disable iff (...)`,
+;; `disable my_block;`, `interface ... endinterface`, `modport ...`,
+;; `class ... endclass`, `covergroup ... endgroup`, `coverpoint`,
+;; `program ... endprogram`, and `function new(); ... endfunction`: none of
+;; these keywords showed up as its own named wrapper node anywhere in the
+;; dump -- same shape as `if`/`else`/`for`/`function`/`task` above, not the
+;; `module_keyword`/`always_keyword`/`case_keyword` wrapped shape). `disable`
+;; is one bare token shared by two different productions (a `disable
+;; iff (...)` assertion guard, and a plain `disable my_block;` statement) --
+;; matching the literal token, not a specific parent node, colors it either
+;; way, same as every other bare-token keyword in this file. `iff` (the
+;; assertion guard's own keyword, `disable iff (rst)`) is the same shape --
+;; a bare, unnamed sibling token directly under `property_spec`, dump-
+;; verified. Added in a later review round: the first version of this
+;; milestone colored `disable` but left `iff` an undocumented omission.
+"assert" @keyword
+"property" @keyword
+"cover" @keyword
+"assume" @keyword
+"disable" @keyword
+"iff" @keyword
+"interface" @keyword
+"endinterface" @keyword
+"modport" @keyword
+"class" @keyword
+"endclass" @keyword
+"covergroup" @keyword
+"endgroup" @keyword
+"coverpoint" @keyword
+"program" @keyword
+"endprogram" @keyword
+"new" @keyword
 
 ;; --- M97: interface port header -> @type / @constant ------------------------
 ;; A module (or another interface) port declared with an interface type,

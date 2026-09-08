@@ -137,6 +137,27 @@ default; `prog-mode-hook' turns it on buffer-locally.")
 (add-hook 'prog-mode-hook
           (lambda () (setq-local rainbow-delimiters-mode t)))
 
+;; M116: `show-trailing-whitespace' and `display-fill-column-indicator-
+;; mode' on by default in `prog-mode' buffers, same convention as
+;; `rainbow-delimiters-mode' just above -- see `simple.el''s defvars for
+;; why this project diverges from GNU's own (off-by-default) defaults
+;; for both.
+(add-hook 'prog-mode-hook
+          (lambda () (setq-local show-trailing-whitespace t)))
+
+(add-hook 'prog-mode-hook
+          (lambda () (setq-local display-fill-column-indicator-mode t)))
+
+;; M101: which `treesit-parser-create' language (if any) this buffer's
+;; major mode set up, buffer-local. Every tree-sitter-backed mode already
+;; knows its own LANG argument at `treesit--prog-mode-setup' time; this
+;; exists for generic commands that run in whatever buffer happens to be
+;; current and have no idea what mode that is -- currently just
+;; `expand-region' (expand-region.el), which needs a language symbol to
+;; hand to `treesit-parser-create' without hardcoding a mode-to-language
+;; table of its own. nil means "no syntax tree available in this buffer."
+(defvar treesit--buffer-language nil)
+
 ;; Shared body for every tree-sitter-backed programming major mode below:
 ;; set MODE as the buffer's major mode, turn on tree-sitter highlighting
 ;; for the `treesit-highlight-mode' language LANG, set the buffer-local
@@ -177,6 +198,7 @@ default; `prog-mode-hook' turns it on buffer-locally.")
 (defun treesit--prog-mode-setup (mode lang hook &optional width indent-fn)
   (major-mode-internal-set mode)
   (treesit-highlight-mode lang)
+  (setq-local treesit--buffer-language lang)
   (setq-local standard-indent-width (or width 4))
   (setq-local indent-line-function indent-fn)
   (indent--maybe-detect-width)
@@ -291,7 +313,15 @@ default; `prog-mode-hook' turns it on buffer-locally.")
 (defun verilog-mode ()
   "Major mode for editing Verilog/SystemVerilog code."
   (interactive)
-  (treesit--prog-mode-setup 'verilog-mode 'verilog 'verilog-mode-hook 4 'verilog-indent-line))
+  ;; M104: 2, not 4 -- matches `verible-verilog-format''s own default
+  ;; `--indentation_spaces' (and `format.el''s `verible' style, which
+  ;; pins the same value explicitly). Before this, a freshly typed
+  ;; Verilog buffer indented at 4 got silently rewritten to 2 columns
+  ;; the first time `format-buffer'/save-time formatting ran on it.
+  ;; `indent--maybe-detect-width' (indent.el) still takes priority when
+  ;; it can confidently detect a file's own existing width -- this is
+  ;; only the fallback for files it can't read a width from.
+  (treesit--prog-mode-setup 'verilog-mode 'verilog 'verilog-mode-hook 2 'verilog-indent-line))
 
 (add-to-list 'auto-mode-alist '("\\.v\\'" . verilog-mode))
 (add-to-list 'auto-mode-alist '("\\.vh\\'" . verilog-mode))

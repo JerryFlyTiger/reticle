@@ -70,7 +70,10 @@
   (interactive)
   (let ((dir (or (default-directory)
                  (file-name-as-directory (expand-file-name ".")))))
-    (switch-to-buffer-internal "*eshell*")
+    ;; M103: `pop-to-buffer', not `switch-to-buffer-internal' -- splits a
+    ;; window for `*eshell*' instead of overwriting whatever the user
+    ;; was editing. See window.el's header for the full design.
+    (pop-to-buffer "*eshell*")
     (major-mode-internal-set 'eshell-mode)
     (unless (default-directory)
       (set-default-directory dir)))

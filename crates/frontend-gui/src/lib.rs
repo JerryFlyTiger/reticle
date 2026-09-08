@@ -13,7 +13,7 @@
 //! never calls elisp. Ground colors come from the theme's `default`
 //! face, so `(load-theme 'light)` relights the whole frame live.
 
-mod shaping;
+pub mod shaping;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -22,8 +22,9 @@ use std::sync::Arc;
 use eframe::egui;
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Vec2};
 
+use core::buffer::Buffer;
 use core::commands::{handle_key, Key};
-use core::editor::Editor;
+use core::editor::{buffer_local_value, Editor};
 use core::keymap::{ctrl_encode, META};
 use core::redisplay::{frame_base_style, render, Underline};
 use elisp::Interp;
@@ -45,13 +46,23 @@ const ITALIC_FAMILY: &str = "mono-italic";
 /// run simply has nothing to shape with and falls back to `painter.text`,
 /// same as it always has.
 #[derive(Default)]
-struct FontSet {
+pub struct FontSet {
     regular: Option<ShapingFace>,
     bold: Option<ShapingFace>,
     italic: Option<ShapingFace>,
 }
 
 impl FontSet {
+    /// The shaping-ready regular face, or `None` when nothing loaded
+    /// (never happens in practice -- some primary candidate always
+    /// resolves, at minimum to a built-in). Exposed read-only: nothing
+    /// outside this module needs to construct or mutate a `FontSet`
+    /// directly, only `font_tests.rs` needs to read `regular` back to
+    /// confirm which bytes actually got loaded.
+    pub fn regular(&self) -> Option<&ShapingFace> {
+        self.regular.as_ref()
+    }
+
     fn for_role(&self, role: FaceRole) -> Option<&ShapingFace> {
         match role {
             FaceRole::Regular => self.regular.as_ref(),
@@ -67,7 +78,7 @@ impl FontSet {
 /// indices. `None` when `base` doesn't follow the `*-Regular.*` pattern
 /// (a font file named some other way, e.g. `Monaco.ttf`, which has no
 /// separate bold/italic file to look for).
-fn variant_file_name(base: &str, variant: &str) -> Option<String> {
+pub fn variant_file_name(base: &str, variant: &str) -> Option<String> {
     // Fix 7 (cold review): `replacen(.., 1)` replaces the FIRST
     // occurrence of "Regular". A family name that itself contains
     // "Regular" before the variant marker (e.g. a hypothetical
@@ -107,6 +118,68 @@ const BLINK_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_mil
 /// changes what a macOS user sees in the Dock.
 const ICON_PNG_BYTES: &[u8] = include_bytes!("../../../assets/icon/png/reticle-256.png");
 
+/// M105: the two bundled body fonts, embedded at compile time the same
+/// way `ICON_PNG_BYTES` is -- so a fresh checkout has a working default
+/// font with nothing to install, and the result does not depend on
+/// which fonts (if any) happen to be present on the machine this runs
+/// on. Both are SIL Open Font License 1.1 (see `assets/fonts/*-OFL.txt`
+/// and the "Fonts" entry `dev/gen-third-party-licenses.py` adds to
+/// `THIRD_PARTY_LICENSES.md`), which permits redistribution as part of a
+/// larger work.
+///
+/// Fira Code's upstream release ships no italic face at all (only
+/// Bold/Light/Medium/Regular/Retina/SemiBold) -- there is deliberately
+/// no `FIRA_CODE_ITALIC` constant. `embedded_font_bytes` returning `None`
+/// for `"FiraCode-Italic.ttf"` is what lets `install_fonts`' existing
+/// Menlo.ttc fallback fill that gap in, exactly as it already does for
+/// any other font missing a same-family italic.
+const JETBRAINS_MONO_REGULAR: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+const JETBRAINS_MONO_BOLD: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Bold.ttf");
+const JETBRAINS_MONO_ITALIC: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Italic.ttf");
+const FIRA_CODE_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/FiraCode-Regular.ttf");
+const FIRA_CODE_BOLD: &[u8] = include_bytes!("../../../assets/fonts/FiraCode-Bold.ttf");
+
+/// The embedded bytes for one of the five bundled font files by name, or
+/// `None` when `name` isn't one of them -- the caller's cue to fall back
+/// to `find_font`'s disk search instead. Embedded files are matched by
+/// name and NEVER also looked up on disk, even when a same-named file
+/// happens to exist there: `gui-font`'s `jetbrains-mono`/`fira-code`
+/// choices must render identically regardless of what a given machine
+/// has installed, which is also why the bundled OFL license files travel
+/// with the binary via `dev/gen-third-party-licenses.py` rather than
+/// this being "just another disk candidate".
+pub fn embedded_font_bytes(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "JetBrainsMono-Regular.ttf" => Some(JETBRAINS_MONO_REGULAR),
+        "JetBrainsMono-Bold.ttf" => Some(JETBRAINS_MONO_BOLD),
+        "JetBrainsMono-Italic.ttf" => Some(JETBRAINS_MONO_ITALIC),
+        "FiraCode-Regular.ttf" => Some(FIRA_CODE_REGULAR),
+        "FiraCode-Bold.ttf" => Some(FIRA_CODE_BOLD),
+        _ => None,
+    }
+}
+
+/// `embedded_font_bytes` first, `find_font` (disk search) second. Used
+/// ONLY for `gui-font`'s built-in candidates (`font_search_order`'s
+/// output, plus their same-family bold/italic variants), never for a
+/// `gui-font-family` override -- see `build_font_definitions`'s
+/// `regular_is_override` split, which routes an override's lookups
+/// through `find_font` directly instead. Fix (cold review): an earlier
+/// version of this function was also used for the override, which meant
+/// setting `gui-font-family` to a name that happened to match one of the
+/// five embedded files (e.g. a Nerd-Font-patched build a user installed
+/// under the same name) silently returned this project's own bundled
+/// bytes instead of the user's file -- contradicting both this function's
+/// intent and `gui-font-family`'s own docstring in `gui.el`.
+fn resolve_font(name: &str) -> Option<Vec<u8>> {
+    if let Some(bytes) = embedded_font_bytes(name) {
+        return Some(bytes.to_vec());
+    }
+    find_font(name)
+}
+
 /// Default window size (M-visual-quality): big enough that a Verilog
 /// module instantiation with a wide port list isn't immediately
 /// scrollbar territory. `min_inner_size` keeps a user-shrunk window from
@@ -130,7 +203,18 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 780.0])
         .with_min_inner_size([480.0, 320.0])
-        .with_title("Reticle");
+        .with_title("Reticle")
+        // M111: always request a transparent-capable viewport, not
+        // conditionally on `gui-opacity` -- that variable is read once per
+        // frame (see `App::update`), so a startup-time branch here could
+        // never react to a later runtime change anyway, and at the
+        // default 100% every background paints fully opaque regardless,
+        // so the window looks identical to before this milestone either
+        // way. If the platform's GL config can't actually do it, eframe
+        // logs "Cannot create transparent window" and falls back to an
+        // ordinary opaque window -- not a crash, not an error surfaced
+        // to the user.
+        .with_transparent(true);
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
@@ -143,8 +227,11 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
         options,
         Box::new(move |cc| {
             let font_family = str_var(&interp, "gui-font-family");
+            let named_font = sym_var(&interp, "gui-font")
+                .unwrap_or("jetbrains-mono")
+                .to_string();
             let (have_bold, have_italic, fonts) =
-                install_fonts(&cc.egui_ctx, font_family.as_deref());
+                install_fonts(&cc.egui_ctx, font_family.as_deref(), &named_font);
             Ok(Box::new(App {
                 interp,
                 ed,
@@ -152,6 +239,7 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
                 have_bold,
                 have_italic,
                 fonts,
+                active_font: (named_font, font_family),
                 shape_cache: ShapeCache::default(),
                 glyph_cache: GlyphAtlasCache::default(),
                 last_frame_ms: 0.0,
@@ -162,13 +250,17 @@ pub fn run_gui(interp: Interp, ed: Rc<RefCell<Editor>>) -> Result<(), eframe::Er
     )
 }
 
-/// Preferred body-text fonts, in search order, each tried under every
-/// directory in `FONT_DIRS`; the first one found on disk wins. JetBrains
+/// Preferred body-text fonts, base search order (before `gui-font`
+/// reorders it -- see `font_search_order`), each tried under every
+/// directory in `FONT_DIRS` for the two that aren't embedded. JetBrains
 /// Mono and Fira Code are the two monospace faces routinely singled out
 /// for readability at RTL-editing sizes (wide port lists, long
-/// parameterized module names); the rest are the macOS system monospace
-/// faces this project already shipped with, kept as the fallback chain.
-const FONT_CANDIDATES: [&str; 5] = [
+/// parameterized module names) -- since M105 both are embedded
+/// (`embedded_font_bytes`), so they no longer depend on `FONT_DIRS` at
+/// all; SF Mono, Menlo and Monaco are the macOS system monospace faces
+/// this project already shipped with, kept as the fallback chain and
+/// still disk-searched (SF Mono's license does not permit bundling it).
+pub const FONT_CANDIDATES: [&str; 5] = [
     "JetBrainsMono-Regular.ttf",
     "FiraCode-Regular.ttf",
     "SFNSMono.ttf",
@@ -176,9 +268,38 @@ const FONT_CANDIDATES: [&str; 5] = [
     "Monaco.ttf",
 ];
 
+/// `FONT_CANDIDATES`, with the file matching `gui-font`'s selection
+/// moved to the front (stable: everything else keeps its relative
+/// order). `named_font` is `gui-font`'s symbol name
+/// (`"jetbrains-mono"`/`"fira-code"`/`"sf-mono"`); anything else
+/// (unset, or a typo in a user's init.el) is treated as
+/// `"jetbrains-mono"`, the documented default. Moving the pick to the
+/// front only changes which candidate becomes `install_fonts`'s
+/// "regular" face (used for shaping and for the same-family bold/italic
+/// search) and its position in the fallback chain -- every other
+/// candidate is still tried afterward exactly as before, so a pick that
+/// fails to resolve (`sf-mono` not installed) still falls through to a
+/// working font rather than leaving the grid unrenderable.
+pub fn font_search_order(named_font: &str) -> Vec<&'static str> {
+    let preferred = match named_font {
+        "fira-code" => "FiraCode-Regular.ttf",
+        "sf-mono" => "SFNSMono.ttf",
+        _ => "JetBrainsMono-Regular.ttf",
+    };
+    let mut order: Vec<&'static str> = Vec::with_capacity(FONT_CANDIDATES.len());
+    order.push(preferred);
+    order.extend(FONT_CANDIDATES.iter().copied().filter(|c| *c != preferred));
+    order
+}
+
 /// Directories searched for `FONT_CANDIDATES` (and for `gui-font-family`
-/// when set), in order.
-fn font_dirs() -> Vec<std::path::PathBuf> {
+/// when set), in order. `pub` (M105 fix round) so `font_tests.rs` can
+/// probe the exact same directories `find_font` searches, instead of
+/// hard-coding its own guess -- and so it can detect when this list
+/// drifts from `gui.el`'s `gui--font-dirs`, which duplicates this list by
+/// hand because there is no channel from Rust to elisp before the first
+/// frame paints (see that function's own docstring).
+pub fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
@@ -190,8 +311,11 @@ fn font_dirs() -> Vec<std::path::PathBuf> {
 }
 
 /// Search `font_dirs()` for `file_name`, returning the first match's
-/// bytes.
-fn find_font(file_name: &str) -> Option<Vec<u8>> {
+/// bytes. `pub` (M105 fix round) so tests can independently confirm
+/// whether a given machine has, e.g., `SFNSMono.ttf` installed, and
+/// assert the correct branch of `gui-font`'s `sf-mono` fallback instead
+/// of assuming one particular machine's state.
+pub fn find_font(file_name: &str) -> Option<Vec<u8>> {
     for dir in font_dirs() {
         let path = dir.join(file_name);
         if let Ok(bytes) = std::fs::read(&path) {
@@ -206,42 +330,95 @@ fn find_font(file_name: &str) -> Option<Vec<u8>> {
 /// available (Menlo.ttc: 0=regular 1=bold 2=italic on macOS). Returns
 /// which real variants loaded; bold falls back to double-draw when
 /// absent. `font_family` is `gui-font-family` (a file name), tried
-/// before the built-in candidate list when set.
+/// before the built-in candidate list when set; `named_font` is
+/// `gui-font`'s symbol name, which only reorders that built-in candidate
+/// list (`font_search_order`) -- `gui-font-family` still wins outright
+/// when set, matching its docstring in `gui.el`.
 ///
-/// Fix E (trailing review, known gap): the candidate search
+/// M105: called again, not just once at startup -- see `App::active_font`
+/// and its check in `update`. Callers must not assume this only runs
+/// before the first frame.
+///
+/// Fix E (trailing review, narrowed by M105): the candidate search
 /// (`find_font`/`font_dirs`) and the fallback-chain construction below it
-/// both depend on which real font files happen to exist on the running
-/// machine's filesystem, so neither has a test or a mutation point --
+/// still depend on which real font files happen to exist on the running
+/// machine's filesystem for `gui-font-family`, `sf-mono`, Menlo and
+/// Monaco, so those parts still have no test or mutation point --
 /// asserting on the result would mean either shipping fixture font files
 /// or hard-coding assumptions about what's installed on the CI/dev
 /// machine, both of which this project has chosen not to do. This is an
-/// acknowledged, deliberate gap, not an oversight.
-fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool, FontSet) {
+/// acknowledged, deliberate gap, not an oversight. The `jetbrains-mono`/
+/// `fira-code` half of this function no longer has that problem: since
+/// both are embedded (`embedded_font_bytes`), their result is the same on
+/// every machine, and `font_tests.rs` asserts on it directly.
+///
+/// Thin wrapper over `build_font_definitions` (M105): the split exists so
+/// tests can inspect the resulting `FontDefinitions` directly, which
+/// `ctx.set_fonts` below would otherwise consume with nothing handed
+/// back. This function is what every real caller (`run_gui`'s startup
+/// closure, `App::update`'s runtime-switch check) still calls -- the
+/// split changes nothing about their behavior.
+pub fn install_fonts(
+    ctx: &egui::Context,
+    font_family: Option<&str>,
+    named_font: &str,
+) -> (bool, bool, FontSet) {
+    let (have_bold, have_italic, font_set, fonts) = build_font_definitions(font_family, named_font);
+    ctx.set_fonts(fonts);
+    (have_bold, have_italic, font_set)
+}
+
+/// The pure half of `install_fonts`: builds the `FontDefinitions` and
+/// `FontSet` egui/the shaper need, without touching an `egui::Context` at
+/// all. See `install_fonts`'s doc for why this is split out.
+pub fn build_font_definitions(
+    font_family: Option<&str>,
+    named_font: &str,
+) -> (bool, bool, FontSet, FontDefinitions) {
     let mut fonts = FontDefinitions::default();
     let mut loaded: Vec<String> = Vec::new();
     let mut font_set = FontSet::default();
     // The primary body font chain (fix 6b): gui-font-family first, then
-    // EVERY built-in candidate actually present on disk, in search
-    // order -- not just the first hit. A previous version of this
-    // function took only the first hit as "primary" and dropped the
+    // EVERY built-in candidate actually present (embedded, or on disk),
+    // in search order -- not just the first hit. A previous version of
+    // this function took only the first hit as "primary" and dropped the
     // rest, so a primary font missing a glyph had nothing left to fall
     // back to except the CJK font. Each hit gets its own font_data key
     // (`primary-0`, `primary-1`, ...) so all of them can be chained.
-    let search_order: Vec<&str> = font_family
+    let candidate_order = font_search_order(named_font);
+    // `gui-font-family` (when set) is ALWAYS disk-searched, never
+    // resolved via embedded bytes, even when its name happens to match
+    // one of the five embedded files (fix, cold review): embedding exists
+    // to serve `gui-font`'s three named choices, not to silently
+    // substitute a user's own explicitly-named font file with the copy
+    // this project bundles. Every built-in candidate after it keeps
+    // going through `resolve_font` (embedded first, disk second) exactly
+    // as before -- only the override entry's resolver changes.
+    let search_order: Vec<(&str, bool)> = font_family
         .into_iter()
-        .chain(FONT_CANDIDATES.iter().copied())
+        .map(|f| (f, true)) // true = "this is the gui-font-family override"
+        .chain(candidate_order.iter().map(|c| (*c, false)))
         .collect();
     // The very first hit is also the "regular" face for shaping (task:
     // coding ligatures) -- its name is remembered so the bold/italic
     // search below can look for a same-family variant of exactly this
     // file, not of the search order's first *candidate* (which may not
-    // be what was actually found).
+    // be what was actually found). `regular_is_override` records whether
+    // that hit came from `gui-font-family`, so the variant search below
+    // knows to stay disk-only too, for the same reason.
     let mut regular_name: Option<String> = None;
-    for name in search_order {
-        if let Some(bytes) = find_font(name) {
+    let mut regular_is_override = false;
+    for (name, is_override) in search_order {
+        let found = if is_override {
+            find_font(name)
+        } else {
+            resolve_font(name)
+        };
+        if let Some(bytes) = found {
             let key = format!("primary-{}", loaded.len());
             if regular_name.is_none() {
                 regular_name = Some(name.to_string());
+                regular_is_override = is_override;
                 // Font-bytes trap: `FontData::from_owned` takes
                 // ownership of `bytes` below and does not give it back,
                 // so the shaping-side copy is taken from this same read
@@ -288,14 +465,27 @@ fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool,
     // drawing its bold/italic runs in Menlo (a different family
     // entirely) is a visible mismatch. Falls back to Menlo.ttc's face
     // indices 1/2 exactly as before when no same-family variant exists.
+    //
+    // `resolve_variant`: same disk-only-vs-embedded split as the primary
+    // search above, keyed on `regular_is_override` -- a `gui-font-family`
+    // override's bold/italic variant must be searched for on disk too,
+    // never substituted with this project's own bundled bytes just
+    // because the variant's file name happens to match one.
+    let resolve_variant = |n: &str| -> Option<Vec<u8>> {
+        if regular_is_override {
+            find_font(n)
+        } else {
+            resolve_font(n)
+        }
+    };
     let same_family_bold = regular_name
         .as_deref()
         .and_then(|n| variant_file_name(n, "Bold"))
-        .and_then(|n| find_font(&n).map(|b| (n, b)));
+        .and_then(|n| resolve_variant(&n).map(|b| (n, b)));
     let same_family_italic = regular_name
         .as_deref()
         .and_then(|n| variant_file_name(n, "Italic"))
-        .and_then(|n| find_font(&n).map(|b| (n, b)));
+        .and_then(|n| resolve_variant(&n).map(|b| (n, b)));
 
     if let Some((_, bytes)) = &same_family_bold {
         font_set.bold = ShapingFace::new(Arc::from(bytes.clone().into_boxed_slice()), 0);
@@ -359,23 +549,81 @@ fn install_fonts(ctx: &egui::Context, font_family: Option<&str>) -> (bool, bool,
         }
     }
 
-    ctx.set_fonts(fonts);
-    (have_bold, have_italic, font_set)
+    (have_bold, have_italic, font_set, fonts)
 }
 
 struct App {
     interp: Interp,
     ed: Rc<RefCell<Editor>>,
     last_input: std::time::Instant,
+    /// Whether a real bold face loaded. Both `jetbrains-mono` and
+    /// `fira-code` have their own embedded `-Bold.ttf`, so this is `true`
+    /// for both -- see `build_font_definitions`'s `same_family_bold`.
     have_bold: bool,
+    /// Whether a real italic face loaded, from EITHER of two different
+    /// sources depending on `gui-font`: `jetbrains-mono` has its own
+    /// embedded `JetBrainsMono-Italic.ttf` (a true italic design for that
+    /// family); `fira-code` has no italic upstream at all, so its
+    /// `have_italic`/`family-italic` slot is never populated -- when this
+    /// is `true` for `fira-code`, the FONT-DEFINITION layer registers
+    /// Menlo.ttc's italic face (index 2) under the `"mono-italic"` family
+    /// instead (confirmed by directly calling `build_font_definitions`:
+    /// `have_italic` is `true` and `families[Name("mono-italic")]` is
+    /// `["menlo-italic", "arial-unicode"]`), and `epaint` 0.29.1
+    /// (`fonts.rs:202`) does pass that face index through to
+    /// `ab_glyph::FontRef::try_from_slice_and_index`, so the registration
+    /// path traces through correctly. `font_tests.rs`'s
+    /// `build_font_definitions_for_fira_code_has_no_embedded_italic`
+    /// covers exactly this registration-layer claim (the `family-italic`
+    /// key stays absent, and when `have_italic` is true the bytes under
+    /// `menlo-italic` are Menlo's, not Fira Code's) -- that test is about
+    /// registration, not about what ends up on screen.
+    ///
+    /// KNOWN GAP, MEASURED then FIXED (M105 measured it, M106 found and
+    /// fixed the cause): despite the registration above being correct,
+    /// selecting `fira-code` used to render italic text (e.g. comments)
+    /// UPRIGHT on screen, confirmed by a screenshot cropped to the
+    /// comment line and scaled 3x for comparison against JetBrains
+    /// Mono's visibly slanted italic. The cause was in `shaping.rs`'s
+    /// `ShapingFace::new`: it built the rasterizing `ab_glyph::FontArc`
+    /// with `try_from_vec`, which always parses face 0 of a font
+    /// collection and silently ignores the `index` argument -- so
+    /// Menlo.ttc's italic face (index 2) was shaped correctly (rustybuzz
+    /// does honor `loaded.index`) but rasterized as face 0 (regular),
+    /// which is why it came out upright. The same bug also made
+    /// `sf-mono`'s bold (Menlo.ttc index 1) rasterize as regular weight.
+    /// Fixed by rasterizing through
+    /// `ab_glyph::FontVec::try_from_vec_and_index`, which does take the
+    /// face index, so shaping and rasterizing now agree on which face of
+    /// the collection they're using. Verified on screen after the fix
+    /// (`dev/gui-shot.sh` against a freshly rebuilt binary, not the stale
+    /// one an earlier attempt at this check mistakenly ran): a
+    /// before/after pixel diff of the comment line shows 16,112 changed
+    /// pixels for `fira-code` and 21,491 for `sf-mono`, both now visibly
+    /// slanted -- only these two fonts' italic/bold-via-Menlo.ttc paths
+    /// were actually looked at on screen, not every font this crate can
+    /// load. See `shaping.rs`'s `ShapingFace` doc for the invariant this
+    /// restores. See `gui-font`'s docstring in `gui.el` for the same
+    /// note.
     have_italic: bool,
     /// Shaping-ready faces (task: coding ligatures) -- see `shaping`'s
-    /// module doc. Populated once, at `install_fonts` time; the GUI never
-    /// changes fonts at runtime, so unlike `glyph_cache` these don't need
-    /// a per-frame invalidation check.
+    /// module doc. Rebuilt by `install_fonts` whenever `active_font`'s
+    /// per-frame check (M105) finds `gui-font`/`gui-font-family` changed
+    /// since the last frame -- unlike `glyph_cache`, this has no
+    /// self-invalidating signal of its own, so `update` must compare
+    /// explicitly rather than relying on an atlas-identity check.
     fonts: FontSet,
-    /// Shaping result cache, keyed on `(FaceRole, text)`. See `shaping`'s
-    /// module doc for what invalidates it (nothing, but capped).
+    /// The `(gui-font, gui-font-family)` pair that produced the `fonts`/
+    /// `have_bold`/`have_italic` currently loaded (M105). Read once per
+    /// frame in `update` and compared against the live elisp variables;
+    /// on a mismatch, `install_fonts` reruns and rebuilds egui's font
+    /// atlas via `ctx.set_fonts` -- an expensive call, which is exactly
+    /// why this comparison exists rather than reinstalling every frame.
+    active_font: (String, Option<String>),
+    /// Shaping result cache, keyed on `(FaceRole, text, enable_calt)`.
+    /// See `shaping`'s module doc for what invalidates it (nothing, but
+    /// capped -- the `enable_calt` key component is what makes
+    /// `gui-ligatures` toggling never see a stale entry).
     shape_cache: ShapeCache,
     /// Rasterized-glyph atlas-placement cache, keyed on `(FaceRole, glyph
     /// id, pixel scale)`. See `shaping`'s module doc for the per-frame
@@ -452,6 +700,42 @@ fn var_truthy(interp: &Interp, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A buffer-local integer variable, honoring buffer-local bindings the
+/// way `buffer_local_value` does -- `fill-column` (M116) is buffer-local
+/// (a per-buffer line-length convention set by major mode / user), unlike
+/// every `gui-*` variable `int_var` reads, which are all global. Mirrors
+/// `core::redisplay::buffer_var_on`'s shape one crate up: that helper is
+/// `pub(crate)` to `core` and not reachable from here, so this is the
+/// frontend's own copy of the same buffer-local-aware read, specialized
+/// to `Int` instead of truthiness.
+fn buffer_int_var(
+    interp: &Interp,
+    ed: &Editor,
+    buf: &Rc<RefCell<Buffer>>,
+    name: &str,
+    default: i64,
+) -> i64 {
+    interp
+        .intern_soft(name)
+        .and_then(|id| buffer_local_value(interp, ed, id, buf))
+        .and_then(|v| match v {
+            elisp::Value::Int(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+/// A buffer-local boolean variable, honoring buffer-local bindings the
+/// way `buffer_local_value` does -- `display-fill-column-indicator-mode`
+/// (M116) is buffer-local, same reasoning as `buffer_int_var` above.
+fn buffer_var_on(interp: &Interp, ed: &Editor, buf: &Rc<RefCell<Buffer>>, name: &str) -> bool {
+    interp
+        .intern_soft(name)
+        .and_then(|id| buffer_local_value(interp, ed, id, buf))
+        .map(|v| v.truthy())
+        .unwrap_or(false)
+}
+
 /// A named face from the editor's face table (`ed.faces`), or `None`
 /// when the theme hasn't defined it yet. Mirrors `redisplay::face_or`,
 /// which is private to that crate -- this is the frontend's own copy of
@@ -485,6 +769,100 @@ fn clamp_font_size(raw: i64) -> i64 {
 /// deliberately inside the clamped range rather than treated as "unset".
 fn clamp_cursor_blinks(raw: i64) -> i64 {
     raw.clamp(0, 100)
+}
+
+/// `gui-opacity` clamp (M111): 20..=100. There is no in-app opacity
+/// picker and no keybinding to raise it back -- the only way out of a
+/// bad value is editing the init file -- so 0 (or anything close to it)
+/// would hand a user a window that is invisible against a busy desktop
+/// and cannot be found to fix. 20 was picked as a floor that stays
+/// unambiguously "a window is there" (a dim but still fully outlined
+/// rectangle) rather than trying to guess the darkest usable value for
+/// every possible desktop background.
+fn clamp_opacity(raw: i64) -> i64 {
+    raw.clamp(20, 100)
+}
+
+/// `gui-opacity`'s raw percentage -> the 0.0..=1.0 fraction every color
+/// conversion below actually consumes. Pulled out as its own named
+/// function (M111 cold review, round 2) because inlining
+/// `clamp_opacity(...) as f32 / 100.0` at the one call site left the
+/// `/ 100.0` divisor unreachable by any test -- mutating it to, say,
+/// `/ 1000.0` would make `gui-opacity 40` behave as 4% in the running
+/// editor while every existing test still passed.
+fn opacity_percent_to_frac(pct: i64) -> f32 {
+    clamp_opacity(pct) as f32 / 100.0
+}
+
+/// Background-role conversion (M111): the same RGB mapping `to_color`
+/// uses, composed with `with_alpha` so the result also carries
+/// `gui-opacity`'s alpha. Kept as a separate function rather than adding
+/// an alpha parameter to `to_color` itself, because `to_color` is also
+/// used for foreground/text colors and underline colors, which must
+/// stay fully opaque regardless of `gui-opacity` -- text over a
+/// translucent background is how iTerm2/VS Code/JetBrains all do it, and
+/// mixing the two roles into one conversion is exactly the failure mode
+/// measured during recon: every face with an explicit `:background`
+/// stayed fully opaque while only the frame's own default background
+/// went translucent, because only the *default* used a hand-rolled
+/// alpha and every per-cell background still went through the opaque
+/// `to_color`.
+fn to_bg_color(c: core::redisplay::Color, opacity_frac: f32) -> Color32 {
+    with_alpha(to_color(c), opacity_frac)
+}
+
+/// The per-frame `gui-opacity` read (M117): pulled out of `App::update`
+/// so the wire from the elisp variable to the fraction every color
+/// conversion consumes is reachable from `cargo test` with a real
+/// `Interp` -- before this extraction the whole conversion lived inline
+/// in `update`, which only runs inside eframe's real `CreationContext`
+/// closure and is therefore unreachable from any test.
+fn frame_opacity_frac(interp: &Interp) -> f32 {
+    opacity_percent_to_frac(int_var(interp, "gui-opacity", 100))
+}
+
+/// The per-frame frame-background computation (M117): the theme's own
+/// background (if the active face set defines one) picks up
+/// `opacity_frac`'s alpha via `to_bg_color`; otherwise `FALLBACK_BG`
+/// picks it up via `with_alpha`. Extracted alongside `frame_opacity_
+/// frac` for the same reason -- it was inline in `App::update` and
+/// unreachable from `cargo test`.
+fn frame_bg(base_bg: Option<core::redisplay::Color>, opacity_frac: f32) -> Color32 {
+    base_bg
+        .map(|c| to_bg_color(c, opacity_frac))
+        .unwrap_or_else(|| with_alpha(FALLBACK_BG, opacity_frac))
+}
+
+/// The per-frame `gui-ligatures` read (M117): pulled out of `App::
+/// update` for the same reason as `frame_opacity_frac` above -- so a
+/// wrong variable name or a hardcoded `true` is caught by a test
+/// instead of only being visible on a screenshot.
+fn ligatures_enabled(interp: &Interp) -> bool {
+    var_truthy(interp, "gui-ligatures")
+}
+
+/// The scrollbar's diagnostics lookup for one window's buffer (M117):
+/// pulled out of the inline `ed_ref.diagnostics.get(&(Rc::as_ptr(&win.
+/// buffer) as usize))...` chain in `App::update` so a wrong key (e.g.
+/// looking up the other window's buffer in a split, which would
+/// silently drop every mark) is caught by a test instead of only being
+/// visible on a screenshot. Preserves the stored iteration order --
+/// does not sort or dedup.
+///
+/// The `Vec` is the deliberate price of that testability: the inline
+/// version borrowed lazily straight out of the `HashMap`, so this
+/// allocates once per frame per window where the old code allocated
+/// nothing. A diagnostics list is a handful of entries, and the cold
+/// read that raised it agreed the trade is worth making -- recorded
+/// here rather than left for someone to rediscover as an unexplained
+/// per-frame allocation.
+fn window_diagnostic_lines(ed: &Editor, buf: &Rc<RefCell<Buffer>>) -> Vec<(usize, u8)> {
+    ed.diagnostics
+        .get(&(Rc::as_ptr(buf) as usize))
+        .into_iter()
+        .flatten()
+        .map(|(line, sev, _msg)| (*line, *sev))
+        .collect()
 }
 
 /// Snap a rect's four edges to whole device pixels via `pixels_per_point`
@@ -564,8 +942,20 @@ fn cursor_glyph_color(normal_fg: Color32, under_cursor_fg: Color32, t: f32) -> C
 /// color, this may keep the smooth interpolation (fix 3): there is no
 /// "invisible" failure mode for a background fading into another
 /// background, only for a glyph fading into the color right behind it.
+///
+/// `normal_bg` is forced `.to_opaque()` here (M111 cold review, round 2)
+/// because under `gui-opacity` < 100 it may be a translucent `to_bg_color`
+/// value -- a `Color32` stores gamma-premultiplied bytes, and `lerp_color`
+/// reads `.r()/.g()/.b()` directly and treats them as plain channel
+/// values, exactly the same "premultiplied read as unmultiplied" bug
+/// already fixed for `with_alpha`'s double-application elsewhere in this
+/// milestone, just reached through a different function. `.to_opaque()`
+/// un-premultiplies by the color's own current alpha, so this is correct
+/// whether `normal_bg` arrives already opaque (a no-op) or translucent.
+/// `under_cursor_bg` is not treated the same way because every call site
+/// already guarantees it opaque before calling this.
 fn cursor_bg_color(normal_bg: Color32, under_cursor_bg: Color32, t: f32) -> Color32 {
-    lerp_color(normal_bg, under_cursor_bg, t)
+    lerp_color(normal_bg.to_opaque(), under_cursor_bg, t)
 }
 
 /// Fix A: whether the cursor's smooth fade (task 6) is still animating at
@@ -698,6 +1088,84 @@ fn scrollbar_thumb(
     Some((top, len))
 }
 
+/// Overview-ruler diagnostic marks (M115): given every diagnostic's
+/// 0-based line number and severity byte (same encoding as
+/// `Editor::diagnostics` and `severity_color` -- 1=error, 2=warning,
+/// anything else=info/hint, LOWER is MORE severe), the buffer's total
+/// line count, and the track geometry (same `track_len` `scrollbar_thumb`
+/// draws into, plus a `min_len` mark height), returns each mark's
+/// `(top, len, severity)` in track-local px, sorted by `top`.
+///
+/// A diagnostic's `top` is proportional to its line within the WHOLE
+/// buffer (`line / total_lines`), not within the visible window -- the
+/// point of an overview ruler is showing what's off-screen, unlike the
+/// thumb which tracks the visible window itself.
+///
+/// Marks are bucketed by their rounded-to-the-pixel `top` (`track_len`
+/// is already in logical px, same units the caller feeds straight into
+/// `painter.rect_filled`, so "same pixel row" is exactly "same rounded
+/// top"); two diagnostics that land in the same bucket merge into one
+/// mark, keeping the MOST severe (lowest byte) of the two -- otherwise a
+/// later info-level diagnostic drawn on top of an earlier error would
+/// visually erase it, which is the opposite of what a ruler is for.
+///
+/// `min_len` gives every mark a floor height (mirroring `scrollbar_thumb`'s
+/// own `min_len` clamp on the thumb) -- a single diagnostic in a
+/// 10,000-line file would otherwise round to a sub-pixel sliver. The
+/// returned length is `min_len.min(track_len)` and `top` is clamped so
+/// `top + len` never exceeds `track_len`, the same way `scrollbar_thumb`
+/// clamps both its own `len` and `top`.
+///
+/// Returns no marks (rather than panicking or emitting an out-of-bounds
+/// rect) for: `total_lines == 0`, `track_len <= 0.0`, or any individual
+/// diagnostic whose line is `>= total_lines` (that diagnostic is simply
+/// dropped, not treated as fatal for the rest).
+fn scrollbar_diagnostic_marks<I>(
+    diagnostics: I,
+    total_lines: usize,
+    track_len: f32,
+    min_len: f32,
+) -> Vec<(f32, f32, u8)>
+where
+    I: IntoIterator<Item = (usize, u8)>,
+{
+    if total_lines == 0 || track_len <= 0.0 {
+        return Vec::new();
+    }
+    // Same clamp shape as `scrollbar_thumb`'s own `len`/`top`: the
+    // returned length can never exceed the track (`min_len.min(track_len)`,
+    // mirroring `raw_len.max(min_len).min(track_len)` there), and `top`
+    // is bounded so `top + len` never exceeds `track_len` either --
+    // review round 1 found the length itself wasn't clamped, so
+    // `track_len < min_len` could return a mark whose bottom edge sat
+    // below the track despite this doc's claim otherwise.
+    let len = min_len.min(track_len);
+    let max_top = (track_len - len).max(0.0);
+    // Takes an `IntoIterator` rather than a slice (review round 1, item
+    // 5) so the caller can feed the `Vec<(usize, u8, String)>` already
+    // sitting in `Editor::diagnostics` straight through a `.map()`
+    // without collecting an intermediate `Vec<(usize, u8)>` first --
+    // the realistic diagnostic count is small, but the intermediate
+    // Vec bought nothing.
+    let mut buckets: std::collections::BTreeMap<i64, u8> = std::collections::BTreeMap::new();
+    for (line, sev) in diagnostics {
+        if line >= total_lines {
+            continue;
+        }
+        let raw_top = track_len * (line as f32 / total_lines as f32);
+        let top = raw_top.clamp(0.0, max_top);
+        let row = top.round() as i64;
+        buckets
+            .entry(row)
+            .and_modify(|e| *e = (*e).min(sev))
+            .or_insert(sev);
+    }
+    buckets
+        .into_iter()
+        .map(|(row, sev)| (row as f32, len, sev))
+        .collect()
+}
+
 // --- Row geometry (M87 stage 3) --------------------------------------
 //
 // `grid.row_scale` (a percentage of the base row height, `100` for an
@@ -735,6 +1203,31 @@ fn row_top(grid: &core::redisplay::Grid, row_h: f32, row: usize) -> f32 {
         y += row_height(grid, row_h, r);
     }
     y
+}
+
+/// Whether the fill-column ruler (M116) is inside this window's text
+/// area at all -- extracted so this guard (review fix: named as an
+/// otherwise-uncovered mutation) is testable on its own, since the
+/// drawing loop it lives in needs a live `egui::Painter`. `fill_column
+/// == text_cols` counts as NOT visible (the ruler would land exactly on
+/// the boundary column, one past the last real text column), matching
+/// the `>=` the call site already used before this was extracted.
+fn fill_column_visible(fill_column: usize, text_cols: usize) -> bool {
+    fill_column < text_cols
+}
+
+/// The pixel `x` the fill-column ruler (M116) lands at: `text_col0` is
+/// the window's own text origin column (already past its gutter, same
+/// value the indent-guide block above it uses), `fill_column` is the
+/// buffer-local column to draw at. Extracted from the drawing block so
+/// this arithmetic is testable without a live `egui::Painter` -- the
+/// indent-guide block does the identical `origin.x + (text_col0 + col)
+/// as f32 * char_w` inline since its column set varies per row and is
+/// already covered by `indent_guide_columns`'s own tests; this one is a
+/// single fixed column per window, so factoring it out is the whole
+/// test.
+fn fill_column_x(origin_x: f32, text_col0: usize, fill_column: usize, char_w: f32) -> f32 {
+    origin_x + (text_col0 + fill_column) as f32 * char_w
 }
 
 /// Inverse of `row_top`: which row a grid-relative pixel offset `rel_y`
@@ -966,9 +1459,119 @@ fn arm_mouse_selection(
     }
 }
 
+/// Whether `active`'s font pair needs to be replaced by `wanted` --
+/// the "should we switch" half of M105's runtime font-switching check,
+/// pulled out as a pure function so it (and the caching/bookkeeping half,
+/// `apply_font_switch` below) can be tested without a live `eframe::App`
+/// -- `App` has no public constructor and nothing in this crate can drive
+/// `eframe::App::update` outside a real window, so the check that used to
+/// live inline in `update` had no test at all (cold review, M105 fix
+/// round): flipping `!=` to `==` (switch never fires), or deleting the
+/// cache-reset calls (stale glyph ids replayed against a new atlas), or
+/// deleting the `active_font` update (`install_fonts` reruns every single
+/// frame, rebuilding egui's font atlas needlessly) would all have passed
+/// every existing test.
+pub fn font_switch_needed(
+    active: &(String, Option<String>),
+    wanted: &(String, Option<String>),
+) -> bool {
+    active.0 != wanted.0 || active.1 != wanted.1
+}
+
+/// The "what to do when we switch" half: resets `shape_cache`/
+/// `glyph_cache` and records `wanted` as the new `active_font`. Callers
+/// must have already installed the new fonts (`install_fonts`, which
+/// needs a live `egui::Context` and so is not folded into this function)
+/// before calling this -- this only updates the bookkeeping/cache state
+/// that goes with that, which is why it takes no `Context` and is
+/// trivially testable on its own.
+///
+/// Both resets are directly observable and covered by `font_tests.rs`.
+/// `shape_cache`'s entries are keyed on `(FaceRole, text, enable_calt)`,
+/// which does not encode which font produced them (shaping the same text through
+/// the same cache under two different fonts must not replay the first
+/// font's glyph ids for the second). `glyph_cache`'s entries are keyed on
+/// `(FaceRole, glyph_id, scale)`, which likewise does not encode which
+/// font rasterized them -- rasterizing the same numeric glyph id under
+/// two different embedded fonts through the same cache with no reset
+/// replays the first font's atlas UV rectangle for the second (confirmed
+/// UV collision, not just a theoretical key clash).
+///
+/// M105 third fix round, corrected: an earlier version of this comment
+/// claimed `glyph_cache`'s reset was "not independently observable
+/// without a live egui texture atlas" and left it untested. That claim
+/// was wrong -- `shaping` is `pub mod shaping` (this milestone made it
+/// so), `build_shaped_mesh`/`finish_shaped_mesh`/`GlyphAtlasCache` are
+/// all `pub`, and `egui::epaint::TextureAtlas::new` needs no live GUI at
+/// all (`shaping.rs`'s own unit tests already construct one this way).
+/// The gap was in what got tried, not in what is testable.
+pub fn apply_font_switch(
+    shape_cache: &mut ShapeCache,
+    glyph_cache: &mut GlyphAtlasCache,
+    active_font: &mut (String, Option<String>),
+    wanted: (String, Option<String>),
+) {
+    *shape_cache = ShapeCache::default();
+    *glyph_cache = GlyphAtlasCache::default();
+    *active_font = wanted;
+}
+
 impl eframe::App for App {
+    // M111: the trait default is `Color32::from_rgba_unmultiplied(12, 12,
+    // 12, 180)` -- a fixed, non-configurable near-black wash eframe paints
+    // behind the whole window before `update` draws anything, which would
+    // show through at the window's edges (anywhere the `CentralPanel`'s
+    // own fill doesn't reach, e.g. under macOS's rounded corners) and
+    // fight with `gui-opacity`. Fully transparent here defers all of the
+    // actual background painting to `CentralPanel`'s fill and the
+    // per-cell backgrounds, which are the two places `gui-opacity` is
+    // actually applied.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = std::time::Instant::now();
+
+        // M105: runtime font switching. `gui-font`/`gui-font-family` are
+        // read every frame (cheap: two symbol-table lookups), but
+        // `install_fonts` -- which calls `ctx.set_fonts` and rebuilds
+        // egui's font atlas -- only reruns when `font_switch_needed` says
+        // the pair actually changed, since that rebuild is expensive.
+        // See `font_switch_needed`/`apply_font_switch` for why this is
+        // split into two pure-ish pieces rather than inlined here.
+        let live_named_font = sym_var(&self.interp, "gui-font")
+            .unwrap_or("jetbrains-mono")
+            .to_string();
+        let live_font_family = str_var(&self.interp, "gui-font-family");
+        let wanted = (live_named_font, live_font_family);
+        if font_switch_needed(&self.active_font, &wanted) {
+            // Known gap (M105 fix round, not fixed -- see below):
+            // `install_fonts`'s `ctx.set_fonts` only STORES the new
+            // `FontDefinitions`; egui actually rebuilds the atlas and its
+            // glyph metrics later, in its own `begin_pass` on the NEXT
+            // frame. `char_w`/`row_h` are measured further down in this
+            // same frame, via `ctx.fonts(|f| ...)`, so on the exact frame
+            // a switch fires, that measurement can still reflect the OLD
+            // font's metrics while glyphs are drawn from the NEW one --
+            // a one-frame mismatch between grid geometry and glyph shape,
+            // self-correcting on the very next frame once egui catches
+            // up. Fixing this would mean reordering this call relative
+            // to egui's own pass boundaries, which is not worth doing
+            // for a single, self-correcting, sub-16ms frame.
+            let (have_bold, have_italic, fonts) =
+                install_fonts(ctx, wanted.1.as_deref(), &wanted.0);
+            self.have_bold = have_bold;
+            self.have_italic = have_italic;
+            self.fonts = fonts;
+            apply_font_switch(
+                &mut self.shape_cache,
+                &mut self.glyph_cache,
+                &mut self.active_font,
+                wanted,
+            );
+        }
+
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
         for event in events {
             match event {
@@ -1048,7 +1651,11 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(wake));
 
         let base = frame_base_style(&self.interp, &self.ed.borrow());
-        let bg = base.bg.map(to_color).unwrap_or(FALLBACK_BG);
+        // M111: read once per frame, same timing as every other `gui-*`
+        // variable in this function -- `clamp_opacity`'s floor keeps the
+        // window always findable, see its doc comment.
+        let opacity_frac = frame_opacity_frac(&self.interp);
+        let bg = frame_bg(base.bg, opacity_frac);
         let fg = base.fg.map(to_color).unwrap_or(FALLBACK_FG);
         let font_size = clamp_font_size(int_var(&self.interp, "gui-font-size", 16)) as f32;
         let cursor_type = sym_var(&self.interp, "cursor-type")
@@ -1075,6 +1682,14 @@ impl eframe::App for App {
             .or_else(|| int_var_opt(&self.interp, "tab-width"))
             .unwrap_or(4)
             .max(0) as usize;
+        // M116: read every frame, like every other `gui-*` variable.
+        // Threaded straight into `ShapeCache::get_or_shape` below rather
+        // than compared against a stored "last frame's value" to decide
+        // whether to clear the cache -- see `shaping.rs`'s `ShapeCache`
+        // doc for why baking it into the cache key makes a stale-cache
+        // toggle impossible by construction instead of by remembering to
+        // reset it.
+        let gui_ligatures = ligatures_enabled(&self.interp);
         let ppp = ctx.pixels_per_point();
 
         let panel_frame = egui::Frame::none().fill(bg);
@@ -1303,11 +1918,41 @@ impl eframe::App for App {
                         let eff = cell.style.or_default(&base);
                         let (mut cfg, mut cbg) = (
                             eff.fg.map(to_color).unwrap_or(fg),
-                            eff.bg.map(to_color).unwrap_or(bg),
+                            eff.bg.map(|c| to_bg_color(c, opacity_frac)).unwrap_or(bg),
                         );
                         if eff.reverse {
                             std::mem::swap(&mut cfg, &mut cbg);
+                            // M111 fix (measured: effective alpha 163
+                            // instead of the requested 102 at gui-opacity
+                            // 40 -- two 40% layers compositing): reassert
+                            // role-correct alpha ONLY inside this branch,
+                            // not unconditionally. Outside `eff.reverse`,
+                            // `cbg` already carries `opacity_frac` from
+                            // `to_bg_color` above; `with_alpha` reads
+                            // `cbg`'s raw bytes and treats them as
+                            // unmultiplied, but `Color32` stores gamma-
+                            // premultiplied bytes -- re-applying `with_alpha`
+                            // to an already-`with_alpha`'d color darkens the
+                            // RGB a second time while leaving the alpha byte
+                            // unchanged, which also makes `cbg` no longer
+                            // bitwise-equal to the unmodified `bg` for a
+                            // cell with no override, defeating the
+                            // "skip painting a cell whose background
+                            // matches the frame default" optimization below
+                            // and causing a second, redundant `rect_filled`
+                            // over the `CentralPanel` fill -- exactly the
+                            // measured double-paint. Only the swap branch
+                            // needs a fix-up: it can put an opaque
+                            // `to_color` value (alpha 255, safe to
+                            // `with_alpha` exactly once) into `cbg`.
+                            cbg = with_alpha(cbg, opacity_frac);
                         }
+                        // `to_opaque` un-premultiplies by the color's OWN
+                        // current alpha rather than assuming unmultiplied
+                        // input, so unlike `with_alpha` this is safe to
+                        // call unconditionally -- a no-op on an
+                        // already-opaque `cfg` (the non-reverse case).
+                        cfg = cfg.to_opaque();
                         let mut cursor_rounding = 0.0_f32;
                         if is_cursor && cursor_type == "box" {
                             // Task 6 / fix 3: continuous fade for the
@@ -1317,17 +1962,32 @@ impl eframe::App for App {
                             // is a zero-contrast bug, not just a style
                             // choice) -- and a `cursor` face overrides the
                             // swap target when the theme defines one.
+                            //
+                            // M111: `target_fg' is forced opaque in both
+                            // branches -- it becomes the glyph color once
+                            // the cursor is solid, and the glyph must never
+                            // go translucent, even when it's sourced from
+                            // `cbg' (a background-role color). `target_bg'
+                            // is always already opaque (`to_color', or
+                            // `cfg'/`fg' which are opaque too), so the box
+                            // cursor itself fades toward a fully opaque
+                            // highlight rather than blending with whatever
+                            // is behind the window -- a translucent focus
+                            // indicator would be exactly the "looks broken"
+                            // failure mode this milestone's recon measured
+                            // for other chrome, just relocated to the
+                            // cursor.
                             let (target_fg, target_bg) = if let Some(cf) = &cursor_face {
                                 (
-                                    cf.fg.map(to_color).unwrap_or(cbg),
+                                    cf.fg.map(to_color).unwrap_or(cbg).to_opaque(),
                                     cf.bg.map(to_color).unwrap_or(cfg),
                                 )
                             } else {
                                 let mut swapped_bg = cfg;
-                                if swapped_bg == bg {
+                                if swapped_bg == bg.to_opaque() {
                                     swapped_bg = fg;
                                 }
-                                (cbg, swapped_bg)
+                                (cbg.to_opaque(), swapped_bg)
                             };
                             cfg = cursor_glyph_color(cfg, target_fg, cursor_alpha);
                             cbg = cursor_bg_color(cbg, target_bg, cursor_alpha);
@@ -1342,6 +2002,17 @@ impl eframe::App for App {
                         // cell. Only paint when the color actually
                         // differs from the frame background, or the box
                         // cursor really did recolor this cell.
+                        // M111: when `cbg != bg` (a cell with its own
+                        // `:background', e.g. the mode line, `hl-line', a
+                        // selection), this paints ON TOP OF the
+                        // `CentralPanel' fill already sitting under it --
+                        // two `gui-opacity'-alpha layers, compositing to
+                        // `1 - (1 - p)^2', not `p'. That is intentional
+                        // (see `gui-opacity''s docstring in `gui.el'), not
+                        // a reappearance of the double-paint bug fixed
+                        // earlier in M111 -- that bug hit cells with NO
+                        // override, where this branch must NOT fire
+                        // because `cbg == bg` exactly.
                         if cbg != bg || (is_cursor && cursor_type == "box") {
                             painter.rect_filled(snap_rect(rect, ppp), cursor_rounding, cbg);
                         }
@@ -1398,29 +2069,51 @@ impl eframe::App for App {
                             let eff = cell.style.or_default(&base);
                             let (mut cfg, mut cbg) = (
                                 eff.fg.map(to_color).unwrap_or(fg),
-                                eff.bg.map(to_color).unwrap_or(bg),
+                                eff.bg.map(|c| to_bg_color(c, opacity_frac)).unwrap_or(bg),
                             );
                             if eff.reverse {
                                 std::mem::swap(&mut cfg, &mut cbg);
+                                // M111 fix: see pass 1's identical comment
+                                // -- only fix up `cbg` when the swap
+                                // actually happened (it then holds an
+                                // opaque `to_color` value, safe to
+                                // `with_alpha` exactly once). Applying
+                                // `with_alpha` unconditionally here double-
+                                // darkens `cbg` when it already carries
+                                // `opacity_frac` from `to_bg_color` above,
+                                // same bug as pass 1's, even though this
+                                // closure never paints `cbg` directly (it
+                                // only paints glyph ink with `cfg`) -- `cbg`
+                                // still feeds the cursor-swap target colors
+                                // below, and a double-darkened value there
+                                // would leave `cfg` duller than intended
+                                // after `.to_opaque()` un-premultiplies it.
+                                cbg = with_alpha(cbg, opacity_frac);
                             }
+                            // `to_opaque` un-premultiplies by the color's
+                            // OWN current alpha, so unlike `with_alpha`
+                            // this is safe unconditionally -- a no-op on
+                            // an already-opaque `cfg`.
+                            cfg = cfg.to_opaque();
                             if cursor_boxed {
                                 // Same hard-switch glyph color + `cursor`-
                                 // face override as pass 1's cell
                                 // background (fix 3), applied here to the
                                 // character's own color (this is "the
                                 // character drawn under a box cursor" from
-                                // task 6).
+                                // task 6). See pass 1's identical block for
+                                // why `target_fg' is forced opaque (M111).
                                 let (target_fg, target_bg) = if let Some(cf) = &cursor_face {
                                     (
-                                        cf.fg.map(to_color).unwrap_or(cbg),
+                                        cf.fg.map(to_color).unwrap_or(cbg).to_opaque(),
                                         cf.bg.map(to_color).unwrap_or(cfg),
                                     )
                                 } else {
                                     let mut swapped_bg = cfg;
-                                    if swapped_bg == bg {
+                                    if swapped_bg == bg.to_opaque() {
                                         swapped_bg = fg;
                                     }
-                                    (cbg, swapped_bg)
+                                    (cbg.to_opaque(), swapped_bg)
                                 };
                                 let _ = target_bg; // only cfg (the glyph color) is drawn here
                                 cfg = cursor_glyph_color(cfg, target_fg, cursor_alpha);
@@ -1513,10 +2206,14 @@ impl eframe::App for App {
 
                         let (mut cfg, cbg) = (
                             eff.fg.map(to_color).unwrap_or(fg),
-                            eff.bg.map(to_color).unwrap_or(bg),
+                            eff.bg.map(|c| to_bg_color(c, opacity_frac)).unwrap_or(bg),
                         );
                         if eff.reverse {
-                            cfg = cbg;
+                            // M111: `cbg` is background-role (translucent
+                            // under `gui-opacity`); forced opaque here
+                            // since this becomes glyph ink, and glyph ink
+                            // must never go translucent.
+                            cfg = cbg.to_opaque();
                         }
 
                         // Marks, relative to `r.col`, which columns of
@@ -1532,9 +2229,12 @@ impl eframe::App for App {
                             let ascent = shaping::ascent_in_points(&face.ab, scale, ppp);
                             let baseline_y = y + ascent;
                             for (seg_start, seg_end, seg_text) in &segments {
-                                let Some(glyphs) =
-                                    self.shape_cache.get_or_shape(role, &face.loaded, seg_text)
-                                else {
+                                let Some(glyphs) = self.shape_cache.get_or_shape(
+                                    role,
+                                    &face.loaded,
+                                    seg_text,
+                                    gui_ligatures,
+                                ) else {
                                     continue;
                                 };
                                 let row_x = origin.x + *seg_start as f32 * char_w;
@@ -1643,6 +2343,81 @@ impl eframe::App for App {
                     }
                 }
 
+                // Fill-column indicator (M116): a 1-device-px vertical
+                // rule at `fill-column`, drawn per published window
+                // (`grid.windows`), same shape as the indent guides just
+                // above -- both are "a vertical rule at a column", and
+                // this follows that code rather than inventing a second
+                // way to turn a column into a pixel `x`. Two differences
+                // from indent guides: (1) `fill-column` and
+                // `display-fill-column-indicator-mode` are buffer-local
+                // (GNU's own names), so each window's buffer is looked up
+                // individually via `buffer_int_var`/`buffer_var_on`
+                // rather than reading one global variable once for the
+                // whole frame; (2) the rule spans the window's full
+                // height unconditionally (it marks a column, not
+                // indentation actually present on each row), so this
+                // loops rows only to get each row's own `row_top`/
+                // `row_height` (block/diagnostic rows scale differently,
+                // same as indent guides do NOT need to -- but this does,
+                // since it must still line up when a diagnostic row
+                // changes `row_h` for one row in the middle of the
+                // window).
+                //
+                // Collision with indent guides: at typical settings
+                // (`fill-column' 100, indentation rarely past column 20)
+                // the two essentially never land on the same column, but
+                // nothing stops it if they do -- this block runs AFTER
+                // the indent-guide block above, so `painter.rect_filled`
+                // draws its shapes on top, meaning the fill-column-
+                // indicator face wins the pixels on any column both would
+                // otherwise draw.
+                {
+                    let fill_col_color =
+                        face_style(&self.interp, &self.ed.borrow(), "fill-column-indicator")
+                            .and_then(|f| f.fg)
+                            .map(to_color)
+                            .unwrap_or_else(|| with_alpha(fg, 0.2));
+                    for win in &grid.windows {
+                        let text_rows = win.rows.saturating_sub(1); // exclude mode line row
+                        let text_col0 = win.col + win.gutter_cols;
+                        let text_cols = win.cols.saturating_sub(win.gutter_cols);
+                        if text_rows == 0 || text_cols == 0 {
+                            continue;
+                        }
+                        let buf = self
+                            .ed
+                            .borrow()
+                            .windows
+                            .get(&win.win_id)
+                            .map(|w| w.buffer.clone());
+                        let Some(buf) = buf else { continue };
+                        let ed = self.ed.borrow();
+                        if !buffer_var_on(
+                            &self.interp,
+                            &ed,
+                            &buf,
+                            "display-fill-column-indicator-mode",
+                        ) {
+                            continue;
+                        }
+                        let fill_column =
+                            buffer_int_var(&self.interp, &ed, &buf, "fill-column", 100).max(0)
+                                as usize;
+                        drop(ed);
+                        if !fill_column_visible(fill_column, text_cols) {
+                            continue;
+                        }
+                        for r in 0..text_rows {
+                            let y = origin.y + row_top(&grid, row_h, win.row + r);
+                            let rh = row_height(&grid, row_h, win.row + r);
+                            let x = fill_column_x(origin.x, text_col0, fill_column, char_w);
+                            let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, rh));
+                            painter.rect_filled(snap_rect(rect, ppp), 0.0, fill_col_color);
+                        }
+                    }
+                }
+
                 // Hairline separators (task 4 / GUI fix 2b): immediately
                 // above the echo row (always the frame's last row,
                 // regardless of window layout) and above EACH window's own
@@ -1702,15 +2477,61 @@ impl eframe::App for App {
                         // would overstate the track's pixel height.
                         let track_len = row_top(&grid, row_h, layout.mode_line_row)
                             - row_top(&grid, row_h, layout.row);
+                        let text_right = origin.x + (layout.col + layout.cols) as f32 * char_w;
+                        let bar_x = text_right - 2.0 - 6.0;
                         if let Some((thumb_top, thumb_len)) =
                             scrollbar_thumb(total_lines, visible_lines, top_line0, track_len, 24.0)
                         {
+                            // Overview-ruler diagnostic marks (M115):
+                            // follows the scrollbar's own visibility
+                            // rule (this whole block is inside
+                            // `scrollbar_thumb`'s `Some` arm) -- if the
+                            // buffer fits and no scrollbar is shown,
+                            // there's nothing off-screen to point at, so
+                            // no marks either. Drawn BEFORE the thumb,
+                            // so the thumb paints over whatever a mark
+                            // occupies underneath it -- a mark that
+                            // coincides with the thumb describes a
+                            // diagnostic that's already in the visible
+                            // window (the thumb *is* the visible range),
+                            // so nothing is lost by letting the thumb
+                            // win there; the marks that matter
+                            // (off-screen ones) are, by construction,
+                            // outside the thumb and stay fully visible.
+                            // Inset a px on each side of the 6px track
+                            // so a mark reads as a tick, not a second
+                            // thumb, matching VS Code's overview ruler.
+                            // Deliberately diagnostics-only: search hits
+                            // aren't marked here because
+                            // `Editor::isearch` only stores the current
+                            // match, not every match in the buffer, so a
+                            // full-buffer scan would be new plumbing --
+                            // that belongs with search work, not this
+                            // one.
+                            let diag_lines = window_diagnostic_lines(&ed_ref, &win.buffer);
+                            let marks = scrollbar_diagnostic_marks(
+                                diag_lines.iter().copied(),
+                                total_lines,
+                                track_len,
+                                3.0,
+                            );
+                            for (mark_top, mark_len, sev) in marks {
+                                let color = to_color(core::redisplay::severity_color(
+                                    &self.interp,
+                                    &ed_ref,
+                                    sev,
+                                ));
+                                let rect = Rect::from_min_size(
+                                    Pos2::new(bar_x + 1.0, track_top + mark_top),
+                                    Vec2::new(4.0, mark_len),
+                                );
+                                painter.rect_filled(snap_rect(rect, ppp), 1.0, color);
+                            }
+
                             let sb_color = face_style(&self.interp, &ed_ref, "scroll-bar")
                                 .and_then(|f| f.fg.or(f.bg))
                                 .map(to_color)
                                 .unwrap_or_else(|| with_alpha(fg, 0.20));
-                            let text_right = origin.x + (layout.col + layout.cols) as f32 * char_w;
-                            let bar_x = text_right - 2.0 - 6.0;
                             let rect = Rect::from_min_size(
                                 Pos2::new(bar_x, track_top + thumb_top),
                                 Vec2::new(6.0, thumb_len),
@@ -1786,6 +2607,29 @@ impl eframe::App for App {
                         .fixed_pos(Pos2::new(px, py))
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
+                            // M111: `.to_opaque()` here is deliberate, not
+                            // a leftover to "fix" once `gui-opacity` makes
+                            // `bg` translucent -- VS Code and JetBrains
+                            // both keep hover popups opaque even with a
+                            // translucent editor background, because a
+                            // translucent popup over translucent text
+                            // underneath it is unreadable.
+                            //
+                            // Known cosmetic erosion (M111 cold review,
+                            // round 2, not fixed -- the opacity/legibility
+                            // guarantee above still holds): `gamma_multiply`
+                            // scales the stored gamma-premultiplied bytes
+                            // INCLUDING alpha, while `to_opaque`
+                            // un-premultiplies in linear space -- the two
+                            // do not commute once `bg` already carries an
+                            // alpha < 255. Measured: the intended "popup is
+                            // 10% darker than the background" effect is
+                            // correct at `gui-opacity` 100, nearly
+                            // cancelled at 40, and gone entirely at the
+                            // floor of 20. The popup itself stays fully
+                            // opaque at every setting either way -- only
+                            // the cosmetic darkening relative to the
+                            // background erodes as opacity drops.
                             egui::Frame::popup(ui.style())
                                 .fill(bg.gamma_multiply(0.9).to_opaque())
                                 .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.4)))
@@ -1909,6 +2753,18 @@ fn key_base_char(key: egui::Key, shift: bool) -> Option<char> {
         K::Num8 => '8', K::Num9 => '9',
         K::Space => ' ',
         K::Minus => if shift { '_' } else { '-' },
+        // M101: `Ctrl' held with `=' was dropped by `convert_key'
+        // before ever reaching the keymap, because this whitelist had no
+        // arm for `Key::Equals' (nor for `Key::Plus', the numpad one);
+        // both exist in egui 0.29, confirmed against its own
+        // `data/key.rs'. `K::Minus' above is NOT part of that gap -- it
+        // has been here since M5, so `C--' always decoded fine and was
+        // merely unbound until `expand-region.el'. `C-=' and `C--' are
+        // the two that file binds (to `expand-region' and
+        // `contract-region' respectively); `Ctrl+Shift+=' now decodes to
+        // `C-+' as well, but nothing binds that combination yet.
+        K::Equals => if shift { '+' } else { '=' },
+        K::Plus => '+',
         K::Slash => if shift { '?' } else { '/' },
         K::Period => if shift { '>' } else { '.' },
         K::Comma => if shift { '<' } else { ',' },
@@ -1956,6 +2812,110 @@ mod tests {
             "cell 3's right edge must equal cell 4's left edge"
         );
         assert_eq!(a.max.y, b.max.y);
+    }
+
+    // --- M116: fill-column paint-block guards (review fix: named as
+    // otherwise-uncovered mutations -- `fill_column_visible` and the
+    // buffer-local reads the mode gate depends on) ---------------------
+
+    #[test]
+    fn fill_column_visible_true_when_strictly_inside_the_text_area() {
+        assert!(fill_column_visible(100, 120));
+    }
+
+    #[test]
+    fn fill_column_visible_false_at_the_boundary_column() {
+        // `fill_column == text_cols` is one past the last real column,
+        // not on it -- must not draw there.
+        assert!(!fill_column_visible(100, 100));
+    }
+
+    #[test]
+    fn fill_column_visible_false_past_the_text_area() {
+        assert!(!fill_column_visible(150, 100));
+    }
+
+    #[test]
+    fn buffer_int_var_reads_the_global_default() {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        let buf = ed.borrow().current.clone();
+        // `fill-column` is already `defvar`'d to 100 in `simple.el`,
+        // loaded by `init_editor` -- this reads that live global value,
+        // not the fallback argument (a separate assertion below pins
+        // the fallback itself, for a variable that isn't defined at all).
+        assert_eq!(
+            buffer_int_var(&interp, &ed.borrow(), &buf, "fill-column", 999),
+            100
+        );
+    }
+
+    #[test]
+    fn buffer_int_var_falls_back_when_the_variable_does_not_exist() {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        let buf = ed.borrow().current.clone();
+        assert_eq!(
+            buffer_int_var(&interp, &ed.borrow(), &buf, "no-such-variable-m116", 42),
+            42
+        );
+    }
+
+    #[test]
+    fn buffer_int_var_honors_a_buffer_local_override() {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        if let Err(flow) = interp.eval_source("(setq-local fill-column 72)") {
+            panic!("eval failed: {}", interp.describe_flow(&flow));
+        }
+        let buf = ed.borrow().current.clone();
+        assert_eq!(
+            buffer_int_var(&interp, &ed.borrow(), &buf, "fill-column", 100),
+            72
+        );
+    }
+
+    #[test]
+    fn buffer_var_on_reflects_the_fill_column_indicator_mode_toggle() {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        let buf = ed.borrow().current.clone();
+        assert!(!buffer_var_on(
+            &interp,
+            &ed.borrow(),
+            &buf,
+            "display-fill-column-indicator-mode"
+        ));
+        if let Err(flow) = interp.eval_source("(setq-local display-fill-column-indicator-mode t)") {
+            panic!("eval failed: {}", interp.describe_flow(&flow));
+        }
+        assert!(buffer_var_on(
+            &interp,
+            &ed.borrow(),
+            &buf,
+            "display-fill-column-indicator-mode"
+        ));
+    }
+
+    // --- M116: fill-column ruler column-to-x mapping ------------------
+
+    #[test]
+    fn fill_column_x_no_gutter_no_padding() {
+        assert_eq!(fill_column_x(0.0, 0, 100, 8.0), 800.0);
+    }
+
+    #[test]
+    fn fill_column_x_accounts_for_gutter_and_window_origin() {
+        // A window whose text starts at column 5 (gutter width 5) inside
+        // a split layout whose own pixel origin is 120.0 (a second
+        // window to the right of a vertical split, say).
+        let x = fill_column_x(120.0, 5, 100, 8.43);
+        assert_eq!(x, 120.0 + (5 + 100) as f32 * 8.43);
+    }
+
+    #[test]
+    fn fill_column_x_zero_column_lands_at_the_text_origin() {
+        assert_eq!(fill_column_x(10.0, 3, 0, 8.0), 10.0 + 3.0 * 8.0);
     }
 
     // --- Fix 7: variant_file_name last-occurrence replacement --------
@@ -2115,6 +3075,199 @@ mod tests {
             "thumb bottom ({}) should coincide with the track bottom ({track_len})",
             top + len
         );
+    }
+
+    // --- Task M115: overview-ruler diagnostic marks ------------------
+
+    #[test]
+    fn diagnostic_marks_empty_list_is_no_marks() {
+        assert_eq!(
+            scrollbar_diagnostic_marks(Vec::<(usize, u8)>::new(), 1000, 1000.0, 3.0),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn diagnostic_marks_placement_is_proportional_to_the_whole_buffer() {
+        // 1000-line buffer, a diagnostic at line 250: the mark should
+        // land at 25% of the track, regardless of what's currently
+        // scrolled into view -- that's the whole point of an overview
+        // ruler (showing what's off-screen), so this function doesn't
+        // even take a visible-window parameter the way `scrollbar_thumb`
+        // does. Asserts the whole tuple (top, len, severity) -- review
+        // round 1 found this test only checked top and len, so a
+        // corrupted severity would have passed unnoticed.
+        let marks = scrollbar_diagnostic_marks([(250, 1)], 1000, 1000.0, 3.0);
+        assert_eq!(marks.len(), 1);
+        assert!((marks[0].0 - 250.0).abs() < 1e-3, "top={}", marks[0].0);
+        assert_eq!(marks[0].1, 3.0);
+        assert_eq!(marks[0].2, 1);
+    }
+
+    #[test]
+    fn diagnostic_marks_merge_same_pixel_row_and_most_severe_wins() {
+        // Two diagnostics on the SAME source line whose proportional
+        // position lands on the same pixel row: an info (3) landing on
+        // the same row as an error (1) must not hide the error -- the
+        // merged mark keeps severity 1. Feeding them in arrival order
+        // info-then-error is deliberate: drawing in arrival order would
+        // let the later info paint over the earlier error, which is
+        // exactly the defect this rule guards against.
+        let marks = scrollbar_diagnostic_marks([(500, 3), (500, 1)], 100_000, 500.0, 3.0);
+        assert_eq!(marks.len(), 1, "same line must merge into one mark");
+        assert_eq!(marks[0].2, 1, "the more severe (lower byte) must win");
+    }
+
+    #[test]
+    fn diagnostic_marks_merge_different_lines_that_round_onto_the_same_pixel_row() {
+        // Review round 1, item 3: the merge test above uses the same
+        // source line for both diagnostics, which is worth pinning but
+        // doesn't cover "a long file where many DIFFERENT lines map to
+        // one row" -- the actual overview-ruler scenario. It also can't
+        // distinguish `top.round()` from truncation, since both
+        // diagnostics land on an identical raw top either way.
+        //
+        // Here line 4996 of 10,000 has a raw top of
+        // 1000.0 * 4996/10000 = 499.6 (rounds to 500, truncates to 499),
+        // and line 5000 has a raw top of exactly 500.0 (rounds and
+        // truncates to 500). Under rounding both land in bucket 500 and
+        // merge into one mark keeping the more severe error (1). Under
+        // truncation they'd land in DIFFERENT buckets (499 and 500) and
+        // stay as two marks -- so this fails if `round()` regresses to
+        // truncation.
+        let marks = scrollbar_diagnostic_marks([(4996, 3), (5000, 1)], 10_000, 1000.0, 3.0);
+        assert_eq!(
+            marks.len(),
+            1,
+            "different lines rounding onto the same pixel row must merge: {marks:?}"
+        );
+        assert_eq!(marks[0].2, 1, "the more severe (lower byte) must win");
+    }
+
+    #[test]
+    fn diagnostic_marks_have_a_minimum_height() {
+        // A single diagnostic in a 10,000-line file: its raw
+        // proportional slice of the track is far under a pixel, so the
+        // mark must be clamped up to `min_len`. Also pins `top` (line
+        // 5000 of 10,000 on a 100px track: raw top 50.0, well clear of
+        // the top/bottom clamps) and `severity`, since a bug that only
+        // corrupted one of the other two fields would be invisible to a
+        // test that checks length alone.
+        let marks = scrollbar_diagnostic_marks([(5000, 2)], 10_000, 100.0, 3.0);
+        assert_eq!(marks.len(), 1);
+        assert!((marks[0].0 - 50.0).abs() < 1e-3, "top={}", marks[0].0);
+        assert_eq!(marks[0].1, 3.0);
+        assert_eq!(marks[0].2, 2);
+    }
+
+    #[test]
+    fn diagnostic_marks_length_never_exceeds_a_track_shorter_than_min_len() {
+        // Review round 1, item 2: `max_top` used to floor at zero
+        // without also clamping the returned length, so a track shorter
+        // than `min_len` (unreachable from the real call site today,
+        // since row heights are far above 3px, but an unenforced
+        // invariant this function's own doc claims to enforce) could
+        // return a mark whose bottom edge sat below the track. 10 total
+        // lines, a 2px track, a 3px min_len: length must clamp down to
+        // the 2px track, and top must be 0 so top+len == track_len
+        // exactly, not below it.
+        let marks = scrollbar_diagnostic_marks([(5, 1)], 10, 2.0, 3.0);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].0, 0.0, "top={}", marks[0].0);
+        assert_eq!(
+            marks[0].1, 2.0,
+            "len must clamp to the track, not exceed it"
+        );
+    }
+
+    #[test]
+    fn diagnostic_marks_at_first_and_last_line() {
+        // Different severities on the two ends so this also verifies
+        // marks keep their own field, not just their position -- review
+        // round 1 found this test never asserted severity at all.
+        let marks = scrollbar_diagnostic_marks([(0, 2), (999, 1)], 1000, 1000.0, 3.0);
+        assert_eq!(marks.len(), 2);
+        let first = marks[0];
+        assert!((first.0 - 0.0).abs() < 1e-3, "first line top={}", first.0);
+        assert_eq!(first.2, 2);
+        // The last line's raw proportional top (999/1000 * 1000 = 999.0)
+        // plus the 3px min height would overflow the track (1000.0) by
+        // 2px without the same top-clamp `scrollbar_thumb` applies to
+        // its own thumb top.
+        let last = marks[1];
+        assert!(
+            last.0 + last.1 <= 1000.0 + 1e-3,
+            "last-line mark must stay within the track: top={} len={}",
+            last.0,
+            last.1
+        );
+        assert_eq!(last.2, 1);
+    }
+
+    #[test]
+    fn diagnostic_marks_line_out_of_range_is_dropped() {
+        // 100 lines, a diagnostic claiming line 500: nonsensical input,
+        // far past the valid range, must be dropped rather than
+        // producing an out-of-bounds rect.
+        let marks = scrollbar_diagnostic_marks([(500, 1)], 100, 500.0, 3.0);
+        assert_eq!(marks, vec![]);
+    }
+
+    #[test]
+    fn diagnostic_marks_line_exactly_at_total_lines_is_dropped() {
+        // Review round 1, item 3: the out-of-range test above uses 500
+        // against 100 lines, nowhere near the boundary -- changing the
+        // `>=` guard to `>` still passes it. Valid lines for a
+        // 100-line buffer are 0..=99, so line 100 (== total_lines) is
+        // the exact off-by-one this guards against.
+        let marks = scrollbar_diagnostic_marks([(100, 1)], 100, 500.0, 3.0);
+        assert_eq!(marks, vec![]);
+    }
+
+    #[test]
+    fn diagnostic_marks_zero_height_track_is_no_marks() {
+        assert_eq!(scrollbar_diagnostic_marks([(0, 1)], 1000, 0.0, 3.0), vec![]);
+    }
+
+    #[test]
+    fn diagnostic_marks_zero_total_lines_is_no_marks() {
+        assert_eq!(scrollbar_diagnostic_marks([(0, 1)], 0, 1000.0, 3.0), vec![]);
+    }
+
+    #[test]
+    fn diagnostic_marks_single_line_buffer() {
+        // A 1-line buffer: the only diagnostic possible is at line 0,
+        // and it must land at the very top of the track, not divide by
+        // zero or produce NaN.
+        let marks = scrollbar_diagnostic_marks([(0, 1)], 1, 200.0, 3.0);
+        assert_eq!(marks.len(), 1);
+        assert!((marks[0].0 - 0.0).abs() < 1e-3);
+        assert_eq!(marks[0].1, 3.0);
+        assert_eq!(marks[0].2, 1);
+    }
+
+    // --- M111 cold review round 2: cursor_bg_color and translucency ---
+
+    #[test]
+    fn cursor_bg_color_forces_a_translucent_normal_bg_opaque_before_lerping() {
+        // Reproduces the reviewer's numeric example: logical (58,60,80) at
+        // 40% opacity is a gamma-premultiplied translucent `Color32`
+        // (stored bytes ~(35,37,50,102), NOT (58,60,80,102)). At t=0 (an
+        // ordinary point in the blink cycle, not an edge case) the result
+        // must equal the un-premultiplied (58,60,80) fully opaque -- if
+        // `cursor_bg_color` fed those raw stored bytes straight into
+        // `lerp_color` (the bug this guards against), it would instead
+        // return a visibly darker opaque (35,37,50).
+        let translucent_bg = to_bg_color((58, 60, 80), 0.4);
+        let target_bg = Color32::from_rgb(200, 200, 200);
+        let result = cursor_bg_color(translucent_bg, target_bg, 0.0);
+        // `to_opaque`'s un-premultiply round-trips through gamma space, so
+        // allow the same sub-2-ULP drift as `to_bg_color`'s own test
+        // rather than asserting bit-exact equality.
+        assert!(result.r().abs_diff(58) <= 1, "r drifted: {}", result.r());
+        assert!(result.g().abs_diff(60) <= 1, "g drifted: {}", result.g());
+        assert!(result.b().abs_diff(80) <= 1, "b drifted: {}", result.b());
+        assert_eq!(result.a(), 255);
     }
 
     // --- Fix 3: cursor fade must never cross zero contrast ------------
@@ -2281,6 +3434,78 @@ mod tests {
     fn cursor_blinks_clamp_out_of_range_both_sides() {
         assert_eq!(clamp_cursor_blinks(-5), 0);
         assert_eq!(clamp_cursor_blinks(9999), 100);
+    }
+
+    // --- M111: gui-opacity clamp / background-role conversion --------
+
+    #[test]
+    fn opacity_clamp_in_range_passes_through() {
+        assert_eq!(clamp_opacity(70), 70);
+    }
+
+    #[test]
+    fn opacity_clamp_low_end_floors_at_20() {
+        assert_eq!(clamp_opacity(0), 20);
+        assert_eq!(clamp_opacity(-100), 20);
+        assert_eq!(clamp_opacity(19), 20);
+    }
+
+    #[test]
+    fn opacity_clamp_high_end_caps_at_100() {
+        assert_eq!(clamp_opacity(101), 100);
+        assert_eq!(clamp_opacity(9999), 100);
+    }
+
+    #[test]
+    fn opacity_clamp_exactly_at_bounds() {
+        assert_eq!(clamp_opacity(20), 20);
+        assert_eq!(clamp_opacity(100), 100);
+    }
+
+    #[test]
+    fn opacity_percent_to_frac_covers_the_divisor() {
+        // Catches a `/ 100.0` -> `/ 1000.0` mutation, which no other test
+        // in this file would have noticed (the divisor was previously
+        // inlined at the single call site and unreachable by any test).
+        assert_eq!(opacity_percent_to_frac(100), 1.0);
+        assert_eq!(opacity_percent_to_frac(40), 0.4);
+        // Below the floor: clamps to 20 first, THEN divides.
+        assert_eq!(opacity_percent_to_frac(0), 0.2);
+    }
+
+    #[test]
+    fn to_bg_color_full_opacity_gives_alpha_255() {
+        let c = to_bg_color((10, 20, 30), 1.0);
+        assert_eq!(c, Color32::from_rgba_unmultiplied(10, 20, 30, 255));
+    }
+
+    #[test]
+    fn to_bg_color_floor_opacity_gives_expected_alpha() {
+        // clamp_opacity's floor, 20%, as a fraction.
+        let c = to_bg_color((10, 20, 30), 0.20);
+        assert_eq!(c, Color32::from_rgba_unmultiplied(10, 20, 30, 51));
+    }
+
+    #[test]
+    fn to_bg_color_mid_value() {
+        let c = to_bg_color((10, 20, 30), 0.50);
+        assert_eq!(c, Color32::from_rgba_unmultiplied(10, 20, 30, 128));
+    }
+
+    #[test]
+    fn to_bg_color_leaves_rgb_channels_untouched() {
+        // `Color32` stores gamma-correct premultiplied bytes, so a
+        // straight `.r()`/`.g()`/`.b()` read after `from_rgba_unmultiplied`
+        // does NOT reproduce the input (that's egui's own representation,
+        // not a bug introduced here) -- `to_srgba_unmultiplied` undoes the
+        // premultiply and is the right decoder to check "did `to_bg_color`
+        // touch the RGB channels", modulo the sub-1-ULP rounding a
+        // gamma-space round trip through premultiplication introduces.
+        let [r, g, b, a] = to_bg_color((200, 100, 5), 0.5).to_srgba_unmultiplied();
+        assert!(r.abs_diff(200) <= 1, "r drifted: {r}");
+        assert!(g.abs_diff(100) <= 1, "g drifted: {g}");
+        assert!(b.abs_diff(5) <= 1, "b drifted: {b}");
+        assert_eq!(a, 128);
     }
 
     #[test]
@@ -2738,6 +3963,24 @@ mod tests {
         (interp, ed)
     }
 
+    /// A real `Interp` + `Editor` with the shipped lisp loaded: just
+    /// `new_interp` + `init_editor`, which is the first two lines of
+    /// `evil_test_editor` and nothing else. It deliberately skips that
+    /// helper's other three steps as well as `(evil-mode 1)` -- the
+    /// frame sizing, the `(insert ...)` and the `goto-char` -- because
+    /// the per-frame wire tests below (M117) read variables and never
+    /// look at buffer text or window geometry.
+    /// Using a real `Interp` here, rather than a hand-built stand-in, is
+    /// the point: it means these tests also pin the shipped `defvar`
+    /// defaults in `crates/core/lisp/gui.el` (e.g. `gui-opacity`'s 100,
+    /// `gui-ligatures`'s `t`), not just whatever fallback the Rust call
+    /// site happens to pass.
+    fn wired_test_editor() -> (Interp, Rc<RefCell<Editor>>) {
+        let mut interp = elisp::new_interp();
+        let ed = core::init_editor(&mut interp);
+        (interp, ed)
+    }
+
     // --- Fix 4: `drag_should_arm` -----------------------------------
 
     #[test]
@@ -2863,5 +4106,188 @@ mod tests {
         // still 'normal'; this pins that the fallback doesn't try to
         // force a state transition of its own.
         assert_eq!(sym_var(&interp, "evil--state"), Some("normal"));
+    }
+
+    // --- M101: convert_key / key_base_char for `=' and `-' -----------
+    //
+    // `convert_key' had no unit tests at all before this milestone.
+    // These pin the `K::Equals'/`K::Plus' whitelist entries added for
+    // expand-region's `C-=' binding against the SAME encoding
+    // `core::keymap::parse_kbd' produces for the textual key
+    // descriptions `expand-region.el' binds -- computing the expected
+    // value with `parse_kbd' rather than hand-deriving the control-bit
+    // arithmetic is what `ctrl_7_is_the_shared_undo_byte'
+    // (frontend-tui/src/lib.rs) does for the same reason: it's the
+    // encoding a real keymap lookup will actually be compared against.
+    fn expect_char_key(desc: &str) -> Key {
+        match core::keymap::parse_kbd(desc).unwrap().as_slice() {
+            [k] => k.clone(),
+            other => panic!("{desc:?} parsed to {other:?}, expected exactly one key"),
+        }
+    }
+
+    #[test]
+    fn ctrl_equals_matches_parse_kbd_c_dash_equals() {
+        let got = convert_key(egui::Key::Equals, egui::Modifiers::CTRL);
+        assert_eq!(got, Some(expect_char_key("C-=")));
+    }
+
+    #[test]
+    fn ctrl_minus_matches_parse_kbd_c_dash_dash() {
+        let got = convert_key(egui::Key::Minus, egui::Modifiers::CTRL);
+        assert_eq!(got, Some(expect_char_key("C--")));
+    }
+
+    #[test]
+    fn ctrl_shift_equals_matches_parse_kbd_c_dash_plus() {
+        let got = convert_key(
+            egui::Key::Equals,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        );
+        assert_eq!(got, Some(expect_char_key("C-+")));
+    }
+
+    #[test]
+    fn ctrl_numpad_plus_matches_parse_kbd_c_dash_plus() {
+        // `egui::Key::Plus' is the numpad `+' (`KeyCode::NumpadAdd'), a
+        // physically different key from `Key::Equals' (the top-row `='
+        // that needs Shift for `+') -- both map to the SAME `key_base_char'
+        // output `+' though, so `Ctrl' held with either must decode to
+        // the same `C-+' this file's own `K::Plus' arm was left
+        // completely unpinned by the three tests above it.
+        let got = convert_key(egui::Key::Plus, egui::Modifiers::CTRL);
+        assert_eq!(got, Some(expect_char_key("C-+")));
+    }
+
+    // --- M117: per-frame wires from elisp variables to the screen ---
+    // (see the module doc for why these were previously unreachable
+    // from `cargo test`).
+
+    #[test]
+    fn frame_opacity_frac_reads_the_gui_opacity_variable() {
+        let (mut interp, _ed) = wired_test_editor();
+        interp
+            .eval_source("(setq gui-opacity 40)")
+            .unwrap_or_else(|e| panic!("setq failed: {}", interp.describe_flow(&e)));
+        let frac = frame_opacity_frac(&interp);
+        assert!((frac - 0.40).abs() < 1e-6, "got {frac}");
+    }
+
+    #[test]
+    fn frame_opacity_frac_defaults_to_fully_opaque() {
+        // No `setq` at all -- this pins `gui.el`'s shipped default of
+        // 100, not just the Rust fallback baked into `int_var`'s third
+        // argument.
+        let (interp, _ed) = wired_test_editor();
+        let frac = frame_opacity_frac(&interp);
+        assert!((frac - 1.0).abs() < 1e-6, "got {frac}");
+    }
+
+    #[test]
+    fn frame_opacity_frac_applies_the_floor_through_the_variable() {
+        let (mut interp, _ed) = wired_test_editor();
+        interp
+            .eval_source("(setq gui-opacity 5)")
+            .unwrap_or_else(|e| panic!("setq failed: {}", interp.describe_flow(&e)));
+        let frac = frame_opacity_frac(&interp);
+        assert!((frac - 0.20).abs() < 1e-6, "got {frac}");
+    }
+
+    #[test]
+    fn frame_opacity_frac_applies_the_cap_through_the_variable() {
+        let (mut interp, _ed) = wired_test_editor();
+        interp
+            .eval_source("(setq gui-opacity 400)")
+            .unwrap_or_else(|e| panic!("setq failed: {}", interp.describe_flow(&e)));
+        let frac = frame_opacity_frac(&interp);
+        assert!((frac - 1.0).abs() < 1e-6, "got {frac}");
+    }
+
+    #[test]
+    fn frame_bg_carries_the_opacity_onto_the_theme_background() {
+        // `Color32` stores gamma-correct premultiplied bytes, so a
+        // straight `.r()`/`.g()`/`.b()` read does not reproduce the
+        // input -- `to_srgba_unmultiplied` undoes the premultiply, same
+        // decoder `to_bg_color_leaves_rgb_channels_untouched` uses.
+        let base_bg: core::redisplay::Color = (10, 20, 30);
+        let bg = frame_bg(Some(base_bg), 0.4);
+        let [r, g, b, a] = bg.to_srgba_unmultiplied();
+        assert_eq!(a, 102, "0.4 * 255 rounded is 102");
+        assert!(r.abs_diff(10) <= 1, "r drifted: {r}");
+        assert!(g.abs_diff(20) <= 1, "g drifted: {g}");
+        assert!(b.abs_diff(30) <= 1, "b drifted: {b}");
+    }
+
+    #[test]
+    fn frame_bg_fallback_also_carries_the_opacity() {
+        // This is the branch that would silently go opaque if the
+        // `unwrap_or_else` in `frame_bg` lost its fraction.
+        let bg = frame_bg(None, 0.4);
+        assert_eq!(bg.a(), 102, "0.4 * 255 rounded is 102");
+    }
+
+    #[test]
+    fn with_alpha_clamps_a_fraction_outside_the_unit_range() {
+        // Today every call site passes an already-clamped fraction, so
+        // nothing else exercises this clamp.
+        let c = Color32::from_rgb(1, 2, 3);
+        assert_eq!(with_alpha(c, 1.5).a(), 255);
+        assert_eq!(with_alpha(c, -1.0).a(), 0);
+    }
+
+    #[test]
+    fn ligatures_enabled_defaults_to_on_from_the_shipped_gui_el() {
+        // `var_truthy` returns `false` for an unbound symbol, so this
+        // test also fails if the `defvar` for `gui-ligatures` disappears
+        // from `gui.el` (not just if the default value changes).
+        let (interp, _ed) = wired_test_editor();
+        assert!(ligatures_enabled(&interp));
+    }
+
+    #[test]
+    fn ligatures_enabled_follows_the_variable_when_turned_off() {
+        let (mut interp, _ed) = wired_test_editor();
+        interp
+            .eval_source("(setq gui-ligatures nil)")
+            .unwrap_or_else(|e| panic!("setq failed: {}", interp.describe_flow(&e)));
+        assert!(!ligatures_enabled(&interp));
+    }
+
+    #[test]
+    fn window_diagnostic_lines_returns_the_buffers_own_diagnostics() {
+        let (_interp, ed) = wired_test_editor();
+        let buf = Rc::new(RefCell::new(Buffer::new("a", "")));
+        ed.borrow_mut().diagnostics.insert(
+            Rc::as_ptr(&buf) as usize,
+            vec![
+                (3, 1, "error on line 3".to_string()),
+                (7, 2, "warning on line 7".to_string()),
+            ],
+        );
+        let ed_ref = ed.borrow();
+        let got = window_diagnostic_lines(&ed_ref, &buf);
+        assert_eq!(got, vec![(3, 1), (7, 2)], "must preserve stored order");
+    }
+
+    #[test]
+    fn window_diagnostic_lines_does_not_return_another_buffers_diagnostics() {
+        // The one that would catch a wrong `Rc::as_ptr` key -- e.g.
+        // looking up the other window's buffer in a split.
+        let (_interp, ed) = wired_test_editor();
+        let buf_a = Rc::new(RefCell::new(Buffer::new("a", "")));
+        let buf_b = Rc::new(RefCell::new(Buffer::new("b", "")));
+        let buf_c = Rc::new(RefCell::new(Buffer::new("c", ""))); // no entry at all
+        ed.borrow_mut().diagnostics.insert(
+            Rc::as_ptr(&buf_a) as usize,
+            vec![(1, 1, "a's diagnostic".to_string())],
+        );
+        ed.borrow_mut().diagnostics.insert(
+            Rc::as_ptr(&buf_b) as usize,
+            vec![(2, 2, "b's diagnostic".to_string())],
+        );
+        let ed_ref = ed.borrow();
+        assert_eq!(window_diagnostic_lines(&ed_ref, &buf_a), vec![(1, 1)]);
+        assert_eq!(window_diagnostic_lines(&ed_ref, &buf_b), vec![(2, 2)]);
+        assert_eq!(window_diagnostic_lines(&ed_ref, &buf_c), Vec::new());
     }
 }

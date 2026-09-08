@@ -15,7 +15,10 @@
 (defun ielm ()
   "Open the *ielm* interactive elisp REPL buffer."
   (interactive)
-  (switch-to-buffer-internal "*ielm*")
+  ;; M103: `pop-to-buffer', not `switch-to-buffer-internal' -- splits a
+  ;; window for `*ielm*' instead of overwriting whatever the user was
+  ;; editing. See window.el's header for the full design.
+  (pop-to-buffer "*ielm*")
   ;; M29: without this, `ielm-mode' never actually names this buffer's
   ;; major-mode (it stayed nil/fundamental), so evil-mode's default
   ;; `evil-emacs-state-modes' entry for it was inert. Same pattern
