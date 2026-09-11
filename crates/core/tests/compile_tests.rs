@@ -701,3 +701,59 @@ fn compile_output_cap_kills_process_and_reports_truncation() {
         text
     );
 }
+
+// --- M130: vim-style j/k motion in compilation's local keymap -----------
+
+#[test]
+fn compilation_j_and_k_move_without_inserting() {
+    let scratch = Scratch::new("jk_compile");
+    write(&scratch, "main.sv", "// nothing\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    run(&mut i, "(evil-mode 1)");
+    do_compile(&mut i, &ed, "printf '%s\\n' one two three");
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    run(&mut i, "(switch-to-buffer-internal \"*compilation*\")");
+    assert_eq!(
+        run(&mut i, "evil--state"),
+        "emacs",
+        "*compilation* must start in evil's `emacs' state"
+    );
+    let before = run(&mut i, "(buffer-string)");
+    run(&mut i, "(goto-char (point-min))");
+    let line0 = run(&mut i, "(line-number-at-pos)");
+    feed_keys(&mut i, &ed, "j").unwrap();
+    let line1 = run(&mut i, "(line-number-at-pos)");
+    assert_ne!(line1, line0, "j must move down a line");
+    feed_keys(&mut i, &ed, "k").unwrap();
+    assert_eq!(
+        run(&mut i, "(line-number-at-pos)"),
+        line0,
+        "k must move back up to the original line"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "j/k must never insert text into *compilation*"
+    );
+    // M130 fix round FIX-4: `*compilation*' is a plain scrolling-output
+    // text buffer (no trailing row past the last line of real content
+    // the way dired/search-mode have -- see those two modes' own `G'
+    // fix comments), so plain `end-of-buffer' semantics are correct
+    // here and need no special-case landing function. Still worth its
+    // own assertion: nothing else in this test presses `G' at all, so a
+    // regression that dropped or broke the binding would go undetected.
+    feed_keys(&mut i, &ed, "G").unwrap();
+    assert_eq!(
+        run(&mut i, "(point)"),
+        run(&mut i, "(point-max)"),
+        "G must move point to the end of *compilation*"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "G must never insert text into *compilation*"
+    );
+}

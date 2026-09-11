@@ -601,6 +601,32 @@ fn lsp_connect_records_its_own_command_on_the_client() {
     ok(&mut i, "(lsp-kill (lsp--client-conn test--client))");
 }
 
+#[test]
+fn lsp_connect_records_its_own_root_on_the_client() {
+    // M131 Part A: `lsp-connect' is the real call site that builds a
+    // live `lsp--client' with a non-nil ROOT-PATH -- this is the
+    // struct-field-level guard standing on `(make-lsp--client :conn
+    // conn :command command :root root-path)' actually wiring
+    // ROOT-PATH through, independent of any `lsp-references-at-point'
+    // wiring (covered separately, at the message-text level, in
+    // `lsp_references_tests.rs').
+    let mut i = setup();
+    let dir = scratch_dir("lsp_connect_records_root");
+    std::fs::create_dir_all(&dir).unwrap();
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--client (lsp-connect \"cat\" nil {:?}))",
+            dir.to_str().unwrap()
+        ),
+    );
+    assert_eq!(
+        run(&mut i, "(lsp--client-root test--client)"),
+        format!("{:?}", dir.to_str().unwrap())
+    );
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--client))");
+}
+
 // ============================================================
 // M-x lsp: clean degradation
 // ============================================================

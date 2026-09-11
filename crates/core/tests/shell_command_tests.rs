@@ -658,3 +658,53 @@ fn shell_command_on_region_stops_promptly_when_original_buffer_killed_mid_stream
          wait out the remaining `sleep 5'"
     );
 }
+
+// --- M130: vim-style j/k motion in the shell-command output buffer's
+// --- local keymap ---------------------------------------------------------
+
+#[test]
+fn shell_command_output_j_moves_and_does_not_insert_text() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(evil-mode 1)");
+    do_shell_command(&mut i, &ed, "printf '%s\\n' one two three");
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_procs_running);
+    assert!(ok, "shell command never finished");
+
+    run(
+        &mut i,
+        "(switch-to-buffer-internal shell-command-output-buffer-name)",
+    );
+    assert_eq!(
+        run(&mut i, "evil--state"),
+        "emacs",
+        "the shell-command output buffer must start in evil's `emacs' state"
+    );
+    let before = run(&mut i, "(buffer-string)");
+    run(&mut i, "(goto-char (point-min))");
+    let line0 = run(&mut i, "(line-number-at-pos)");
+    feed_keys(&mut i, &ed, "j").unwrap();
+    let line1 = run(&mut i, "(line-number-at-pos)");
+    assert_ne!(line1, line0, "j must move down a line");
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "j must never self-insert into the shell-command output buffer"
+    );
+    // M130 fix round FIX-4: the shell-command output buffer is a plain
+    // scrolling-output text buffer (no trailing row past the last line
+    // of content the way dired/search-mode have), so plain `end-of-
+    // buffer' semantics are correct and need no special-case landing
+    // function -- still asserted here since nothing else in this test
+    // presses `G'.
+    feed_keys(&mut i, &ed, "G").unwrap();
+    assert_eq!(
+        run(&mut i, "(point)"),
+        run(&mut i, "(point-max)"),
+        "G must move point to the end of the shell-command output buffer"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "G must never self-insert into the shell-command output buffer"
+    );
+}

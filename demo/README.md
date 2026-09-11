@@ -22,7 +22,8 @@ opinion about, next to the existing `dev/` tooling directory.
 ```
 demo/
   rtl/              SystemVerilog — a small SoC, split across subdirectories
-  rtl-verilog2001/  plain Verilog-2001 — a FIFO, a Gray-code counter, and testbenches
+  rtl-verilog2001/  plain Verilog-2001 — a FIFO, a Gray-code counter, a non-ANSI
+                    top wrapping both, and testbenches
   verif/            SystemVerilog — testbenches and verification-only material
   tools/            Rust, C, C++, Java, Python, Perl, shell
   editor/           Emacs Lisp — a working init.el for RTL work
@@ -188,18 +189,23 @@ perl -c tools/simlog_report.pl
 
 Verified on macOS (arm64) when this directory was written:
 
-- `./tools/lint_rtl.sh` — **all three checks pass** across all 17 Verilog
+- `./tools/lint_rtl.sh` — **all three checks pass** across all 20 Verilog
   and SystemVerilog files (`verible-verilog-syntax`, `-lint`, `-format
   --verify`).
-- `./tools/run_sim.sh` — **all three simulations actually run and pass**:
+- `./tools/run_sim.sh` — **all four simulations actually run and pass**:
   `rtl-verilog2001/fifo_sync` prints `PASS: fifo_sync 8 x 32`,
   `rtl-verilog2001/gray_ctr` prints `PASS: gray_ctr WIDTH=4` (M124: a
   non-ANSI-header Gray-code counter, checked against both the expected
   binary sequence and the one-bit-per-step Gray property across two full
-  wraps), and `verif/sram_bank_tb` prints `PASS: sram_bank 4 banks x 3
-  words (hits=12 misses=0)` — 4 banks, 3 words each, written and read
-  back through the real `axi4_lite_if` interface and `sram_bank`'s
-  generate-instantiated `sram_wrapper`/`clk_gate` hierarchy.
+  wraps), `rtl-verilog2001/fifo_gray_top` prints `PASS: fifo_gray_top 8 x
+  32, GRAY_WIDTH=4` (M125: a non-ANSI top wrapping both `fifo_sync` and
+  `gray_ctr` — real material for `/*AUTOOUTPUT*/`, `/*AUTOINPUT*/` and
+  `/*AUTOINOUT*/`, checked in fully expanded and pinned byte-for-byte
+  against the editor's own output), and `verif/sram_bank_tb`
+  prints `PASS: sram_bank 4 banks x 3 words (hits=12 misses=0)` — 4
+  banks, 3 words each, written and read back through the real
+  `axi4_lite_if` interface and `sram_bank`'s generate-instantiated
+  `sram_wrapper`/`clk_gate` hierarchy.
 - `tools/bitvec.rs` — **5 tests passed, 0 failed**.
 - `tools/crc32.c` — **5 vectors + streaming pass**.
 - `tools/vcd_writer.cpp` — builds clean with `-Wall -Wextra`, produced a
@@ -214,20 +220,22 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 33 files open in the correct major mode** — 27 in a
+- **All 37 files open in the correct major mode** — 31 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
   `emacs-lisp-mode`, `org-mode`) and 6 in `fundamental-mode`
   (`README.md`, `rtl/verible.filelist`, `verif/verible.filelist`,
   `rtl/.slang/server.json`, `rtl-verilog2001/.rules.verible_lint`,
   `tools/sample_sim.log`). (M124: `gray_ctr.v`/`gray_ctr_tb.v` added to
-  `rtl-verilog2001/`, both dump-verified to open in `verilog-mode`.)
+  `rtl-verilog2001/`, both dump-verified to open in `verilog-mode`. M125:
+  `fifo_gray_top.v`/`fifo_gray_top_tb.v` added the same way. M127:
+  `rtl/mem/sram_dual_channel.sv` added the same way.)
 - From `rtl/top/soc_top.sv`, **`M-.` on `alu` lands in
   `rtl/core/alu.sv`** and port completion engages inside `u_regfile`'s
   port list — the two table rows above are measured, not asserted.
-- That file sees **8 library files** even though `rtl/top/` contains
-  only `soc_top.sv` itself: all eight arrive via `rtl/verible.filelist`.
-- Open any of the 16 files under `rtl/`, `rtl-verilog2001/` and
+- That file sees **9 library files** even though `rtl/top/` contains
+  only `soc_top.sv` itself: all nine arrive via `rtl/verible.filelist`.
+- Open any of the 20 files under `rtl/`, `rtl-verilog2001/` and
   `verif/` that have enough indented lines to go on, and the editor's
   indent step
   **follows that file's own 2-space style** instead of `verilog-mode`'s
@@ -270,7 +278,7 @@ And, driving the editor itself rather than the external toolchains:
 
 The four editor claims above, plus the `C-c C-a` / `C-c C-k` rows of
 the keybinding table, are the ones a test now re-checks on every run:
-`crates/core/tests/demo_smoke_tests.rs`. The "8 library files" count is
+`crates/core/tests/demo_smoke_tests.rs`. The "9 library files" count is
 not asserted directly — the cross-file jump and completion tests only
 prove that resolution reaches other directories at all. Add or remove a
 file under `demo/` and that test fails until its expected-mode table and
@@ -296,7 +304,51 @@ Not verified, for lack of a toolchain on this machine:
 actually runs (`./tools/run_sim.sh`, above): `PASS: fifo_sync 8 x 32` is
 an observed result, not intent. Same for `rtl-verilog2001/gray_ctr_tb.v`
 (M124), added together with `gray_ctr.v` and wired into the same script
-from the start — `PASS: gray_ctr WIDTH=4` is likewise observed.
+from the start — `PASS: gray_ctr WIDTH=4` is likewise observed. Same
+again for `rtl-verilog2001/fifo_gray_top_tb.v` (M125), added together
+with `fifo_gray_top.v` and wired into the same script from the start —
+`PASS: fifo_gray_top 8 x 32, GRAY_WIDTH=4` is likewise observed.
+
+M126 changed `rtl-verilog2001/gray_ctr.v` itself: `bin_count`'s port
+declaration was changed from `output reg [WIDTH-1:0]` to a bare, untyped
+`output`, and a `/*AUTOREG*/` marker (checked in fully expanded) now
+supplies the `reg` declaration that used to be hand-written. The same
+`PASS: gray_ctr WIDTH=4` and `PASS: fifo_gray_top 8 x 32, GRAY_WIDTH=4`
+lines above were re-observed after that change (`./tools/run_sim.sh`),
+and `./tools/lint_rtl.sh` re-run clean across all 20 files. `rtl/core/
+status_regs_stub.sv` is new material for `/*AUTOTIEOFF*/` on a real ANSI
+SystemVerilog module (a bring-up stub whose outputs are declared but not
+yet driven, ordinary early-stage RTL practice) — lint/format-clean under
+the same zero-waiver rule set as every other file under `rtl/`, but
+**not** run through `./tools/run_sim.sh`: it is not instantiated
+anywhere, so it has no testbench to run. It is deliberately not wired
+into `rtl/top/soc_top.sv`, because several tests pin that file's exact
+line numbers and instance count and this module's own job is AUTOTIEOFF
+rather than integration.
+
+Both of those checked-in expanded artifacts are pinned byte-for-byte
+against what this editor itself generates, so neither can drift from the
+command that is supposed to produce it: `demo_verilog2001_gray_ctr_
+autoreg_matches_editor_output` and `demo_rtl_status_regs_stub_autotieoff_
+matches_editor_output`, both in `crates/core/tests/demo_smoke_tests.rs`.
+Each opens the real file, runs delete-auto → verilog-auto → format-buffer,
+and asserts byte-equality with what is on disk.
+
+M127 added `rtl/mem/sram_dual_channel.sv`: a third `/*AUTOINST*/` demo,
+checked in fully expanded, exercising AUTO_TEMPLATE's `@` instance-number
+substitution and `[]` bit-range tokens (neither had any exercise anywhere
+under `demo/` before this milestone) — one AUTO_TEMPLATE body applied to
+two `sram_wrapper` instances (`u_ch0`/`u_ch1`), an exact rule for the
+shared `clk_i`/`rst_ni` winning over a wildcard rule that would otherwise
+mis-rename them, and every templated connection carrying its own
+`// Templated` annotation. Same pinning discipline as the other two:
+`demo_rtl_sram_dual_channel_autoinst_matches_editor_output` in
+`crates/core/tests/demo_smoke_tests.rs` runs delete-auto → verilog-auto →
+format-buffer and asserts byte-equality with what is on disk. It is
+deliberately not instantiated anywhere in `rtl/top/soc_top.sv` for the
+same reason `status_regs_stub.sv` isn't — that file's exact line numbers
+and instance count are pinned by other tests, and this module's own job
+is demonstrating AUTO_TEMPLATE, not integration.
 
 ### Checked by Verible, never simulated
 

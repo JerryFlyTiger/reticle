@@ -147,11 +147,13 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 33] = [
+    const TABLE: [(&str, &str); 37] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
         ("rtl-verilog2001/.rules.verible_lint", "fundamental-mode"),
+        ("rtl-verilog2001/fifo_gray_top.v", "verilog-mode"),
+        ("rtl-verilog2001/fifo_gray_top_tb.v", "verilog-mode"),
         ("rtl-verilog2001/fifo_sync.v", "verilog-mode"),
         ("rtl-verilog2001/fifo_sync_tb.v", "verilog-mode"),
         ("rtl-verilog2001/gray_ctr.v", "verilog-mode"),
@@ -162,8 +164,10 @@ fn every_file_under_demo_opens_in_its_expected_major_mode() {
         ("rtl/core/alu.sv", "verilog-mode"),
         ("rtl/core/clk_gate.sv", "verilog-mode"),
         ("rtl/core/regfile.sv", "verilog-mode"),
+        ("rtl/core/status_regs_stub.sv", "verilog-mode"),
         ("rtl/include/soc_defs.svh", "verilog-mode"),
         ("rtl/mem/sram_bank.sv", "verilog-mode"),
+        ("rtl/mem/sram_dual_channel.sv", "verilog-mode"),
         ("rtl/mem/sram_wrapper.sv", "verilog-mode"),
         ("rtl/pkg/soc_pkg.sv", "verilog-mode"),
         ("rtl/top/soc_top.sv", "verilog-mode"),
@@ -472,6 +476,305 @@ fn arbiter_autoinst_expands_then_deletes() {
     );
 }
 
+/// Raw string value of `(buffer-string)`, read straight off the
+/// interpreter `Value` (mirrors `buffer_file_name` above and
+/// `verilog_auto_tests.rs`'s own `bs` helper) rather than through
+/// `prin1_to_string`, which would escape/quote the text and defeat a
+/// byte-identical comparison.
+fn buffer_string(interp: &mut Interp) -> String {
+    match interp.eval_source("(buffer-string)") {
+        Ok(Value::Str(s)) => (*s).clone(),
+        Ok(_) => panic!("(buffer-string) did not return a string"),
+        Err(flow) => panic!("(buffer-string) errored: {}", interp.describe_flow(&flow)),
+    }
+}
+
+/// Set this to `1`/`true`/`yes` to turn a missing `verible-verilog-format`
+/// on `PATH` into a deliberate, visible skip instead of a failure --
+/// mirrors `dev_tools_tests.rs`'s own `RETICLE_ALLOW_MISSING_PILLOW`. Any
+/// other value, including `0`, means "not allowed to skip" (matching
+/// `demo/tools/run_sim.sh`'s own `DEMO_SIM_ALLOW_MISSING` convention).
+const SKIP_ENV_VERIBLE_FORMAT: &str = "RETICLE_ALLOW_MISSING_VERIBLE_FORMAT";
+
+/// Whether `verible-verilog-format` is on `PATH` at all -- `format-buffer'
+/// (`crates/core/lisp/format.el:284`) never signals an ELISP error when
+/// its external formatter binary is missing (a failed `call-process`
+/// is reported via `message', not `error' -- see `format--run-external'),
+/// so this Rust-level check is the only thing that can turn a missing
+/// binary into a loud test failure rather than a silent no-op that
+/// happens to leave the buffer already matching the (unformatted)
+/// on-disk file by coincidence.
+fn verible_verilog_format_available() -> bool {
+    match std::process::Command::new("verible-verilog-format")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+/// M125 Part C, fix round (spec section 2): pins "the checked-in
+/// `demo/rtl-verilog2001/fifo_gray_top.v` is exactly what a real user
+/// ends up with on disk" -- and a real user's own pipeline is *generate,
+/// then save*, because `format-on-save' defaults to `t'
+/// (`crates/core/lisp/format.el:360`, `before-save-hook' at `:393') and
+/// `format-buffer' is a public command (`:284'). So this test runs
+/// `(verilog-delete-auto)', `(verilog-auto)', THEN `(format-buffer)' --
+/// generator layout followed by verible -- not generator layout alone,
+/// which is what the pre-fix-round version of this test checked and is
+/// why the checked-in file used to fail `demo/tools/lint_rtl.sh's own
+/// `format' step (the AUTO generator aligns trailing comments to a
+/// shared column and indents connection lists to the marker's own
+/// column, GNU verilog-mode's own house style; `verible-verilog-format
+/// --indentation_spaces=2' collapses all of that).
+///
+/// Two instances (`u_fifo_sync`, `u_gray_ctr`) share `clk`/`rst_n`, which
+/// is what makes this real material rather than a single-instance
+/// fixture: the checked-in AUTOINPUT block collapses both contributions
+/// into one declaration per name.
+#[test]
+fn demo_verilog2001_auto_top_matches_editor_output() {
+    if !verible_verilog_format_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_VERIBLE_FORMAT).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): verible-verilog-format is not \
+                 available, demo_verilog2001_auto_top_matches_editor_output was not run",
+                SKIP_ENV_VERIBLE_FORMAT
+            );
+            return;
+        }
+        panic!(
+            "verible-verilog-format is not available -- \
+             demo_verilog2001_auto_top_matches_editor_output was not run. \
+             Failing by default so a missing dependency cannot silently \
+             pass as a green gate. Install Verible \
+             (https://github.com/chipsalliance/verible), or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_VERIBLE_FORMAT
+        );
+    }
+
+    let (mut i, _ed) = setup();
+    let top = demo_root().join("rtl-verilog2001/fifo_gray_top.v");
+    let top_str = top.to_str().unwrap();
+
+    let on_disk = std::fs::read_to_string(&top).unwrap();
+
+    ok(&mut i, &format!("(find-file-internal {:?})", top_str));
+    ok(&mut i, "(verilog-delete-auto)");
+    ok(&mut i, "(verilog-auto)");
+    ok(&mut i, "(format-buffer)");
+
+    let regenerated = buffer_string(&mut i);
+    assert_eq!(
+        regenerated, on_disk,
+        "demo/rtl-verilog2001/fifo_gray_top.v on disk must be byte-identical \
+        to what (verilog-delete-auto), (verilog-auto), then (format-buffer) \
+        regenerate -- i.e. exactly the generate-then-save pipeline a real user gets"
+    );
+
+    let bytes_after = std::fs::read(&top).unwrap();
+    assert_eq!(
+        bytes_after,
+        on_disk.as_bytes(),
+        "this test must never write back to demo/rtl-verilog2001/fifo_gray_top.v on disk"
+    );
+}
+
+/// M126 Part C1: pins "the checked-in `demo/rtl-verilog2001/gray_ctr.v`
+/// is exactly what a real user ends up with on disk" for `/*AUTOREG*/',
+/// the same generate-then-save pipeline
+/// `demo_verilog2001_auto_top_matches_editor_output' above pins for
+/// `fifo_gray_top.v''s own AUTOOUTPUT/AUTOINPUT/AUTOINOUT. `gray_ctr.v'
+/// is the only non-ANSI module under `demo/' with an `output reg' before
+/// M126 -- its own header now records why `bin_count' was changed to a
+/// bare, untyped `output' so AUTOREG has something real to fill in.
+#[test]
+fn demo_verilog2001_gray_ctr_autoreg_matches_editor_output() {
+    if !verible_verilog_format_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_VERIBLE_FORMAT).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): verible-verilog-format is not \
+                 available, demo_verilog2001_gray_ctr_autoreg_matches_editor_output was not run",
+                SKIP_ENV_VERIBLE_FORMAT
+            );
+            return;
+        }
+        panic!(
+            "verible-verilog-format is not available -- \
+             demo_verilog2001_gray_ctr_autoreg_matches_editor_output was not run. \
+             Failing by default so a missing dependency cannot silently \
+             pass as a green gate. Install Verible \
+             (https://github.com/chipsalliance/verible), or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_VERIBLE_FORMAT
+        );
+    }
+
+    let (mut i, _ed) = setup();
+    let path = demo_root().join("rtl-verilog2001/gray_ctr.v");
+    let path_str = path.to_str().unwrap();
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+
+    ok(&mut i, &format!("(find-file-internal {:?})", path_str));
+    ok(&mut i, "(verilog-delete-auto)");
+    ok(&mut i, "(verilog-auto)");
+    ok(&mut i, "(format-buffer)");
+
+    let regenerated = buffer_string(&mut i);
+    assert_eq!(
+        regenerated, on_disk,
+        "demo/rtl-verilog2001/gray_ctr.v on disk must be byte-identical \
+        to what (verilog-delete-auto), (verilog-auto), then (format-buffer) \
+        regenerate -- i.e. exactly the generate-then-save pipeline a real user gets"
+    );
+
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes_after,
+        on_disk.as_bytes(),
+        "this test must never write back to demo/rtl-verilog2001/gray_ctr.v on disk"
+    );
+}
+
+/// M126 Part C2: pins "the checked-in `demo/rtl/core/status_regs_stub.sv`
+/// is exactly what a real user ends up with on disk" for `/*AUTOTIEOFF*/'
+/// on a real ANSI SystemVerilog module -- the same generate-then-save
+/// pipeline the two tests above pin for their own AUTO commands. This is
+/// the ONE test in this file proving divergence 2 (the ANSI `assign'
+/// switch) actually matters on `demo/rtl/', which is entirely ANSI --
+/// not just on a synthetic fixture in verilog_auto_tests.rs.
+#[test]
+fn demo_rtl_status_regs_stub_autotieoff_matches_editor_output() {
+    if !verible_verilog_format_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_VERIBLE_FORMAT).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): verible-verilog-format is not \
+                 available, demo_rtl_status_regs_stub_autotieoff_matches_editor_output was not run",
+                SKIP_ENV_VERIBLE_FORMAT
+            );
+            return;
+        }
+        panic!(
+            "verible-verilog-format is not available -- \
+             demo_rtl_status_regs_stub_autotieoff_matches_editor_output was not run. \
+             Failing by default so a missing dependency cannot silently \
+             pass as a green gate. Install Verible \
+             (https://github.com/chipsalliance/verible), or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_VERIBLE_FORMAT
+        );
+    }
+
+    let (mut i, _ed) = setup();
+    let path = demo_root().join("rtl/core/status_regs_stub.sv");
+    let path_str = path.to_str().unwrap();
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+
+    ok(&mut i, &format!("(find-file-internal {:?})", path_str));
+    ok(&mut i, "(verilog-delete-auto)");
+    ok(&mut i, "(verilog-auto)");
+    ok(&mut i, "(format-buffer)");
+
+    let regenerated = buffer_string(&mut i);
+    assert_eq!(
+        regenerated, on_disk,
+        "demo/rtl/core/status_regs_stub.sv on disk must be byte-identical \
+        to what (verilog-delete-auto), (verilog-auto), then (format-buffer) \
+        regenerate -- i.e. exactly the generate-then-save pipeline a real user gets"
+    );
+
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes_after,
+        on_disk.as_bytes(),
+        "this test must never write back to demo/rtl/core/status_regs_stub.sv on disk"
+    );
+}
+
+/// M127: `rtl/mem/sram_dual_channel.sv` is the showcase file for
+/// AUTO_TEMPLATE's `@' instance-number substitution and `[]' bit-range
+/// tokens -- neither had any exercise anywhere under `demo/' before this
+/// milestone. Same pinning discipline as the two tests above: this is the
+/// ONE test in this file proving `@'/`[]' actually work on real,
+/// parameterised RTL, not just on a synthetic fixture in
+/// verilog_auto_tests.rs.
+#[test]
+fn demo_rtl_sram_dual_channel_autoinst_matches_editor_output() {
+    if !verible_verilog_format_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_VERIBLE_FORMAT).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): verible-verilog-format is not \
+                 available, demo_rtl_sram_dual_channel_autoinst_matches_editor_output was not run",
+                SKIP_ENV_VERIBLE_FORMAT
+            );
+            return;
+        }
+        panic!(
+            "verible-verilog-format is not available -- \
+             demo_rtl_sram_dual_channel_autoinst_matches_editor_output was not run. \
+             Failing by default so a missing dependency cannot silently \
+             pass as a green gate. Install Verible \
+             (https://github.com/chipsalliance/verible), or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_VERIBLE_FORMAT
+        );
+    }
+
+    let (mut i, _ed) = setup();
+    let path = demo_root().join("rtl/mem/sram_dual_channel.sv");
+    let path_str = path.to_str().unwrap();
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+
+    ok(&mut i, &format!("(find-file-internal {:?})", path_str));
+    ok(&mut i, "(verilog-delete-auto)");
+    ok(&mut i, "(verilog-auto)");
+    ok(&mut i, "(format-buffer)");
+
+    let regenerated = buffer_string(&mut i);
+    assert_eq!(
+        regenerated, on_disk,
+        "demo/rtl/mem/sram_dual_channel.sv on disk must be byte-identical \
+        to what (verilog-delete-auto), (verilog-auto), then (format-buffer) \
+        regenerate -- i.e. exactly the generate-then-save pipeline a real user gets"
+    );
+    assert!(
+        regenerated.contains("// Templated"),
+        "sanity -- this file's whole point is exercising the `// Templated' annotation: {}",
+        regenerated
+    );
+
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes_after,
+        on_disk.as_bytes(),
+        "this test must never write back to demo/rtl/mem/sram_dual_channel.sv on disk"
+    );
+}
+
 // ============================================================
 // 6. M73: every demo/ Verilog file's own on-disk indent width is what
 //    `indent--detect-width' (indent.el:650, a pure scanner -- read-only,
@@ -502,7 +805,9 @@ fn arbiter_autoinst_expands_then_deletes() {
 #[test]
 fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
     let root = demo_root();
-    let verilog_files: [(&str, Option<i64>); 17] = [
+    let verilog_files: [(&str, Option<i64>); 21] = [
+        ("rtl-verilog2001/fifo_gray_top.v", Some(2)),
+        ("rtl-verilog2001/fifo_gray_top_tb.v", Some(2)),
         ("rtl-verilog2001/fifo_sync.v", Some(2)),
         ("rtl-verilog2001/fifo_sync_tb.v", Some(2)),
         ("rtl-verilog2001/gray_ctr.v", Some(2)),
@@ -512,6 +817,7 @@ fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
         ("rtl/core/alu.sv", Some(2)),
         ("rtl/core/clk_gate.sv", Some(2)),
         ("rtl/core/regfile.sv", Some(2)),
+        ("rtl/core/status_regs_stub.sv", Some(2)),
         // Only 2 lines of this 28-line file are indented at all (a
         // `SOC_ASSERT' macro continuation) -- below
         // `indent--detect-min-samples' (5), so detection returns nil
@@ -521,6 +827,7 @@ fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
         // case that exercises it, not a synthetic one.
         ("rtl/include/soc_defs.svh", None),
         ("rtl/mem/sram_bank.sv", Some(2)),
+        ("rtl/mem/sram_dual_channel.sv", Some(2)),
         ("rtl/mem/sram_wrapper.sv", Some(2)),
         ("rtl/pkg/soc_pkg.sv", Some(2)),
         ("rtl/top/soc_top.sv", Some(2)),

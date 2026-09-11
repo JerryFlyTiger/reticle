@@ -581,6 +581,12 @@ See this file's M67 header note for what this does NOT cover."
       (major-mode-internal-set 'help-mode)
       (let ((map (make-sparse-keymap)))
         (define-key map "q" 'help-quit)
+        ;; M130: `gg' is deliberately not bound anywhere in this
+        ;; milestone -- see dired.el's header note for the mechanical
+        ;; reason (`g' collision risk in `Keymap::define-sequence').
+        (define-key map "j" 'next-line)
+        (define-key map "k" 'previous-line)
+        (define-key map "G" 'end-of-buffer)
         (use-local-map map))
       (let ((inhibit-read-only t))
         (erase-buffer)

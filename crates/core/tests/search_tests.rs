@@ -3592,3 +3592,116 @@ fn search_filter_changes_composition_recalibrates_current_index() {
          stale index"
     );
 }
+
+// --- M130: vim-style j/k motion in search-mode/search-edit-mode's local
+// --- keymaps -------------------------------------------------------------
+
+#[test]
+fn search_view_j_and_k_move_by_line() {
+    let scratch = Scratch::new("jk_view");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "a.v", "one\ntwo\nthree\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    run(&mut i, "(evil-mode 1)");
+    set_fake_printf_engine(&mut i, &["a.v:1:1:one", "a.v:2:1:two", "a.v:3:1:three"]);
+    do_search(&mut i, &ed, "x");
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_search_procs_running);
+    assert!(ok, "search job never finished");
+
+    run(&mut i, "(switch-to-buffer-internal \"*search*\")");
+    assert_eq!(run(&mut i, "evil--state"), "emacs");
+    let before = search_buffer_string(&mut i);
+    run(&mut i, "(goto-char (point-min))");
+    let line0 = run(&mut i, "(line-number-at-pos)");
+    feed_keys(&mut i, &ed, "j").unwrap();
+    let line1 = run(&mut i, "(line-number-at-pos)");
+    assert_ne!(line1, line0, "j must move down a line");
+    feed_keys(&mut i, &ed, "k").unwrap();
+    assert_eq!(
+        run(&mut i, "(line-number-at-pos)"),
+        line0,
+        "k must move back up to the original line"
+    );
+    assert_eq!(
+        search_buffer_string(&mut i),
+        before,
+        "j/k must never alter *search*'s text"
+    );
+    // M130 fix round FIX-3: every result line ends in its own "\n"
+    // (including the last), so a plain `end-of-buffer' would land on
+    // the empty line PAST the last result, where `search--result-at-
+    // buffer-pos' finds nothing and RET would report "No search result
+    // on this line" -- confirmed by reproducing this before the fix.
+    // `G' must land ON the last result line instead.
+    feed_keys(&mut i, &ed, "G").unwrap();
+    let entry = run(
+        &mut i,
+        "(search--result-at-buffer-pos (line-beginning-position))",
+    );
+    assert_ne!(
+        entry, "nil",
+        "G must land on a real result line, not the empty line past the last one"
+    );
+    assert_eq!(
+        run(&mut i, "(line-number-at-pos)"),
+        "3",
+        "G must land on the LAST (third) result line"
+    );
+}
+
+// M130 fix round FIX-1: the original spec's own judgment call for
+// `search-edit-mode' was wrong -- this is a WRITABLE, free-typing wgrep-
+// level edit buffer (M83), the same category as `eshell'/`ielm', not a
+// scrollable-output-only buffer like `*compilation*'/the shell-command
+// output buffer. Binding `j'/`k'/`G' here would silently eat those
+// letters from every typed replacement line, and Verilog identifiers
+// routinely contain them (`clk', `jtag', `join_none'). This test
+// replaces the deleted `search_edit_j_moves_and_does_not_insert_text'
+// and asserts the OPPOSITE: `j' must still self-insert, guarding
+// against a future regression that binds it back to motion.
+#[test]
+fn search_edit_j_k_capital_g_all_still_self_insert() {
+    // M130 fix round FIX-8: the original version of this test (named
+    // `search_edit_j_still_self_inserts') only pressed `j', but FIX-1's
+    // reasoning for leaving `j'/`k'/`G' all unbound in search-edit-mode
+    // applies equally to all three letters -- with only `j' covered, a
+    // future regression that bound `k' or `G' back to motion here would
+    // have gone undetected by any named test. This test presses all
+    // three and asserts each one actually lands in the buffer text.
+    let scratch = Scratch::new("jkG_edit_selfinsert");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "a.v", "l1\nOLD\nl3\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    run(&mut i, "(evil-mode 1)");
+    set_fake_printf_engine(&mut i, &["a.v:2:1:OLD"]);
+    do_search(&mut i, &ed, "x");
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_search_procs_running);
+    assert!(ok, "search job never finished");
+
+    enter_edit_mode(&mut i, &ed);
+    assert_eq!(
+        run(&mut i, "evil--state"),
+        "emacs",
+        "search-edit-mode must start in evil's `emacs' state so ordinary \
+         typing self-inserts instead of being read as vim motions"
+    );
+    run(
+        &mut i,
+        "(with-current-buffer \"*search*\" (goto-char (point-max)))",
+    );
+    for key in ["j", "k", "G"] {
+        let before = search_buffer_string(&mut i);
+        feed_keys(&mut i, &ed, key).unwrap();
+        let after = search_buffer_string(&mut i);
+        let expected = format!("{}{}\"", &before[..before.len() - 1], key);
+        assert_eq!(
+            after, expected,
+            "{:?} must still self-insert in search-edit-mode -- binding it to \
+             motion would silently eat the letter from every typed line: \
+             before={:?} after={:?}",
+            key, before, after
+        );
+    }
+}

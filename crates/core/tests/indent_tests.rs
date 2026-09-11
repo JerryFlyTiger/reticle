@@ -1016,6 +1016,381 @@ fn verilog_wrapped_port_list_second_continuation_line_does_not_stack_wrap_steps(
     );
 }
 
+/// M127: dump-verified that the FIRST comment inside a wrapped
+/// `hierarchical_instance''s port-connection list is a direct child of
+/// `hierarchical_instance' itself -- a SIBLING of `list_of_port_
+/// connections', not a descendant of it -- while a comment appearing
+/// AFTER a real connection sits inside `list_of_port_connections'
+/// between two `named_port_connection' children. Only the leading
+/// comment's own ancestor chain therefore misses the wrap node entirely,
+/// computing wrap-depth 0 (column 2, module block depth alone) instead
+/// of matching `.gnt_o(gnt_o),' at column 6. See
+/// `indent--verilog-comment-before-wrap-node-adjust' in indent.el.
+#[test]
+fn verilog_leading_comment_inside_wrapped_port_connections_gets_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n      // Outputs\n      .gnt_o(gnt_o),\n      // Inputs\n      .clk_i(clk_i),\n      .rst_ni(rst_ni)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// Outputs\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "the leading comment, sibling of `list_of_port_connections', must still get the wrap \
+         step -- matching `.gnt_o(gnt_o),' immediately after it"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// Inputs\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "a comment appearing AFTER a real connection is already a descendant of \
+         `list_of_port_connections' and was already correct before this fix -- must stay 6"
+    );
+}
+
+/// M127: same defect, `list_of_parameter_value_assignments'.
+#[test]
+fn verilog_leading_comment_inside_wrapped_parameter_value_assignment_list_gets_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module #(\n      // param overrides\n      .W(8),\n      .D(4)\n  ) u_sub (\n      .clk(clk)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// param overrides\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "leading comment inside a wrapped `#(...)' parameter list must get the wrap step, \
+         matching `.W(8),' immediately after it"
+    );
+}
+
+/// M127: same defect, `list_of_arguments' (a plain task/function call).
+#[test]
+fn verilog_leading_comment_inside_wrapped_argument_list_gets_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  initial begin\n    do_call(\n      // arg comment\n      a,\n      b\n    );\n  end\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// arg comment\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "8",
+        "leading comment inside a wrapped call argument list must get the wrap step, \
+         matching `a,' immediately after it"
+    );
+}
+
+/// M127 must-not-fire case: a comment sitting ABOVE an entire
+/// instantiation (outside its parens) is ALSO immediately followed by a
+/// node -- but that next sibling is `module_instantiation' itself (the
+/// comment is a direct child of `module_declaration', between
+/// `module_ansi_header' and `module_instantiation' -- dump-verified),
+/// not one of the three wrap-node-types this fix targets, so it must
+/// stay at plain block depth, not gain a wrap step.
+#[test]
+fn verilog_comment_above_whole_instantiation_does_not_get_a_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  // instantiate the sub-module\n  sub_module u_sub (\n      .clk(clk)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// instantiate\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "a comment above the WHOLE instantiation (outside its parens) must stay at the \
+         module's own block depth -- it is followed by `module_instantiation', not by one \
+         of the three wrap-node-types this fix targets"
+    );
+}
+
+/// M127 negative control: the module's own ANSI header wrap list
+/// (`list_of_port_declarations'/`parameter_port_list') is NOT affected
+/// by this fix -- a leading comment there genuinely IS a child of the
+/// list node already (dump-verified in the M127 spec), so it was
+/// already correct and must stay that way.
+#[test]
+fn verilog_leading_comment_inside_ansi_header_port_list_is_unaffected() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top (\n  // clock and reset\n  input logic clk_i\n);\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// clock and reset\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "the ANSI header's own leading comment is already a genuine descendant of \
+         `list_of_port_declarations' and must stay at column 4, matching `input logic clk_i'"
+    );
+}
+
+/// M127 fix round (trailing review finding 1): a RUN of two or more
+/// consecutive leading comments, not just a single one. Dump-verified
+/// (fix round) that consecutive comments are spliced in as ordinary
+/// positional siblings of one another, so checking only the IMMEDIATE
+/// next sibling (the pre-fix-round version of `indent--verilog-comment-
+/// before-wrap-node-adjust') left every comment but the LAST in the run
+/// undetected -- its own immediate next sibling is the NEXT comment, not
+/// the wrap node. `indent--verilog-comment-after-skipping-comments' walks
+/// past every further comment sibling to fix this. Both comments here
+/// must land at the SAME column as `.gnt_o(gnt_o),' immediately after
+/// them.
+#[test]
+fn verilog_two_leading_comments_inside_wrapped_port_connections_both_get_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module u_sub (\n      // Outputs\n      // (active high)\n      .gnt_o(gnt_o),\n      .clk_i(clk_i)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// Outputs\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "the FIRST of two consecutive leading comments (whose own immediate next sibling is \
+         the SECOND comment, not the wrap node) must still get the wrap step by skipping past \
+         the run to `list_of_port_connections'"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// (active high)\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "the SECOND of two consecutive leading comments (whose own immediate next sibling \
+         already IS the wrap node) must land at the same column as the first"
+    );
+}
+
+/// M127 fix round: same multi-comment defect, `list_of_parameter_value_
+/// assignments'.
+#[test]
+fn verilog_two_leading_comments_inside_wrapped_parameter_value_assignment_list_both_get_wrap_step()
+{
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  sub_module #(\n      // param overrides\n      // (bumped for sim)\n      .W(8),\n      .D(4)\n  ) u_sub (\n      .clk(clk)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// param overrides\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "first of two consecutive leading comments must still get the wrap step"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// (bumped for sim)\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "second of two consecutive leading comments lands at the same column as the first"
+    );
+}
+
+/// M127 fix round: same multi-comment defect, `list_of_arguments'.
+#[test]
+fn verilog_two_leading_comments_inside_wrapped_argument_list_both_get_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  initial begin\n    do_call(\n      // arg comment\n      // (second line)\n      a,\n      b\n    );\n  end\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// arg comment\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "8",
+        "first of two consecutive leading comments must still get the wrap step"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// (second line)\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "8",
+        "second of two consecutive leading comments lands at the same column as the first"
+    );
+}
+
+/// M127 fix round: the must-not-fire guard must still hold for a RUN of
+/// comments above the whole instantiation, not just a single one --
+/// both comments here stay at the module's own block depth.
+#[test]
+fn verilog_two_leading_comments_above_whole_instantiation_neither_gets_a_wrap_step() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top;\n  // instantiate the sub-module\n  // (see spec section 4)\n  sub_module u_sub (\n      .clk(clk)\n  );\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// instantiate\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "first of two comments above the whole instantiation must stay at block depth"
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// (see spec section 4)\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "2",
+        "second of two comments above the whole instantiation must also stay at block depth -- \
+         its own immediate next sibling is the FIRST comment, then skipping past it lands on \
+         `module_instantiation', not a wrap-node-type"
+    );
+}
+
+/// M127 fix round (trailing review finding 3): negative control for
+/// `parameter_port_list' -- dump-verified that its own leading comment is
+/// already a genuine descendant of the list node (same shape as
+/// `list_of_port_declarations', already covered above), so it must stay
+/// unaffected by this fix. Nothing before this test would have caught a
+/// future edit that wrongly added `parameter_port_list' to
+/// `indent--verilog-comment-wrap-sibling-types'.
+#[test]
+fn verilog_leading_comment_inside_ansi_header_parameter_port_list_is_unaffected() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top #(\n  // param comment\n  parameter W = 8\n);\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// param comment\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "the `#(...)' parameter list's own leading comment is already a genuine descendant of \
+         `parameter_port_list' and must stay at column 4, matching `parameter W = 8'"
+    );
+}
+
+/// M127 fix round: negative control for `list_of_ports' (the non-ANSI
+/// counterpart) -- dump-verified the same descendant shape as the ANSI
+/// header types above.
+#[test]
+fn verilog_leading_comment_inside_non_ansi_header_port_list_is_unaffected() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "module top (\n  // port comment\n  clk,\n  rst\n);\n  input clk;\n  input rst;\nendmodule\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// port comment\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "4",
+        "the non-ANSI header's own leading comment is already a genuine descendant of \
+         `list_of_ports' and must stay at column 4, matching `clk,'"
+    );
+}
+
+/// M127 fix round: negative control for `modport_item' -- dump-verified
+/// the same descendant shape (a leading comment inside `modport mst(...)'
+/// is already a child of `modport_item' itself).
+#[test]
+fn verilog_leading_comment_inside_modport_item_is_unaffected() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        &format!(
+            "(insert {:?})",
+            "interface my_if;\n  logic a, b, c;\n  modport mst(\n    // comment\n    output a, b,\n    input c\n  );\nendinterface\n"
+        ),
+    );
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(search-forward \"// comment\")");
+    run(&mut i, "(beginning-of-line)");
+    assert_eq!(
+        run(&mut i, "(verilog-indent-line)"),
+        "6",
+        "the modport's own leading comment is already a genuine descendant of `modport_item' \
+         and must stay at column 6 (interface_declaration's own depth 1 * width 2, plus the \
+         fixed wrap step 4), matching `output a, b,'"
+    );
+}
+
 /// M119 D1: real `verible-verilog-format --indentation_spaces=2', run on
 /// this exact fixture, puts `parameter W = 8'/`input logic clk'/`input
 /// logic rst' at column 4 and `wire w;' at column 2 -- confirmed against
@@ -2832,6 +3207,11 @@ fn verilog_every_demo_rtl_file_reindents_to_its_own_on_disk_columns_except_named
         ("rtl/core/alu.sv", 6, "module header-line quirk"),
         ("rtl/core/regfile.sv", 7, "module header-line quirk"),
         ("rtl/mem/sram_wrapper.sv", 7, "module header-line quirk"),
+        (
+            "rtl/core/status_regs_stub.sv",
+            12,
+            "module header-line quirk",
+        ),
         ("rtl/pkg/soc_pkg.sv", 7, "package header-line quirk"),
         (
             "rtl/top/soc_top.sv",
@@ -2955,6 +3335,56 @@ fn verilog_every_demo_rtl_file_reindents_to_its_own_on_disk_columns_except_named
             265,
             "covergroup header-line quirk, compounded by nesting inside a module (see comment \
              above)",
+        ),
+        // M127: the ninth file to hit the module header-line quirk
+        // already documented at the top of this list (every other
+        // top-level module header in demo/rtl/ is already here) -- this
+        // is simply the first agent to add sram_dual_channel.sv itself.
+        // Verified independently that this is the same pre-existing
+        // quirk, not something this milestone's own fix introduced: a
+        // bare `module foo (...)' with no comment inside its header at
+        // all still computes one level too deep on `main' before this
+        // milestone's changes, e.g. `module top (\n  input logic
+        // clk_i\n);' -- the SAME `module_declaration' self-referential
+        // header-line quirk `verilog_module_header_line_has_a_documented_
+        // one_level_indent_quirk' pins.
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            15,
+            "module header-line quirk",
+        ),
+        // M127: the ninth instance of the already-documented "tree-sitter
+        // parses a block comment as ONE leaf node" limitation --
+        // `soc_top.sv' lines 106-113 above are the first eight. The
+        // `/* sram_wrapper AUTO_TEMPLATE ( ... ); */' block comment's
+        // hand-typed interior alignment (lines 42-46) is invisible to the
+        // block-depth engine for the identical structural reason: the
+        // WHOLE comment is one leaf node with no internal structure to
+        // walk.
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            42,
+            "hand-aligned commented-out code inside a block comment",
+        ),
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            43,
+            "hand-aligned commented-out code inside a block comment",
+        ),
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            44,
+            "hand-aligned commented-out code inside a block comment",
+        ),
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            45,
+            "hand-aligned commented-out code inside a block comment",
+        ),
+        (
+            "rtl/mem/sram_dual_channel.sv",
+            46,
+            "hand-aligned commented-out code inside a block comment",
         ),
     ];
 

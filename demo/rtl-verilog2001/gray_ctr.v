@@ -9,6 +9,13 @@
 // ANSI style in this same directory. Both styles are ordinary industry
 // Verilog-2001; this file exists so the editor has real non-ANSI
 // material to be tested against (see M124's Part A/E).
+//
+// M126: `bin_count' is a bare, untyped `output' so `/*AUTOREG*/' below
+// can fill in its own `reg' declaration -- AUTOREG ignores procedural
+// drivers, so it still declares `bin_count' even though the `always'
+// block is its only real driver. `gray_count' keeps its explicit
+// `output wire', which is why AUTOREG leaves it alone: a net-type
+// keyword already on the port means there is nothing left to add.
 
 `timescale 1ns / 1ps
 
@@ -25,8 +32,13 @@ module gray_ctr (
   input clk;
   input rst_n;
   input en;
-  output reg [WIDTH-1:0] bin_count;
+  output [WIDTH-1:0] bin_count;
   output wire [WIDTH-1:0] gray_count;
+
+  /*AUTOREG*/
+  // Beginning of automatic regs (for this module's undeclared outputs)
+  reg [WIDTH-1:0] bin_count;
+  // End of automatics
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin

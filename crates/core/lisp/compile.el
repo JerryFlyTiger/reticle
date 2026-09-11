@@ -612,6 +612,16 @@ needed a from-scratch rewrite instead of reuse)."
           (define-key map "n" 'compile-next-error)
           (define-key map "p" 'compile-previous-error)
           (define-key map "RET" 'compile-goto-error-at-point)
+          ;; M130: `j'/`k' are plain cursor motion (`next-line'/
+          ;; `previous-line'), deliberately NOT the same as `n'/`p' --
+          ;; `n'/`p' here jump to the NEXT/PREVIOUS parsed error's
+          ;; location, while vim's `j'/`k' just move the cursor one
+          ;; line. `gg' is deliberately not bound anywhere in this
+          ;; milestone -- see dired.el's header note for the mechanical
+          ;; reason (`g' collision risk in `Keymap::define-sequence').
+          (define-key map "j" 'next-line)
+          (define-key map "k" 'previous-line)
+          (define-key map "G" 'end-of-buffer)
           (use-local-map map))))
     buf))
 

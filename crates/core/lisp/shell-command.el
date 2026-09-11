@@ -242,6 +242,14 @@ decide separately whether to display it (see `shell-command--maybe-show')."
         (major-mode-internal-set 'shell-command-mode)
         (let ((map (make-sparse-keymap)))
           (define-key map "q" 'quit-source-return)
+          ;; M130: without these, `j'/`k' would self-insert literal
+          ;; characters into this buffer's shown output. `gg' is
+          ;; deliberately not bound anywhere in this milestone -- see
+          ;; dired.el's header note for the mechanical reason (`g'
+          ;; collision risk in `Keymap::define-sequence').
+          (define-key map "j" 'next-line)
+          (define-key map "k" 'previous-line)
+          (define-key map "G" 'end-of-buffer)
           (use-local-map map))))
     buf))
 

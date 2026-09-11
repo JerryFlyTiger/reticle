@@ -18,7 +18,7 @@
 # 13.0 also does not support ("Errors in port declarations.").
 #
 # Exits non-zero if any simulation fails to build, fails to print its
-# PASS line, or exits non-zero, and non-zero if fewer than 3
+# PASS line, or exits non-zero, and non-zero if fewer than 4
 # simulations actually ran -- a discovery mechanism that silently runs
 # nothing must not be able to report success.
 #
@@ -103,6 +103,13 @@ run_one "rtl-verilog2001/gray_ctr" "$work_dir/gray_ctr.vvp" \
   "$demo_root/rtl-verilog2001/gray_ctr.v" \
   "$demo_root/rtl-verilog2001/gray_ctr_tb.v" || true
 
+run_one "rtl-verilog2001/fifo_gray_top" "$work_dir/fifo_gray_top.vvp" \
+  iverilog -o "$work_dir/fifo_gray_top.vvp" \
+  "$demo_root/rtl-verilog2001/fifo_sync.v" \
+  "$demo_root/rtl-verilog2001/gray_ctr.v" \
+  "$demo_root/rtl-verilog2001/fifo_gray_top.v" \
+  "$demo_root/rtl-verilog2001/fifo_gray_top_tb.v" || true
+
 run_one "verif/sram_bank_tb" "$work_dir/sram_bank_tb.vvp" \
   iverilog -g2012 -DSOC_SVA_OFF -DSOC_COVERAGE_OFF \
   -I "$demo_root/rtl/include" \
@@ -115,9 +122,9 @@ run_one "verif/sram_bank_tb" "$work_dir/sram_bank_tb.vvp" \
   "$demo_root/verif/soc_verif_pkg.sv" \
   "$demo_root/verif/sram_bank_tb.sv" || true
 
-if [[ $ran -lt 3 ]]; then
+if [[ $ran -lt 4 ]]; then
   echo
-  echo "only $ran/3 simulation(s) actually ran and passed -- treating as failure" >&2
+  echo "only $ran/4 simulation(s) actually ran and passed -- treating as failure" >&2
   exit 1
 fi
 

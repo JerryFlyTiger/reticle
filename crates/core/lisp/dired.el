@@ -28,6 +28,39 @@
 ;; - SRC and DST must be on the same side (both local, or the same
 ;;   remote host); `copy-file'/`rename-file' (files.rs) error cleanly
 ;;   otherwise.
+;; - M130: `j'/`k'/`G' (vim-style line motion) are bound alongside `n'/
+;;   `p', but `gg' (jump to first line) is NOT, in any of the FIVE
+;;   emacs-state modes this milestone actually bound them in (dired-mode,
+;;   help-mode, shell-command-mode, compilation-mode, search-mode) -- not
+;;   just here. The reason is mechanical, not a judgment call: `Keymap'
+;;   stores one Value per key (keymap.rs), and `Keymap::define-sequence'
+;;   silently OVERWRITES an existing single-key binding with a fresh
+;;   empty sub-keymap when a longer sequence sharing that prefix is
+;;   defined (no error, no warning). `g' here is already bound to
+;;   `dired-revert' (a GNU-parity binding), so `(define-key map "g g"
+;;   ...)' would silently delete `dired-revert' with no way to notice
+;;   short of testing for its disappearance. The other four modes' `g'
+;;   is unbound, so `gg' would "work" there -- but "`gg' functions in
+;;   four modes and not in dired" is worse than "`gg' is absent
+;;   everywhere," so it is left out uniformly instead.
+;;   `search-edit-mode', `eshell-mode', and `ielm-mode' are ALSO on
+;;   `evil-emacs-state-modes' (evil.el) and also writable, but M130
+;;   deliberately did NOT bind `j'/`k'/`G' in any of the three (fix
+;;   round FIX-1 removed `search-edit-mode' from the original five-plus-
+;;   one after cold review: it had been bound there in the first draft,
+;;   which was wrong). The test that decides this is "is this buffer's
+;;   PURPOSE to be typed into," never "is it read-only" -- `*compilation*'
+;;   and the shell-command output buffer are also writable in the Rust
+;;   sense and still get the bindings, because nothing about their
+;;   purpose involves typing. `search-edit-mode' is M83's wgrep-level
+;;   editable search results: free typing that gets written back to the
+;;   real source files verbatim (`search-edit-apply') is its entire
+;;   purpose, exactly like `eshell-mode'/`ielm-mode' being REPLs where
+;;   typing a command that happens to contain `j'/`k'/`G' at the prompt
+;;   is normal, expected input. Binding those letters to motion in any
+;;   of the three would silently eat them out of ordinary typing --
+;;   Verilog identifiers routinely contain `j'/`k' (`clk', `jtag',
+;;   `join_none').
 ;;
 ;; M68: buffer identity, quit target, and cursor landing.
 ;; - Buffer identity: `dired' used to hand a bare NAME (the directory's
@@ -196,6 +229,12 @@ creating or aliasing onto a buffer picked by name."
       (define-key map "D" 'dired-do-delete)
       (define-key map "C" 'dired-do-copy)
       (define-key map "R" 'dired-do-rename)
+      (define-key map "j" 'next-line)
+      (define-key map "k" 'previous-line)
+      ;; M130 fix round FIX-2: `dired-goto-last-entry', not `end-of-
+      ;; buffer' -- see that function's own doc comment for why a plain
+      ;; end-of-buffer lands one line PAST the last real entry here.
+      (define-key map "G" 'dired-goto-last-entry)
       (use-local-map map))
     (setq-local dired--dir dir)
     (setq-local dired--files nil)
@@ -345,6 +384,31 @@ so this never walks `forward-line' past the last real row into nothing."
   (goto-char (point-min))
   (if (> (length dired--files) 2)
       (forward-line (+ dired--header-lines 2))
+    (forward-line dired--header-lines)))
+
+(defun dired-goto-last-entry ()
+  "Move point to the LAST real entry in the listing (M130's `G' binding).
+Addresses the SAME mechanical problem `dired--goto-first-real-entry'
+addresses at the other end of the listing, but the two do NOT land on
+the same row when the directory is empty -- see below. Every row
+`dired-insert-listing' emits, including the last one, ends in its own
+\"\\n\" (files.rs's `list_dir'), so a plain `end-of-buffer' lands on
+the empty line PAST the last real row, where `dired--entry-at-point'
+computes a row index one past the end of `dired--files' and returns
+nil (\"No file on this line\" from every command that reads it). This
+goes to `(1- (length dired--files))' rows past the header instead --
+the last row, not past it. `dired--files' always lists \".\" and \"..\"
+even in an empty directory (see that function's own doc comment), so
+on an empty directory (only \".\"/\"..\" present, length 2) this lands
+on the SECOND of the two, \"..\" -- one row PAST where
+`dired--goto-first-real-entry' lands in that same case (its own
+\"only \".\"/\"..\" present\" branch stops at the FIRST of the two,
+\".\"): the two functions land on different rows here by design, one
+at each end of the listing, not on the same row."
+  (interactive)
+  (goto-char (point-min))
+  (if dired--files
+      (forward-line (+ dired--header-lines (1- (length dired--files))))
     (forward-line dired--header-lines)))
 
 (defun dired--goto-name (name)

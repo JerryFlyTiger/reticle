@@ -126,6 +126,25 @@ fn set_client_command(interp: &mut Interp, command: &str) {
     );
 }
 
+fn set_client_root(interp: &mut Interp, root: &std::path::Path) {
+    ok(
+        interp,
+        &format!(
+            "(setf (lsp--client-root client) {:?})",
+            root.to_str().unwrap()
+        ),
+    );
+}
+
+fn stub_read_string_returning(interp: &mut Interp, value: &str) {
+    ok(
+        interp,
+        &format!(
+            "(fset 'read-string (lambda (prompt callback &optional initial) (funcall callback {value:?})))"
+        ),
+    );
+}
+
 fn invoke_captured_callback(interp: &mut Interp, reply_json: &str) {
     ok(
         interp,
@@ -204,9 +223,22 @@ fn empty_result_non_verilog_file_shows_plain_message_no_picker() {
     ok(&mut i, "(lsp-references-at-point)");
     invoke_captured_callback(&mut i, "[]");
 
+    // M131: even a non-Verilog file's empty answer now names the root
+    // that was actually used, so a narrow/misrooted answer is never
+    // silently indistinguishable from "genuinely no references". Exact
+    // comparison, same shape as 3 of its 4 sibling
+    // `empty_result_verilog_file_*' tests below -- a dynamic root
+    // still allows an exact match, and a loose `contains'-only check
+    // would miss stray text appended after the root. (The 4th sibling,
+    // `..._no_filelist_verible_command_names_verible_filelist_and_
+    // root', uses `assert!(...contains...)' instead, checking the
+    // `verible.filelist' clause and the root as two separate
+    // substrings rather than one exact string.)
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
     assert_eq!(
         run(&mut i, "(car test--messages)"),
-        "\"No references found\""
+        format!("\"No references found (project root: {})\"", root)
     );
 }
 
@@ -258,21 +290,25 @@ fn empty_result_verilog_file_names_the_filelist_ancestor_not_the_nearer_git() {
     ok(&mut i, "(lsp-references-at-point)");
     invoke_captured_callback(&mut i, "[]");
 
-    // The buffer's directory (`sub') is a naive nearest-marker walk's
-    // answer; the actually-used root is `dir' itself, and the filelist
-    // lives directly in it -- so verible.filelist WAS found, and the
-    // message must fall back to the plain "No references found", not
-    // the "no verible.filelist in ..." clause (which would be a lie:
-    // the file is right there in the root that was actually used).
-    let msg = run(&mut i, "(car test--messages)");
-    assert_eq!(msg, "\"No references found\"", "got {msg:?}");
-
     let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
     let root: String = root.trim_matches('"').to_string();
     assert_eq!(
         root,
         dir.to_str().unwrap(),
         "lsp--project-root should have resolved to the filelist ancestor, not the nearer .git"
+    );
+
+    // The buffer's directory (`sub') is a naive nearest-marker walk's
+    // answer; the actually-used root is `dir' itself, and the filelist
+    // lives directly in it -- so verible.filelist WAS found, and the
+    // message must name `dir' (M131) with no "no verible.filelist in
+    // ..." clause (which would be a lie: the file is right there in
+    // the root that was actually used), not the nearer `sub'.
+    let msg = run(&mut i, "(car test--messages)");
+    assert_eq!(
+        msg,
+        format!("\"No references found (project root: {})\"", root),
+        "got {msg:?}"
     );
 }
 
@@ -290,9 +326,11 @@ fn empty_result_verilog_file_with_filelist_shows_plain_message() {
     ok(&mut i, "(lsp-references-at-point)");
     invoke_captured_callback(&mut i, "[]");
 
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
     assert_eq!(
         run(&mut i, "(car test--messages)"),
-        "\"No references found\""
+        format!("\"No references found (project root: {})\"", root)
     );
 }
 
@@ -313,8 +351,14 @@ fn empty_result_verilog_file_no_filelist_slang_command_shows_plain_message() {
     ok(&mut i, "(lsp-references-at-point)");
     invoke_captured_callback(&mut i, "[]");
 
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
     let msg = run(&mut i, "(car test--messages)");
-    assert_eq!(msg, "\"No references found\"", "got {msg:?}");
+    assert_eq!(
+        msg,
+        format!("\"No references found (project root: {})\"", root),
+        "got {msg:?}"
+    );
     assert!(
         !msg.to_lowercase().contains("verible"),
         "a slang-server client's empty-result message must never mention verible, got {msg:?}"
@@ -336,8 +380,14 @@ fn empty_result_verilog_file_no_filelist_nil_command_shows_plain_message() {
     ok(&mut i, "(lsp-references-at-point)");
     invoke_captured_callback(&mut i, "[]");
 
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
     let msg = run(&mut i, "(car test--messages)");
-    assert_eq!(msg, "\"No references found\"", "got {msg:?}");
+    assert_eq!(
+        msg,
+        format!("\"No references found (project root: {})\"", root),
+        "got {msg:?}"
+    );
 }
 
 #[test]
@@ -820,4 +870,449 @@ fn malformed_plus_one_valid_still_jumps_directly_no_picker() {
     // "world" starts at buffer position 7 (1-based) -- the single valid
     // entry's own direct-jump path must still fire, not the picker.
     assert_eq!(run(&mut i, "(point)"), "7");
+}
+
+// ============================================================
+// M131: the project-root label -- success/empty/rename -- and the
+// outside-root advisory sweep.
+// ============================================================
+
+#[test]
+fn references_success_message_names_the_root_actually_sent() {
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("success_names_root");
+    let file_t = write_file(&dir, "t.sv", "hello world\n");
+    write_file(&dir, "other.sv", "second reference here\n");
+    setup_client_buffer(&mut i, &file_t);
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(&mut i, "(setq test--cr-args nil)");
+    ok(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (setq test--cr-args (list prompt collection require-match))
+                 (funcall callback (car collection))))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri_t = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let uri_other = run(
+        &mut i,
+        &format!(
+            "(lsp--path-to-uri {:?})",
+            dir.join("other.sv").to_str().unwrap()
+        ),
+    );
+    let reply = format!(
+        "[{{\"uri\":{uri_t},\"range\":{{\"start\":{{\"line\":0,\"character\":6}},\"end\":{{\"line\":0,\"character\":11}}}}}},\
+          {{\"uri\":{uri_other},\"range\":{{\"start\":{{\"line\":0,\"character\":7}},\"end\":{{\"line\":0,\"character\":16}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let root: String = root.trim_matches('"').to_string();
+    let prompt = run(&mut i, "(nth 0 test--cr-args)");
+    assert!(
+        prompt.contains("2 reference"),
+        "expected the reference/file count in the picker prompt, got {prompt:?}"
+    );
+    assert!(
+        prompt.contains(&format!("project root: {}", root)),
+        "expected the actual root {root:?} in the picker prompt, got {prompt:?}"
+    );
+}
+
+#[test]
+fn references_root_label_uses_the_clients_stored_root_not_a_recomputation() {
+    // The client's own STORED root (`lsp--client-root', M131 Part A)
+    // deliberately differs from what a FRESH `lsp--project-root' call
+    // for FILE would compute right now -- simulating a connection whose
+    // `rootUri' was decided once, at `lsp-connect' time, and then
+    // reused via `lsp--connections''s own `(COMMAND . ROOT)' key
+    // (`lsp--get-connection') for as long as the connection lives. The
+    // label must show the value ACTUALLY SENT to the server, never a
+    // value recomputed after the fact.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("root_label_actual_a");
+    let stored_root_dir = scratch_dir("root_label_stored_b");
+    let file = write_file(&dir, "t.sv", "hello world\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &stored_root_dir);
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(
+        &mut i,
+        "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":6}},\"end\":{{\"line\":0,\"character\":11}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let computed_root = run(&mut i, "(lsp--project-root (buffer-file-name))");
+    let computed_root: String = computed_root.trim_matches('"').to_string();
+    assert_ne!(
+        computed_root,
+        stored_root_dir.to_str().unwrap(),
+        "test setup must actually diverge -- otherwise this test can't tell the two apart"
+    );
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        msg.contains(stored_root_dir.to_str().unwrap()),
+        "expected the client's own STORED root, got {msg:?}"
+    );
+    assert!(
+        !msg.contains(&computed_root),
+        "must not silently fall back to a freshly recomputed root, got {msg:?}"
+    );
+}
+
+#[test]
+fn references_reports_verilog_files_outside_the_root_that_contain_the_name() {
+    // repo/ (`.git' -- `search--find-root''s own scan boundary)
+    //   proj/t.sv    -- the LSP project root actually used, contains
+    //                   the symbol and is the only file in the reply.
+    //   other/other.sv -- OUTSIDE proj, also mentions the same text,
+    //                     but the (stubbed) server never reported it.
+    let (mut i, _ed) = setup();
+    let repo = scratch_dir("outside_sweep_repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let proj = repo.join("proj");
+    let file = write_file(&proj, "t.sv", "WidgetName37 foo\n");
+    write_file(&repo.join("other"), "other.sv", "WidgetName37 bar\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &proj);
+    ok(&mut i, "(goto-char 1)"); // point is on "WidgetName37"
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(
+        &mut i,
+        "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":12}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        msg.contains("1 Verilog file"),
+        "expected the outside-root sweep to report exactly one file, got {msg:?}"
+    );
+    assert!(
+        msg.contains("WidgetName37"),
+        "expected the swept-for symbol named in the message, got {msg:?}"
+    );
+    assert!(
+        msg.contains("search-project"),
+        "expected the search-project escape hatch named, got {msg:?}"
+    );
+}
+
+#[test]
+fn references_outside_root_sweep_does_not_run_for_non_verilog_buffers() {
+    // FIX-8 (M131 fix round): the QUERYING buffer here is `t.rs', not
+    // Verilog -- `lsp--verilog-buffer-p' must gate the sweep off
+    // entirely, even though the outside file below is real, is `.sv',
+    // and genuinely does contain the swept-for text (same shape as
+    // `references_reports_verilog_files_outside_the_root_that_contain_
+    // the_name' above, but for a non-Verilog querying buffer). Without
+    // the gate this would report "1 Verilog file..." despite the
+    // symbol itself being a Rust identifier, not Verilog at all.
+    let (mut i, _ed) = setup();
+    let repo = scratch_dir("outside_sweep_non_verilog_buffer");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let proj = repo.join("proj");
+    let file = write_file(&proj, "t.rs", "RustIdentifier55 foo\n");
+    write_file(&repo.join("other"), "other.sv", "RustIdentifier55 bar\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &proj);
+    ok(&mut i, "(goto-char 1)"); // point is on "RustIdentifier55"
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(
+        &mut i,
+        "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":16}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        !msg.contains("Verilog file"),
+        "a non-Verilog querying buffer must never run the outside-root sweep \
+         at all, even when a real matching Verilog file exists outside the \
+         root, got {msg:?}"
+    );
+}
+
+#[test]
+fn references_outside_root_sweep_ignores_non_verilog_files() {
+    // Same shape as the test above, except the OUTSIDE file this time
+    // is `.md'/`.py'/`.el'/`.rs' -- none of them Verilog, all of them
+    // must be excluded from the sweep's own count.
+    let (mut i, _ed) = setup();
+    let repo = scratch_dir("outside_sweep_non_verilog");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let proj = repo.join("proj");
+    let file = write_file(&proj, "t.sv", "GadgetXyz99 foo\n");
+    write_file(&repo.join("other"), "notes.md", "GadgetXyz99 in prose\n");
+    write_file(&repo.join("other"), "gen.py", "# GadgetXyz99\n");
+    write_file(&repo.join("other"), "helper.el", ";; GadgetXyz99\n");
+    write_file(&repo.join("other"), "tests.rs", "// GadgetXyz99\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &proj);
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(
+        &mut i,
+        "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":11}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        !msg.contains("Verilog file"),
+        "no Verilog file exists outside the root -- the .md/.py/.el/.rs \
+         hits must not be counted, got {msg:?}"
+    );
+}
+
+#[test]
+fn references_outside_root_sweep_never_adds_entries_to_the_result_list() {
+    // The outside-root sweep is advisory-only text: even though
+    // `other/other.sv' textually contains the same identifier, it must
+    // NEVER show up as a candidate in the picker's own COLLECTION --
+    // only the server's actual reply may do that.
+    let (mut i, _ed) = setup();
+    let repo = scratch_dir("outside_sweep_never_pollutes_list");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let proj = repo.join("proj");
+    let file_a = write_file(&proj, "a.sv", "ThingCounter7 x\n");
+    write_file(&proj, "b.sv", "ThingCounter7 y\n");
+    write_file(&repo.join("other"), "other.sv", "ThingCounter7 z\n");
+    setup_client_buffer(&mut i, &file_a);
+    set_client_root(&mut i, &proj);
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(&mut i, "(setq test--cr-args nil)");
+    ok(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (setq test--cr-args (list prompt collection require-match))
+                 (funcall callback (car collection))))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri_a = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let uri_b = run(
+        &mut i,
+        &format!(
+            "(lsp--path-to-uri {:?})",
+            proj.join("b.sv").to_str().unwrap()
+        ),
+    );
+    let reply = format!(
+        "[{{\"uri\":{uri_a},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":13}}}}}},\
+          {{\"uri\":{uri_b},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":13}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let collection = run(&mut i, "(nth 1 test--cr-args)");
+    assert!(
+        !collection.contains("other.sv"),
+        "the text-only outside-root hit must never appear in the actual \
+         candidate list, got {collection:?}"
+    );
+    let msg = run(&mut i, "(nth 0 test--cr-args)");
+    assert!(
+        msg.contains("1 Verilog file"),
+        "the sweep's own advisory count must still appear in the prompt, got {msg:?}"
+    );
+}
+
+#[test]
+fn references_symbol_at_point_includes_dollar_for_system_functions() {
+    // FIX-2 (M131 fix round): `lsp--symbol-at-point' now reuses
+    // `verilog-complete--ident-char-p' (`verilog-complete.el'), which
+    // treats `$' as an identifier character -- SystemVerilog allows it
+    // inside a simple identifier, and every system function/task
+    // (`$clog2', `$bits', `$signed', ...) starts with one. Point on
+    // `$clog2' below must sweep for the FULL `$clog2', never the
+    // truncated `clog2' a plain `[A-Za-z0-9_]' class would produce.
+    let (mut i, _ed) = setup();
+    let repo = scratch_dir("symbol_dollar_sysfunc");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let proj = repo.join("proj");
+    let file = write_file(&proj, "t.sv", "$clog2(WIDTH)\n");
+    write_file(&repo.join("other"), "other.sv", "$clog2(DEPTH)\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &proj);
+    ok(&mut i, "(goto-char 3)"); // inside "$clog2", on the "c"
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+    ok(
+        &mut i,
+        "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+    );
+
+    ok(&mut i, "(lsp-references-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":6}}}}}}]"
+    );
+    invoke_captured_callback(&mut i, &reply);
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        msg.contains("1 Verilog file"),
+        "expected the outside file found via the FULL \"$clog2\" (proving `$' \
+         was treated as part of the identifier), got {msg:?}"
+    );
+}
+
+#[test]
+fn references_symbol_at_point_expands_from_the_middle_or_end_of_the_identifier() {
+    // FIX-4 (M131 fix round): every outside-root-sweep test above put
+    // point at buffer position 1 -- the identifier's own LEFTMOST
+    // character -- so `lsp--symbol-at-point''s backward-expansion loop
+    // ((while (verilog-complete--ident-char-p (char-before))
+    // (backward-char))) ran ZERO iterations in every one of them. Point
+    // sitting in the MIDDLE, or right at the END, of an identifier --
+    // the common real-world `M-?' invocation -- is what actually
+    // exercises that loop. "MidEndIdent12" spans buffer positions 1-13
+    // (1-based); position 7 sits in the middle (both loops run),
+    // position 14 sits one past the last character (only the backward
+    // loop runs; the forward loop sees the following space and stops
+    // immediately) -- the exact opposite split from every test above.
+    for point in [7, 14] {
+        let (mut i, _ed) = setup();
+        let repo = scratch_dir(&format!("symbol_mid_end_{point}"));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let proj = repo.join("proj");
+        let file = write_file(&proj, "t.sv", "MidEndIdent12 foo\n");
+        write_file(&repo.join("other"), "other.sv", "MidEndIdent12 bar\n");
+        setup_client_buffer(&mut i, &file);
+        set_client_root(&mut i, &proj);
+        ok(&mut i, &format!("(goto-char {point})"));
+        capture_messages(&mut i);
+        capture_request_async(&mut i);
+        ok(
+            &mut i,
+            "(fset 'completing-read (lambda (&rest _) (error \"picker must not open\")))",
+        );
+
+        ok(&mut i, "(lsp-references-at-point)");
+        let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+        let reply = format!(
+            "[{{\"uri\":{uri},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":13}}}}}}]"
+        );
+        invoke_captured_callback(&mut i, &reply);
+
+        let msg = run(&mut i, "(car test--messages)");
+        assert!(
+            msg.contains("1 Verilog file"),
+            "point={point}: expected the outside file actually found -- this only \
+             happens if `lsp--symbol-at-point' recovered the FULL identifier \
+             \"MidEndIdent12\", not a truncated substring, got {msg:?}"
+        );
+    }
+}
+
+#[test]
+fn references_empty_message_names_the_root_for_a_non_verible_server() {
+    // Death-code fix: the OLD three-way gate required COMMAND to name
+    // verible before naming the root at ALL -- so a non-verible server
+    // (slang-server, or any other) got nothing but the bare "No
+    // references found", even though ROOT is exactly as useful (or
+    // misleading) regardless of which server answered. Uses a root
+    // that diverges from `lsp--project-root' (M131 Part A), so this
+    // also confirms the empty path reads the STORED root, not a
+    // recomputed one.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("empty_names_root_other_server");
+    let stored_root_dir = scratch_dir("empty_names_root_other_server_stored");
+    let file = write_file(&dir, "t.sv", "module t; endmodule\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_command(&mut i, "slang-server");
+    set_client_root(&mut i, &stored_root_dir);
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+
+    ok(&mut i, "(lsp-references-at-point)");
+    invoke_captured_callback(&mut i, "[]");
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        msg.contains(stored_root_dir.to_str().unwrap()),
+        "expected the client's own stored root named, got {msg:?}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("verible"),
+        "a non-verible server's empty message must never mention verible, got {msg:?}"
+    );
+}
+
+#[test]
+fn rename_skipped_message_names_the_root() {
+    // `lsp-rename''s own safety valve applies only to the current
+    // buffer's edits and reports how many it skipped in other files
+    // (`lsp.el''s `lsp-rename', "also skipped N edit(s)..." /
+    // "touches other file(s) only" messages) -- that count is built
+    // from a single buffer's own connection, which can be scoped
+    // narrower than the real project, so an undercount must at least
+    // be visible: the root actually used has to be named.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("rename_skip_names_root");
+    let stored_root_dir = scratch_dir("rename_skip_names_root_stored");
+    let file = write_file(&dir, "foo.sv", "foo foo\n");
+    setup_client_buffer(&mut i, &file);
+    set_client_root(&mut i, &stored_root_dir);
+    ok(&mut i, "(goto-char 1)");
+    stub_read_string_returning(&mut i, "bar");
+    capture_messages(&mut i);
+    capture_request_async(&mut i);
+
+    ok(&mut i, "(lsp-rename)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "{{\"changes\":{{\
+           {uri}:[{{\"newText\":\"bar\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":3}}}}}}],\
+           \"file:///elsewhere/other.sv\":[{{\"newText\":\"x\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}]\
+         }}}}"
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 test--captured) (json-parse-string {reply:?}))"),
+    );
+
+    let msg = run(&mut i, "(car test--messages)");
+    assert!(
+        msg.contains(stored_root_dir.to_str().unwrap()),
+        "expected the client's own stored root named in the rename skip message, got {msg:?}"
+    );
 }

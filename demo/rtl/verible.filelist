@@ -10,8 +10,10 @@ pkg/soc_pkg.sv
 core/alu.sv
 core/regfile.sv
 core/clk_gate.sv
+core/status_regs_stub.sv
 mem/sram_wrapper.sv
 mem/sram_bank.sv
+mem/sram_dual_channel.sv
 bus/axi4_lite_arbiter.sv
 bus/axi4_lite_if.sv
 top/soc_top.sv

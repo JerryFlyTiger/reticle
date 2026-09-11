@@ -469,7 +469,7 @@
                           ; stub), NOT "capabilities known to be empty"; see
                           ; `lsp--capability-supported-p''s own docstring for
                           ; why that distinction matters.
-  command)                ; M59: the server COMMAND string `lsp-connect' was
+  command                 ; M59: the server COMMAND string `lsp-connect' was
                           ; called with (e.g. "verible-verilog-ls"), or nil
                           ; for a client predating this field (or a test's
                           ; `make-lsp--client' stub) -- lets a caller tell
@@ -480,6 +480,23 @@
                           ; major mode, which only says the LANGUAGE, not
                           ; which of possibly several configured servers
                           ; for it (`lsp-server-alist') is actually running.
+  root)                   ; M131: the ROOT-PATH string `lsp-connect'/the
+                          ; autostart path actually sent as this
+                          ; connection's own `rootUri', or nil for a client
+                          ; predating this field (or a test's
+                          ; `make-lsp--client' stub). Deliberately NOT "call
+                          ; `lsp--project-root' again when you need it": a
+                          ; connection is looked up and reused by
+                          ; `lsp--connections''s `(COMMAND . ROOT)' key
+                          ; (`lsp--get-connection'), so the root a LIVE
+                          ; connection is actually rooted at can differ from
+                          ; whatever `lsp--project-root' would compute for
+                          ; some file RIGHT NOW -- displaying a freshly
+                          ; recomputed value would show the user a root
+                          ; that was never the one actually sent to the
+                          ; server, which is worse than not showing one at
+                          ; all. See `lsp--client-root-or-computed', the
+                          ; only sanctioned way to read this for display.
 
 ;; Every live client, so the editor's idle tick can pump all of them
 ;; without the user threading handles around (M15).
@@ -1172,7 +1189,7 @@ would otherwise succeed (cwd unset, inherited from the editor) into one
 that fails outright."
   (let* ((conn (lsp-start command args
                           (and root-path (file-directory-p root-path) root-path)))
-         (client (make-lsp--client :conn conn :command command)))
+         (client (make-lsp--client :conn conn :command command :root root-path)))
     (condition-case err
         (let* ((id (lsp--request
                     client "initialize"
@@ -2174,15 +2191,27 @@ previously refused."
                    (t
                     (let* ((this-uri (lsp--path-to-uri (buffer-file-name)))
                            (other (lsp--workspace-edit-other-uris result this-uri))
-                           (n (lsp--apply-workspace-edit-for-buffer result)))
+                           (n (lsp--apply-workspace-edit-for-buffer result))
+                           ;; M131: the skipped-edit count above is
+                           ;; built from THIS buffer's own connection
+                           ;; only (the v1 safety valve this function's
+                           ;; own docstring describes), which is scoped
+                           ;; to a narrower root than the actual RTL
+                           ;; project can be -- so a low skip count can
+                           ;; itself be an undercount. Naming the root
+                           ;; makes that undercount visible instead of
+                           ;; silent, same reasoning as the references
+                           ;; root label above.
+                           (root (lsp--client-root-or-computed client (buffer-file-name))))
                       (cond
                        ((and (not n) other)
-                        (message "lsp: rename touches other file(s) only, not applied (v1 limitation)"))
+                        (message "lsp: rename touches other file(s) only, not applied (v1 limitation; project root: %s)"
+                                 root))
                        ((not n)
                         (message "Rename not available here"))
                        (other
-                        (message "Renamed %d occurrence(s) here (also skipped %d edit(s) in other file(s))"
-                                 n (length other)))
+                        (message "Renamed %d occurrence(s) here (also skipped %d edit(s) in other file(s); project root: %s)"
+                                 n (length other) root))
                        (t
                         (message "Renamed %d occurrence(s)" n)))))))))))))))))
 
@@ -2598,6 +2627,28 @@ in `verilog-auto.el' and is not this function's job."
                               (lsp--nearest-filelist-root start)))
          (found (or filelist-root (lsp--nearest-marker-root start))))
     (directory-file-name (or found start))))
+
+(defun lsp--client-root-or-computed (client file)
+  "The ROOT to label CLIENT's own answers with (M131): CLIENT's stored
+`lsp--client-root' when it has one, else `lsp--project-root' on FILE.
+
+The fallback exists only for a client that predates the `root' field
+-- a hand-built test fixture (`make-lsp--client' with no `:root'), or
+in principle a live client from before this milestone -- and matches
+`lsp--project-root's own answer for a FILE in the same project a real
+`lsp-connect'/autostart call would have used, so the label is at worst
+a recomputation, never wrong by construction.
+
+For every client `lsp-connect' or the M88 autostart path actually
+produced, though, CLIENT's stored root -- the exact ROOT-PATH string
+sent as this connection's `rootUri' -- is used AS IS, deliberately
+never recomputed here: `lsp--connections' reuses a live connection by
+its `(COMMAND . ROOT)' key, so \"what would `lsp--project-root' return
+for FILE right now\" is not guaranteed to equal \"what ROOT was this
+connection actually given at `initialize' time\", and a label built
+from the former would describe a root the server was never told
+about."
+  (or (lsp--client-root client) (lsp--project-root file)))
 
 ;; --- Connecting: M-x lsp ---
 
@@ -3925,7 +3976,7 @@ succeed into a failure."
   (condition-case err
       (let* ((conn (lsp-start command args
                               (and (file-directory-p root) root)))
-             (client (make-lsp--client :conn conn :command command)))
+             (client (make-lsp--client :conn conn :command command :root root)))
         (setq lsp--clients (cons client lsp--clients))
         (lsp-request-async
          client "initialize"
@@ -5506,35 +5557,51 @@ docstring) means \"don't know\", treated as NOT verible: silence over a
 wrong guess."
   (and command (string-match-p "verible" (file-name-nondirectory command)) t))
 
-(defun lsp--references-empty-message (file command)
+(defun lsp--references-empty-message (file command root)
   "The `message' `lsp-references-at-point' shows for an empty/absent
 `textDocument/references' reply against FILE (the querying buffer's own
 `buffer-file-name') from a client started with COMMAND (its
-`lsp--client-command'). Always starts with \"No references found\";
-when FILE is Verilog-family (`lsp--verilog-buffer-p'), AND COMMAND
-names a verible binary (`lsp--verible-command-p'), AND the project root
-(`lsp--project-root') has no `verible.filelist' file directly in it, a
-second clause names both facts -- verible-verilog-ls answers `[]'
-unconditionally without one, a real-server finding surprising enough
-(even a same-file, same-buffer reference comes back empty) that v1
-treats it as worth surfacing rather than leaving the plain \"No
-references found\" to imply the query genuinely has no references.
+`lsp--client-command') and actually rooted at ROOT
+(`lsp--client-root-or-computed', NOT a fresh `lsp--project-root' call
+-- see that function's own docstring for why the distinction matters).
 
-Reviewer round fix: the first version of this function gated only on
-FILE being Verilog-family, so a `.sv' buffer connected to slang-server
-(also first-class per `lsp-server-alist''s own docstring) got told to
-add a `verible.filelist' -- naming the wrong tool AND the wrong fix,
-since slang-server's own empty-cross-file-reference failure mode is a
-missing `.slang' project-root marker, unrelated to `verible.filelist'
-entirely. A COMMAND that doesn't name verible (or is nil, unknown)
-never adds the clause."
-  (let ((base "No references found"))
-    (if (and (lsp--verilog-buffer-p file) (lsp--verible-command-p command))
-        (let ((root (lsp--project-root file)))
-          (if (file-exists-p (expand-file-name "verible.filelist" root))
-              base
-            (format "%s (no verible.filelist in %s; verible only answers for files listed there)"
-                    base root)))
+Always names ROOT -- M131: an empty answer with no stated scope reads
+as \"this symbol genuinely has no references\", when it may just as
+well mean \"the server was asked about a narrower project than you
+think\", and the only way to tell those apart is to say what the
+narrower project actually was.
+
+When FILE is Verilog-family (`lsp--verilog-buffer-p') AND COMMAND names
+a verible binary (`lsp--verible-command-p') AND ROOT has no
+`verible.filelist' file directly in it, an ADDITIONAL clause names that
+too -- verible-verilog-ls answers `[]' unconditionally without one, a
+real-server finding surprising enough (even a same-file, same-buffer
+reference comes back empty) that v1 treats it as worth surfacing on
+top of the ROOT clause every other case already gets.
+
+Reviewer round fix (pre-M131): the first version of this function
+gated only on FILE being Verilog-family, so a `.sv' buffer connected to
+slang-server (also first-class per `lsp-server-alist''s own docstring)
+got told to add a `verible.filelist' -- naming the wrong tool AND the
+wrong fix, since slang-server's own empty-cross-file-reference failure
+mode is a missing `.slang' project-root marker, unrelated to
+`verible.filelist' entirely. A COMMAND that doesn't name verible (or is
+nil, unknown) never adds the verible-specific clause.
+
+M131 note: this function used to ALSO require \"ROOT has no
+verible.filelist\" before naming ROOT at all -- structurally dead,
+since `lsp-references-at-point' routes every call here through
+`lsp--preferred-role-client', which always prefers a capable secondary
+(slang-server for Verilog) over verible for `textDocument/references'
+(see that function's own M95 note), so COMMAND naming verible on this
+path never actually happens in practice; ROOT is now always stated
+regardless of COMMAND or FILE."
+  (let ((base (format "No references found (project root: %s)" root)))
+    (if (and (lsp--verilog-buffer-p file)
+             (lsp--verible-command-p command)
+             (not (file-exists-p (expand-file-name "verible.filelist" root))))
+        (format "%s; no verible.filelist there -- verible only answers for files listed there"
+                base)
       base)))
 
 (defun lsp--relative-path (file root)
@@ -5669,6 +5736,203 @@ two DISPLAY strings can ever collide."
                     ((/= la lb) (< la lb))
                     (t (< ca cb))))))))
 
+(defun lsp--reference-alist-file-count (alist)
+  "Number of distinct PATHs among ALIST's entries (an
+`lsp--reference-alist' return value, sorted by PATH already), for the
+\"N references in M files\" summary in `lsp--references-summary'. Walks
+the already-sorted list comparing each entry's path only against the
+immediately preceding one -- correct exactly because ALIST is sorted by
+PATH first (`lsp--reference-alist''s own docstring), so every run of
+entries sharing one PATH is contiguous."
+  (let ((prev nil) (n 0))
+    (dolist (entry alist n)
+      (let ((path (nth 0 (cdr entry))))
+        (unless (equal path prev)
+          (setq n (1+ n))
+          (setq prev path))))))
+
+(defun lsp--symbol-at-point ()
+  "The identifier text touching point, widened outward to its nearest
+non-identifier boundary on each side (`verilog-complete--ident-char-p',
+`verilog-complete.el' -- letters, digits, `_', and `$', since
+SystemVerilog allows `$' inside a simple identifier and this project's
+Verilog-first priority means point sitting on a system function/task
+like `$clog2'/`$bits'/`$signed' must not be treated as a boundary), or
+nil if point isn't on/adjacent to any identifier character at all.
+
+M131 fix round: an earlier version of this function had its own,
+narrower `[A-Za-z0-9_]' character class, disagreeing with
+`verilog-complete--ident-char-p' on exactly the `$' question within the
+same codebase -- point on `$clog2' would have only grabbed `clog2',
+handing the sweep below an incomplete, possibly-ambiguous substring to
+search for. Reused directly rather than duplicated: `crates/core/src/
+lib.rs''s `init_editor' loads `verilog-complete.el' (`:282') AFTER
+`lsp.el' (`:219'), but this function's body only runs when `M-?' is
+actually invoked, long after every file `init_editor' loads has
+finished loading -- the same \"a file loaded earlier references, by
+NAME, a function in a file loaded later, from inside a closure/hook
+that only runs after the whole list has finished\" shape `init_editor''s
+own comments already document for `modes.el' referencing `verilog-
+complete-at-point' (`verilog-complete.el') and for `lsp.el'/`modes.el'
+referencing `verilog-nav.el''s entry point, both by name, both several
+files earlier in the same load list. (Not the `format.el'-into-`lsp.el'
+comment a step above the `verilog-complete.el' one in `lib.rs' --that
+one is `format.el' calling FORWARD into something loaded BEFORE it,
+the opposite direction from this call.) `lsp.el' itself has no other
+actual call into `verilog-auto.el' or `verilog-complete.el' anywhere
+else -- the two mentions of either name elsewhere in this file are
+docstring cross-references, not calls.
+
+SAFE TO ASSUME a SystemVerilog-specific character class (`$' as an
+identifier character) ONLY because every caller of this function that
+actually consumes its result for the M131 sweep gates on
+`lsp--verilog-buffer-p' first -- see `lsp--references-summary''s own
+docstring, which names the contrasting case this reuse would otherwise
+collide with: `expand-region.el:98-106''s `expand-region--ident-char-p'
+deliberately does NOT reuse `verilog-complete--ident-char-p', because
+`expand-region-at-point' can run from ANY buffer with no language
+attached at all. This function's own signature looks like the same
+shape (called unconditionally, before any Verilog check, to capture
+SYMBOL up front in `lsp-references-at-point') -- what keeps the
+SystemVerilog assumption safe here is that a non-Verilog buffer's
+SYMBOL value is computed but then never handed to `rg' at all.
+
+Deliberately still crude in one other respect -- unlike the actual
+`textDocument/references' REQUEST, which names the symbol purely by
+LINE/CHARACTER position and never needs its text at all, this is used
+ONLY to word the M131 outside-root sweep's own `rg' search pattern
+(`lsp--references-outside-root-files'). A slightly-wrong boundary here
+only makes that ADVISORY clause search for slightly-wrong text -- it
+can never change what the LSP server itself was asked or answered.
+
+Deliberately does NOT extend across a backtick (`` ` '', macro
+invocation) or `::' (hierarchical/package scope): the LSP server's own
+`textDocument/references' replies name a symbol like `DataWidth', never
+`soc_pkg::DataWidth' -- widening across `::' would hand the sweep a
+search string the server has never once returned, guaranteeing the
+sweep finds nothing it should and possibly matches unrelated text on
+either side of the `::' by coincidence."
+  (save-excursion
+    (while (verilog-complete--ident-char-p (char-before)) (backward-char))
+    (let ((start (point)))
+      (while (verilog-complete--ident-char-p (char-after)) (forward-char))
+      (if (> (point) start) (buffer-substring start (point)) nil))))
+
+(defun lsp--references-outside-root-files (symbol root)
+  "Verilog/SystemVerilog files (`.sv'/`.svh'/`.v'/`.vh') under
+`search--find-root''s own repo root (`search.el' -- the nearest `.git'
+ancestor of ROOT, deliberately NOT another call to `lsp--project-root':
+a narrower, LSP-specific root is exactly the thing this sweep exists to
+cross-check, so reusing it here would make the sweep unable to ever
+disagree with the thing it's checking) that contain the literal text
+SYMBOL, filtered down to only the ones OUTSIDE ROOT (the project root
+the just-answered `textDocument/references' request actually used).
+
+Text-only, via `rg -l --fixed-strings', restricted to the four Verilog
+extensions with `-g' globs. Omitting the globs also matches every
+non-Verilog file that happens to mention SYMBOL as a substring --
+measured 2026-09-11 against this very repo for the symbol
+\"DataWidth\": `PLAN.md', `dev/gen-big-rtl.py', `verilog-auto.el', and
+`verilog_auto_tests.rs', none of them Verilog -- pure noise for an
+editor whose whole point is Verilog. With the globs, the same sweep
+over this repo finds exactly one file outside `demo/rtl' mentioning
+that symbol: `demo/verif/sram_bank_tb.sv'.
+
+A text hit here is NEVER treated as, or merged into, an actual
+reference -- see this function's only caller
+(`lsp--references-summary') for why: SYMBOL commonly names an
+unrelated same-named declaration in another file entirely (module-
+local `parameter's shadowing a package constant of the same name is
+routine RTL style), so a text match is not evidence of the same
+semantic symbol, only evidence worth a human's own look via `M-x
+search-project'.
+
+Bounded to 2 seconds and fails silent (nil) on any non-zero exit,
+timeout, or missing `rg' binary (`call-process-string' reports a
+missing PROGRAM as a non-zero exit with a message in stderr, never a
+signal -- see that builtin's own doc comment) -- this clause is
+advisory only, and must never be the reason `M-?' itself fails, hangs,
+or reports nothing at all for its own, actual answer.
+
+M131 fix round (F2): the 2-second bound above is not close to binding
+in practice, so it is left as-is (no async rewrite, no cache) --
+`rg -l' stops at each file's FIRST match, so cost tracks directory-walk
+size, not how common SYMBOL is (a worry raised for high-frequency short
+names like `clk'/`valid'). Measured 2026-09-11 with `dev/gen-big-rtl.py`
+-generated trees: 186 files / 1MB -> 0.055s; 890 files / 8MB -> 0.066s;
+8900 files / 80MB -> 0.179s -- an order of magnitude of headroom below
+the 2-second bound even at 8900 files.
+
+Known gap, documented rather than fixed (F6): a Verilog file whose OWN
+NAME contains an embedded newline would corrupt the `(split-string
+(nth 1 result) \"\\n\" t)' split below -- one real filename would be
+read back as two spurious \"files\", each missing the other half of its
+own name, and the prefix check would then almost certainly fail to
+match either half against ROOT. `rg -l' itself always emits one
+filename per line with no escaping, so this is a property of that
+output format, not a bug in the split. Not fixed because a Verilog
+source file with a literal newline in its own filename is not a shape
+this project's target RTL workflow produces or has ever been observed
+to hit; recorded here so the next reader finds it stated rather than
+rediscovers it by surprise."
+  (let* ((scan-root (search--find-root (concat root "/")))
+         (args (list "-l" "--fixed-strings" symbol
+                     "-g" "*.sv" "-g" "*.svh" "-g" "*.v" "-g" "*.vh"
+                     scan-root))
+         (result (call-process-string "rg" args "" 2000 nil)))
+    (when (and result (= (nth 0 result) 0))
+      (let ((prefix (concat (directory-file-name root) "/"))
+            (outside nil))
+        (dolist (f (split-string (nth 1 result) "\n" t) (nreverse outside))
+          (unless (string-prefix-p prefix f)
+            (push f outside)))))))
+
+(defun lsp--references-summary (alist root symbol file)
+  "The success message/picker-prompt text for `lsp-references-at-point':
+\"N reference(s) in M file(s) (project root: ROOT)\", from ALIST (an
+`lsp--reference-alist' return value), plus an advisory clause -- \"K
+Verilog file(s) outside that root also mention SYMBOL\" -- when FILE is
+Verilog-family (`lsp--verilog-buffer-p') AND
+`lsp--references-outside-root-files' finds any, pointing at `M-x
+search-project' as the escape hatch for actually seeing them (that
+command already searches the whole checkout, per its own docstring in
+`search.el' -- this just tells the user the option exists).
+
+FILE gates the sweep entirely (M131 fix round) -- a non-Verilog FILE
+(any other language `lsp-references-at-point' can be invoked from) never
+runs it at all, for two reasons: (1) it would otherwise be pure wasted
+work, handing `rg' a search restricted to `.sv'/`.svh'/`.v'/`.vh' globs
+for a symbol that, by definition, isn't Verilog; and (2) it is what
+makes `lsp--symbol-at-point''s own reuse of
+`verilog-complete--ident-char-p' (which treats `$' as an identifier
+character, a SystemVerilog-only rule) correct rather than merely
+convenient -- see that function's own docstring, and contrast
+`expand-region.el:98-106''s `expand-region--ident-char-p', which
+deliberately does NOT reuse `verilog-complete--ident-char-p' for
+exactly the opposite reason: that call site (`expand-region-at-point')
+has no language of its own to assume, since it can be invoked from ANY
+buffer. This function's own call site is the same shape (`M-?' works
+from any buffer with an attached LSP client) -- what makes the Verilog
+assumption safe here, unlike there, is that FILE is checked before
+`lsp--symbol-at-point' is ever consulted for the sweep, so a non-
+Verilog buffer never reaches code that assumes a SystemVerilog
+character class at all.
+
+SYMBOL nil (point wasn't on an identifier) also skips the sweep,
+independent of FILE, rather than searching for an empty/nonsense
+pattern."
+  (let* ((n (length alist))
+         (nfiles (lsp--reference-alist-file-count alist))
+         (base (format "%d reference(s) in %d file(s) (project root: %s)"
+                        n nfiles root))
+         (outside (and symbol (lsp--verilog-buffer-p file)
+                       (lsp--references-outside-root-files symbol root)))
+         (n-outside (length outside)))
+    (if (> n-outside 0)
+        (format "%s -- %d Verilog file(s) outside that root also mention \"%s\"; M-x search-project searches the whole checkout"
+                base n-outside symbol)
+      base)))
+
 (defun lsp--goto-reference (path line character)
   "Jump to 0-based LINE/CHARACTER (LSP's own UTF-16 CHARACTER encoding)
 in PATH, opening it via `find-file' first -- unlike
@@ -5743,16 +6007,17 @@ previously refused."
              (lc (lsp--line-utf16-at (point)))
              (p (lsp--text-document-position-params file (car lc) (cdr lc)))
              (buf (current-buffer))
-             (origin (lsp--make-definition-marker)))
+             (origin (lsp--make-definition-marker))
+             (symbol (lsp--symbol-at-point)))
         (puthash "context" (lsp--references-context) p)
         (lsp-request-async
          client "textDocument/references" p
          (lambda (result)
            (when (eq (current-buffer) buf)
+             (let ((root (lsp--client-root-or-computed client file)))
              (if (not (and (vectorp result) (> (length result) 0)))
-                 (message "%s" (lsp--references-empty-message file (lsp--client-command client)))
-               (let* ((root (lsp--project-root file))
-                      (alist (lsp--reference-alist result root)))
+                 (message "%s" (lsp--references-empty-message file (lsp--client-command client) root))
+               (let* ((alist (lsp--reference-alist result root)))
                  (cond
                   ;; RESULT was non-empty, but every element failed
                   ;; `lsp--reference-entry''s well-formedness check (see
@@ -5777,13 +6042,20 @@ previously refused."
                   ((= (length alist) 1)
                    (let ((entry (cdr (car alist))))
                      (lsp-push-definition-marker origin)
-                     (lsp--goto-reference (nth 0 entry) (nth 1 entry) (nth 2 entry))))
+                     (lsp--goto-reference (nth 0 entry) (nth 1 entry) (nth 2 entry))
+                     ;; M131: no picker will show up to carry this
+                     ;; jump's own root/outside-root context, so it
+                     ;; gets its own `message' here -- unlike the
+                     ;; picker-prompt case below, nothing overwrites
+                     ;; this one.
+                     (message "%s" (lsp--references-summary alist root symbol file))))
                   (t
                    (with-completing-read
-                    (name "References: " (mapcar #'car alist) t)
+                    (name (lsp--references-summary alist root symbol file)
+                          (mapcar #'car alist) t)
                     ;; Second staleness check: see this function's own
                     ;; docstring.
                     (when (eq (current-buffer) buf)
                       (let ((entry (cdr (assoc name alist))))
                         (lsp-push-definition-marker origin)
-                        (lsp--goto-reference (nth 0 entry) (nth 1 entry) (nth 2 entry)))))))))))))))))
+                        (lsp--goto-reference (nth 0 entry) (nth 1 entry) (nth 2 entry))))))))))))))))))

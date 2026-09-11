@@ -1705,6 +1705,145 @@ the closing `);' back at column 10."
       (unless stop (setq n (treesit-node-parent n))))
     (if bare 1 0)))
 
+(defvar indent--verilog-comment-wrap-sibling-types
+  '("list_of_port_connections" "list_of_parameter_value_assignments"
+    "list_of_arguments")
+  "M127: wrap-node-types (see `indent--wrap-node-types') whose leading
+comment(s), when the comment is the wrapping production's own child
+(a SIBLING of the list node) rather than a descendant of the list node
+itself, still need the same wrap step every other line inside the list
+gets. Deliberately excludes `parameter_port_list'/`list_of_port_
+declarations'/`list_of_ports'/`modport_item' -- dump-verified (M127
+spec) that a module's own ANSI/non-ANSI header list nests its leading
+comment(s) as a genuine descendant of the list node already, so those
+four were already correct before this fix and must not be touched by it.
+
+This check inspects the WRAP NODE's own type (`list_of_port_connections'/
+`list_of_parameter_value_assignments'/`list_of_arguments'), not its
+PARENT's type, so it generalises correctly to every grammar production
+that happens to wrap one of these three list types -- not only the three
+named as the motivating example in `indent--verilog-comment-before-wrap-
+node-adjust''s own docstring (`hierarchical_instance', the `#(...)'
+production, `tf_call'). `list_of_arguments' in particular is reused by
+many more productions than a plain task/function call -- `system_tf_call'
+(`$display(...)'), `class_new', ordinary method calls, `randomize()' and
+others -- and a leading comment inside any of THEIR wrapped argument
+lists gets the same fix for the same reason, with no extra code needed:
+whichever production wraps `list_of_arguments', the comment's own walk
+(skipping over any further leading comments -- see
+`indent--verilog-comment-before-wrap-node-adjust') still lands on
+`list_of_arguments' itself.")
+
+(defun indent--treesit-next-sibling (node)
+  "NODE's immediate next sibling by child index within its own PARENT, or
+nil if NODE is the last child (or has no parent). This engine's Rust-side
+`treesit-*' surface (M12/M39, `crates/core/src/builtins/treesit.rs') does
+not implement GNU Emacs's `treesit-node-next-sibling' -- only
+`treesit-node-parent'/`treesit-node-child'/`treesit-node-child-count'/
+`treesit-node-eq' -- so this reconstructs it: find NODE's own index by
+scanning PARENT's children with `treesit-node-eq' (identity, not type or
+position, so it cannot be fooled by two same-typed nodes at different
+positions), then return the child one past it. M127 dump-verified
+(`hierarchical_instance', the `#(...)' production, and `tf_call', all
+three) that no anonymous punctuation token ever sits between a wrap
+list's leading comment and the wrap node that follows it -- the child
+immediately after the comment BY INDEX already IS the wrap node itself,
+not `(' or some other token -- so a plain by-index neighbor is exactly
+the right answer here, without needing to first classify which children
+are \"named\" the way real Emacs's version does."
+  (let ((parent (treesit-node-parent node)))
+    (if (not parent)
+        nil
+      (let ((count (treesit-node-child-count parent)) (k 0) (found nil))
+        (while (and (< k count) (not found))
+          (if (treesit-node-eq node (treesit-node-child parent k))
+              (setq found k)
+            (setq k (1+ k))))
+        (if (and found (< (1+ found) count))
+            (treesit-node-child parent (1+ found))
+          nil)))))
+
+(defun indent--verilog-comment-after-skipping-comments (node)
+  "Walk forward from NODE (a comment) over `indent--treesit-next-sibling'
+links, skipping every further comment (`one_line_comment'/
+`block_comment') sibling, and return the first NON-comment sibling
+found (or nil if NODE is the last child, or every remaining sibling is
+itself a comment). Used by `indent--verilog-comment-before-wrap-node-
+adjust' to see past a RUN of consecutive leading comments to whatever
+substantive node actually follows them."
+  (let ((n (indent--treesit-next-sibling node)))
+    (while (and n (member (treesit-node-type n) '("one_line_comment" "block_comment")))
+      (setq n (indent--treesit-next-sibling n)))
+    n))
+
+(defun indent--verilog-comment-before-wrap-node-adjust (node)
+  "M127: +1 (a wrap step) when NODE is a comment (`one_line_comment' or
+`block_comment') and the first NON-comment sibling reachable by walking
+forward from NODE (`indent--verilog-comment-after-skipping-comments',
+which itself skips over any further leading comments) has a
+`treesit-node-type' that is a member of
+`indent--verilog-comment-wrap-sibling-types'.
+
+Root cause (dump-verified, M127 spec): a wrapped list's leading
+comment(s) -- e.g. the `// Outputs' line immediately after `sub_module
+u_sub (', before any `.port(sig)' connection -- are direct children of
+the WRAPPING production (`hierarchical_instance' for a port-connection
+list, the `#(...)' production for a parameter-value-assignment list,
+`tf_call' for a call's argument list -- see `indent--verilog-comment-
+wrap-sibling-types' for why this generalises past those three examples),
+SIBLINGS of the list node (`list_of_port_connections' etc), not
+descendants of it. Every OTHER comment or real line inside the list --
+including a comment that appears AFTER at least one real
+connection/argument, like a later `// Inputs' -- sits between two of the
+list's own named children and so IS a genuine descendant, already
+correctly picked up by the ordinary `indent--block-depth' ancestor walk
+against `indent--wrap-node-types' in `indent--query-pos-and-depth'. Only
+the leading comment(s)' own ancestor chain skips the wrap node entirely,
+computing WRAP-DEPTH 0 instead of 1 (module block depth alone: column 2,
+not the wrapped list's column 6).
+
+Fix-round finding (trailing review): checking only the IMMEDIATE next
+sibling handles a single leading comment but not a RUN of two or more --
+dump-verified (fix round) that consecutive comments are spliced in as
+ordinary positional siblings of one another (`(one_line_comment)
+(one_line_comment) (list_of_port_connections ...)'). For a two-comment
+run, the LAST comment's immediate next sibling already is the wrap node
+(handled correctly before this fix-round change), but every EARLIER
+comment's immediate next sibling is the NEXT comment in the run, not the
+wrap node -- so checking only the immediate neighbor left every comment
+but the last one in a run undetected and stuck at block depth, the exact
+bug this fix exists to remove, one (or more) comment lines earlier.
+`indent--verilog-comment-after-skipping-comments' fixes this by walking
+PAST every further comment sibling to find the actual substantive
+neighbor, so every comment in the run -- not just the last -- now sees
+the same wrap node and gets the same +1.
+
+Restricted to exactly the three types in `indent--verilog-comment-wrap-
+sibling-types' (not the module-header wrap types) because those are
+dump-verified (M127 spec) to have the OPPOSITE shape: a header list's
+own leading comment(s) already ARE a descendant of the list node itself,
+so adding a step here would double-count them.
+
+Must NOT fire for a comment (or a run of comments) sitting ABOVE an
+entire instantiation statement (outside its parens) -- dump-verified
+(M127) that such a comment's own next sibling by index is
+`module_instantiation' itself (the comment is a direct child of
+`module_declaration', sitting between `module_ansi_header' and
+`module_instantiation'), not one of the three wrap-node-types checked
+here, so this function correctly returns 0 for it (and, via the same
+comment-skipping walk, for every comment in a multi-line run above the
+instantiation) and it stays at the module's own block depth. The check
+is a plain `treesit-node-type' membership test on the final sibling's
+own type, not a descendant walk, so no ancestor-chain shape this
+milestone was not built for can accidentally satisfy it."
+  (if (and (member (treesit-node-type node) '("one_line_comment" "block_comment"))
+           (let ((next (indent--verilog-comment-after-skipping-comments node)))
+             (and next
+                  (member (treesit-node-type next)
+                          indent--verilog-comment-wrap-sibling-types))))
+      1
+    0))
+
 (defun indent--verilog-depth-adjust (node)
   "M119/M122: sum of `indent--verilog-generate-depth-adjust' (D2),
 `indent--verilog-header-wrap-depth-adjust' (D1),
@@ -1742,7 +1881,7 @@ THEN applies the closer's -1 on top) rather than competing for one slot."
      (indent--verilog-modport-item-closer-adjust node)
      (indent--verilog-bare-action-block-adjust node)))
 
-(defun indent--query-pos-and-depth (lang-sym block-types closers &optional wrap-types depth-adjust-fn)
+(defun indent--query-pos-and-depth (lang-sym block-types closers &optional wrap-types depth-adjust-fn wrap-depth-adjust-fn)
   "(QUERY-POS DEPTH WRAP-DEPTH) for the current line under LANG-SYM, or
 nil if a tree-sitter ERROR node is encountered. QUERY-POS is the
 position actually queried: the current line's own first non-blank
@@ -1813,7 +1952,16 @@ without changing the DEPTH-computation's meaning for any other
 language (nil here is a no-op, verified the same way the WRAP-TYPES
 short-circuit above is: no test can distinguish `(if (and depth
 depth-adjust-fn) ...)' from an unconditional call when DEPTH-ADJUST-FN
-is nil, since `funcall' on nil never happens either way)."
+is nil, since `funcall' on nil never happens either way).
+
+WRAP-DEPTH-ADJUST-FN (M127, optional) is the same shape as DEPTH-ADJUST-FN
+but adds its result to WRAP-DEPTH instead of DEPTH, before the closer
+dedent below is applied, clamped at 0. Only verilog uses this, for
+`indent--verilog-comment-before-wrap-node-adjust' -- see that function's
+own doc for why WRAP-DEPTH (an ancestor-chain walk against WRAP-TYPES,
+computed above) has no way to see a wrap list's own leading comment,
+which sits as that list's SIBLING rather than its descendant. nil here is
+a no-op the same way DEPTH-ADJUST-FN's nil is."
   (let* ((line-pos (indent--first-non-blank-pos))
          (blank (= line-pos (line-end-position)))
          (query-pos (if blank (or (indent--prev-nonblank-char-pos) line-pos) line-pos))
@@ -1848,7 +1996,10 @@ is nil, since `funcall' on nil never happens either way)."
              (depth (if (and depth depth-adjust-fn)
                         (max 0 (+ depth (funcall depth-adjust-fn node)))
                       depth))
-             (wrap-depth (and depth wrap-types (indent--block-depth node wrap-types))))
+             (wrap-depth (and depth wrap-types (indent--block-depth node wrap-types)))
+             (wrap-depth (if (and wrap-depth wrap-depth-adjust-fn)
+                              (max 0 (+ wrap-depth (funcall wrap-depth-adjust-fn node)))
+                            wrap-depth)))
         (when depth
           (when (indent--closer-token-at-p node closers)
             (setq depth (max 0 (1- depth)))
@@ -1885,7 +2036,7 @@ re-chosen without data.
 Buffer-local (`setq-local') override if a specific large file's parse
 is still fast enough to be worth keeping smart indentation for.")
 
-(defun indent--treesit-depth-column (lang-sym closers &optional depth-adjust-fn)
+(defun indent--treesit-depth-column (lang-sym closers &optional depth-adjust-fn wrap-depth-adjust-fn)
   "Target column for the current line under LANG-SYM using the block-
 depth heuristic, or nil (caller falls back to `indent--copy-previous-
 indentation') on an ERROR tree or an oversized buffer -- see
@@ -1897,13 +2048,15 @@ one; WRAP-DEPTH is always 0 for a language with no
 for every language except verilog. DEPTH-ADJUST-FN (M119, optional) is
 passed straight through to `indent--query-pos-and-depth' -- see its own
 docstring; nil (the default, every caller except `verilog-indent-line')
-is a no-op."
+is a no-op. WRAP-DEPTH-ADJUST-FN (M127, optional) is likewise passed
+straight through -- see `indent--query-pos-and-depth''s own docstring."
   (if (> (point-max) indent-treesit-max-chars)
       nil
     (let* ((block-types (cdr (assq lang-sym indent--block-node-types)))
            (wrap-types (cdr (assq lang-sym indent--wrap-node-types)))
            (r (indent--query-pos-and-depth
-               lang-sym block-types closers wrap-types depth-adjust-fn)))
+               lang-sym block-types closers wrap-types depth-adjust-fn
+               wrap-depth-adjust-fn)))
       (when r
         (+ (* (nth 1 r) standard-indent-width)
            (* (nth 2 r) indent-wrap-width))))))
@@ -1930,7 +2083,8 @@ is a no-op."
 
 (defun verilog-indent-line ()
   (or (indent--treesit-depth-column
-       'verilog indent--verilog-closers #'indent--verilog-depth-adjust)
+       'verilog indent--verilog-closers #'indent--verilog-depth-adjust
+       #'indent--verilog-comment-before-wrap-node-adjust)
       (indent--copy-previous-indentation)))
 
 ;; --- Python: textual heuristic (not a tree walk -- see this file's header)

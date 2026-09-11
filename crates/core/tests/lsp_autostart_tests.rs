@@ -444,6 +444,40 @@ fn happy_path_spawns_attaches_and_backfills() {
     ok(&mut i, "(lsp-kill test--conn)");
 }
 
+#[test]
+fn autostart_records_the_root_it_connected_with_on_the_client() {
+    // M131 fix round (FIX-1): `lsp--autostart-begin' is the REAL
+    // call site a live GUI session actually connects through (the GUI
+    // never runs `M-x lsp' itself) -- unlike `lsp-connect', which
+    // `lsp_mode_tests.rs''s own `lsp_connect_records_its_own_root_on_
+    // the_client' already guards, nothing here stood watch on
+    // `(make-lsp--client :conn conn :command command :root root)''s
+    // own `:root root' actually landing. Same shape as `happy_path_
+    // spawns_attaches_and_backfills' above, trimmed to the one
+    // assertion this test exists for.
+    let mut i = setup();
+    let dir = scratch_dir("autostart_records_root");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn a() {}\n").unwrap();
+    register_cat(&mut i, &dir);
+
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'rust-mode)");
+    set_frontend_started(&mut i);
+    ok(&mut i, "(lsp--autostart-tick)");
+    dispatch_one_pending(&mut i);
+
+    assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
+    assert_eq!(
+        run(&mut i, "(lsp--client-root lsp--buffer-client)"),
+        format!("{:?}", dir.to_str().unwrap()),
+        "the client's own stored root must be the ROOT this connection was actually made with"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
+}
+
 // ============================================================
 // 2. Deaf server: spawns, reads, never writes. The editor stays
 //    responsive across many idle ticks; after the deadline the pending

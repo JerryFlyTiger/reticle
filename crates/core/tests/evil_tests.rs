@@ -1059,7 +1059,7 @@ fn minibuffer_c_g_in_insert_state_exits_to_normal_state() {
 }
 
 #[test]
-fn emacs_state_buffer_j_is_dired_behavior_not_a_motion() {
+fn emacs_state_buffer_j_is_dired_next_line_not_an_evil_motion() {
     let (mut i, ed) = setup();
     let dir = Scratch::new("dired");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1072,10 +1072,19 @@ fn emacs_state_buffer_j_is_dired_behavior_not_a_motion() {
     let before_text = bs(&mut i);
     let before_point = pt(&mut i);
     feed(&mut i, &ed, "j");
-    // dired doesn't bind "j" to anything (only n/p/RET/^/g/q), and the
-    // buffer is read-only, so this is a no-op — not evil's next-line.
-    assert_eq!(pt(&mut i), before_point);
-    assert_eq!(bs(&mut i), before_text);
+    // M130: dired's own local map now binds "j" to `next-line' (dired.el),
+    // so this must move point down a line without touching the buffer
+    // text at all -- confirming dispatch went through dired's LOCAL map
+    // (which happens to also resolve to `next-line', same as `n') rather
+    // than falling through to evil's normal-state motion. The guard
+    // against this buffer silently dropping OUT of `emacs' state (which
+    // would let evil's own normal-state `j' land here and make this
+    // assertion pass for the wrong reason) is the `assert_eq!' just
+    // above, against `evil--state' directly -- not a separate list-
+    // membership test (M130 fix round FIX-5: no such test exists in
+    // this file; grepping for it turns up nothing).
+    assert_ne!(pt(&mut i), before_point, "j must move point down a line");
+    assert_eq!(bs(&mut i), before_text, "j must not alter buffer text");
 }
 
 #[test]

@@ -889,3 +889,57 @@ fn ssh_dired_and_find_file_internal_agree_on_dired_dir() {
         "the second entry point must reuse the SAME dired buffer, not create a new one"
     );
 }
+
+// --- M130: vim-style j/k/G motion in dired's local keymap ---------------
+
+#[test]
+fn dired_j_and_k_move_by_line() {
+    let (mut i, ed) = setup();
+    let dir = fixture("jk");
+    run(&mut i, &format!("(dired {:?})", dir.to_str().unwrap()));
+    run(&mut i, "(evil-mode 1)");
+    assert_eq!(run(&mut i, "evil--state"), "emacs");
+    let before_text = run(&mut i, "(buffer-string)");
+    run(&mut i, "(goto-char (point-min))");
+    let line0 = run(&mut i, "(line-number-at-pos)");
+    feed_keys(&mut i, &ed, "j").unwrap();
+    let line1 = run(&mut i, "(line-number-at-pos)");
+    assert_ne!(line1, line0, "j must move down a line");
+    feed_keys(&mut i, &ed, "k").unwrap();
+    let line2 = run(&mut i, "(line-number-at-pos)");
+    assert_eq!(line2, line0, "k must move back up to the original line");
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before_text,
+        "j/k must never alter dired's listing text"
+    );
+}
+
+#[test]
+fn dired_capital_g_goes_to_last_line() {
+    let (mut i, ed) = setup();
+    let dir = fixture("capg");
+    run(&mut i, &format!("(dired {:?})", dir.to_str().unwrap()));
+    run(&mut i, "(evil-mode 1)");
+    assert_eq!(run(&mut i, "evil--state"), "emacs");
+    run(&mut i, "(goto-char (point-min))");
+    feed_keys(&mut i, &ed, "G").unwrap();
+    // M130 fix round FIX-2: every row `dired-insert-listing' emits, the
+    // LAST one included, ends in "\n" -- so a plain `end-of-buffer'
+    // lands on the empty line PAST the last real entry, where
+    // `dired--entry-at-point' computes a row index one past the end of
+    // `dired--files' and `nth' returns nil. `G' must instead land ON
+    // the last real entry, the same as GNU's own `dired-mode' `G'
+    // convention.
+    let entry = run(&mut i, "(dired--entry-at-point)");
+    assert_ne!(
+        entry, "nil",
+        "G must land on a real entry, not the empty line past the last row"
+    );
+    let last_name = run(&mut i, "(car (car (last dired--files)))");
+    let entry_name = run(&mut i, "(car (dired--entry-at-point))");
+    assert_eq!(
+        entry_name, last_name,
+        "G must land specifically on the LAST file in the listing"
+    );
+}

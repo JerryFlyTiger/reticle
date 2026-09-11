@@ -1397,6 +1397,26 @@ results', not `search--ordered-results'."
               (1- (length nav))))
       (search--goto-result (nth search--current-index nav)))))
 
+(defun search-goto-last-result ()
+  "Move point to the last content line in `*search*' (M130's `G'
+binding). Mirrors `dired-goto-last-entry' at the other end of the same
+mechanical problem: every line `search--insert-line'/`search--render'
+write, the LAST one included, ends in its own \"\\n\", so a plain
+`end-of-buffer' lands on the empty line PAST the last one, where
+`search--result-at-buffer-pos' (RET's own lookup) finds nothing.
+Simply stepping up one line from `point-max' fixes this generically --
+unlike `dired-goto-last-entry', this does not need to consult
+`search--results' at all, since an unparseable line (never a
+`search--results' entry, see `search--insert-line''s doc comment) is
+still a real line of content that `G' should land on, same as GNU's
+own end-of-buffer-ish `G' convention. A no-op on an empty buffer (no
+lines streamed in at all yet) -- `forward-line' at `point-min' with
+nothing to move to is already safe."
+  (interactive)
+  (goto-char (point-max))
+  (unless (= (point) (point-min))
+    (forward-line -1)))
+
 (defun search--index-of (entry ordered)
   "0-based position of ENTRY (compared by `eq') within ORDERED, or nil."
   (let ((entries ordered) (idx 0) (found nil))
@@ -1552,6 +1572,19 @@ times, unlike `search--ensure-output-buffer''s own one-time init guard
     (define-key map "C-x C-q" 'search-edit-mode)
     (define-key map "M-." 'search-goto-module-declaration)
     (define-key map "/" 'search-filter-start)
+    ;; M130: `j'/`k' are plain cursor motion (`next-line'/`previous-
+    ;; line'), deliberately NOT the same as `n'/`p' -- `n'/`p' here jump
+    ;; to the NEXT/PREVIOUS search result's location, while vim's `j'/
+    ;; `k' just move the cursor one line. `gg' is deliberately not bound
+    ;; anywhere in this milestone -- see dired.el's header note for the
+    ;; mechanical reason (`g' collision risk in `Keymap::define-
+    ;; sequence').
+    (define-key map "j" 'next-line)
+    (define-key map "k" 'previous-line)
+    ;; M130 fix round FIX-3: `search-goto-last-result', not `end-of-
+    ;; buffer' -- see that function's own doc comment for why a plain
+    ;; end-of-buffer lands one line PAST the last content line here.
+    (define-key map "G" 'search-goto-last-result)
     (use-local-map map))
   (set-buffer-read-only t))
 
@@ -1700,6 +1733,23 @@ return to the read-only state."
   (let ((map (make-sparse-keymap)))
     (define-key map "C-c C-c" 'search-edit-apply)
     (define-key map "C-c C-k" 'search-edit-discard)
+    ;; M130 fix round FIX-1: deliberately NOT binding `j'/`k'/`G' here,
+    ;; unlike the other five emacs-state modes this milestone touched.
+    ;; `search-edit-mode' is on `evil-emacs-state-modes' (evil.el) ONLY
+    ;; to keep `C-c C-c'/`C-c C-k' from being shadowed by evil normal-
+    ;; state's own bindings for those keys -- that entry says nothing
+    ;; about self-insert. This buffer is M83's wgrep-level editable
+    ;; search results: free typing that gets written back to the real
+    ;; source files verbatim (`search-edit-apply') is its ENTIRE
+    ;; purpose, exactly the same reason `eshell-mode'/`ielm-mode' are
+    ;; excluded (dired.el's header note). The test is "is this buffer's
+    ;; purpose to be typed into," not "is it writable" -- shell-command
+    ;; output and *compilation* are also writable in the Rust sense but
+    ;; are never meant to be typed into, so binding motion there is
+    ;; fine; this one is meant to be typed into, so it is not. Verilog
+    ;; identifiers routinely contain `j'/`k'/`G' (`clk', `jtag',
+    ;; `join_none'), so binding them here would silently eat those
+    ;; letters every time a user typed a replacement line.
     (use-local-map map))
   (set-buffer-read-only nil))
 

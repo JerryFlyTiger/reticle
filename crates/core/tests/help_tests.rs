@@ -604,3 +604,49 @@ fn c_h_f_binding_prompts_for_a_function_via_real_dispatch() {
     let msg = echo(&ed).unwrap();
     assert_eq!(msg, "next-line is a function (not documented)");
 }
+
+#[test]
+fn help_j_and_k_move_by_line() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(evil-mode 1)");
+    feed_keys(&mut i, &ed, "C-h b").unwrap();
+    assert_eq!(ed.borrow().current.borrow().name, "*Help*");
+    assert_eq!(
+        run(&mut i, "evil--state"),
+        "emacs",
+        "*Help* must start in evil's `emacs' state"
+    );
+    let before = run(&mut i, "(buffer-string)");
+    run(&mut i, "(goto-char (point-min))");
+    let line0 = run(&mut i, "(line-number-at-pos)");
+    feed_keys(&mut i, &ed, "j").unwrap();
+    let line1 = run(&mut i, "(line-number-at-pos)");
+    assert_ne!(line1, line0, "j must move down a line");
+    feed_keys(&mut i, &ed, "k").unwrap();
+    assert_eq!(
+        run(&mut i, "(line-number-at-pos)"),
+        line0,
+        "k must move back up to the original line"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "j/k must never alter *Help*'s text"
+    );
+    // M130 fix round FIX-4: `*Help*' is a plain text buffer (no
+    // trailing row past the last line of content the way dired/
+    // search-mode have), so plain `end-of-buffer' semantics are
+    // correct and need no special-case landing function -- still
+    // asserted here since nothing else in this test presses `G'.
+    feed_keys(&mut i, &ed, "G").unwrap();
+    assert_eq!(
+        run(&mut i, "(point)"),
+        run(&mut i, "(point-max)"),
+        "G must move point to the end of *Help*"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        before,
+        "G must never alter *Help*'s text"
+    );
+}
