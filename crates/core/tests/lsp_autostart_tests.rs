@@ -1882,3 +1882,371 @@ fn pending_marker_holds_both_keys_and_only_fully_clears_once_both_complete() {
         "(dolist (c lsp--buffer-clients) (lsp-kill (lsp--client-conn c)))",
     );
 }
+
+// ============================================================
+// M132: per-server rootUri -- primary and secondary autostart handshakes
+// must be keyed at DIFFERENT roots when their commands have different
+// `lsp-server-root-style-alist' styles, and a live connection at a
+// widened root must be found by the auto-attach path for a buffer
+// resolving to the same connected component through a different
+// (narrower) file list.
+// ============================================================
+
+#[test]
+fn autostart_gives_primary_and_secondary_different_roots() {
+    // proj/.git, proj/rtl/verible.filelist and proj/verif/verible.filelist
+    // share `core/alu.sv' -- one connected component whose smallest
+    // covering directory is `proj' itself. Buffer at proj/rtl/core/alu.sv:
+    // a `filelist'-style primary must stay at `proj/rtl' (the nearest
+    // filelist ancestor); a `workspace'-style secondary (basename
+    // `slang-server', matching the default `lsp-server-root-style-alist'
+    // entry) must widen to `proj'. This is the deletion test for F1e:
+    // reverting `lsp--autostart-try-one'/`lsp--autostart-maybe-begin'
+    // back to a single shared ROOT computed once makes both keys carry
+    // the SAME root, and this test goes red.
+    let mut i = setup();
+    let dir = scratch_dir("m132_primary_secondary_roots");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(dir.join("verif")).unwrap();
+    std::fs::write(
+        dir.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = dir.join("rtl/core/alu.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        dir.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("verif/tb.sv"), "module tb; endmodule\n").unwrap();
+
+    let primary_script = write_script(&dir, "verible_primary.sh", ECHO_INIT_SCRIPT);
+    let secondary_script = write_script(&dir, "slang-server", ECHO_INIT_SCRIPT);
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'verilog-mode (list {:?})))",
+            primary_script
+        ),
+    );
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-secondary-server-alist (cons 'verilog-mode (list {:?})))",
+            secondary_script
+        ),
+    );
+
+    ok(&mut i, &format!("(find-file {:?})", alu.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'verilog-mode)");
+    set_frontend_started(&mut i);
+
+    ok(&mut i, "(lsp--autostart-tick)");
+    assert_eq!(
+        run(&mut i, "(length lsp--autostart-pending)"),
+        "2",
+        "both the primary's and the secondary's autostart must be pending"
+    );
+
+    let primary_root = run(
+        &mut i,
+        &format!(
+            "(cdr (assoc {:?} (mapcar 'car lsp--autostart-pending)))",
+            primary_script
+        ),
+    );
+    let secondary_root = run(
+        &mut i,
+        &format!(
+            "(cdr (assoc {:?} (mapcar 'car lsp--autostart-pending)))",
+            secondary_script
+        ),
+    );
+    assert_eq!(
+        primary_root,
+        format!("{:?}", dir.join("rtl").to_str().unwrap()),
+        "the filelist-style primary must stay at the nearest filelist ancestor"
+    );
+    assert_eq!(
+        secondary_root,
+        format!("{:?}", dir.to_str().unwrap()),
+        "the workspace-style secondary must widen to the filelist component's root"
+    );
+    assert_ne!(
+        primary_root, secondary_root,
+        "primary and secondary must be keyed at different roots"
+    );
+
+    // FIX 5 (M132 fix round, review #6): every existing assertion here
+    // reads the GLOBAL `lsp--autostart-pending', never the buffer-local
+    // `lsp--autostart-pending-here' that `lsp--autostart-buffer-
+    // matches-p' actually fills (lsp.el:4317) -- the mode-line
+    // indicator's own data source. Reverting that predicate's ROOT
+    // comparison back to `(equal (lsp--project-root file) root)' would
+    // make it wrongly say "no match" for the workspace-style
+    // secondary's widened root (`dir', not the buffer's own plain
+    // `lsp--project-root' of `dir/rtl'), so this buffer's own pending
+    // marker for the secondary key would never be set -- caught here
+    // because this same buffer is the one that started BOTH handshakes.
+    let secondary_key_pending = run(
+        &mut i,
+        &format!(
+            "(and (member (cons {:?} {}) lsp--autostart-pending-here) t)",
+            secondary_script, secondary_root
+        ),
+    );
+    assert_eq!(
+        secondary_key_pending, "t",
+        "this buffer's own lsp--autostart-pending-here must contain the \
+         workspace-style secondary's (command . widened-root) key"
+    );
+
+    // Let both complete.
+    dispatch_one_pending(&mut i);
+    dispatch_one_pending(&mut i);
+
+    // FIX 4 (M132 fix round, review #5): before this assertion, this
+    // test only ever iterated `lsp--buffer-clients' to KILL every
+    // connection -- it never checked what, if anything, they actually
+    // are. Per the reviewer's reading, `lsp--autostart-begin''s
+    // completion closure calling `lsp--auto-attach-backfill' is the
+    // ONLY mechanism that attaches THIS buffer (the one whose idle tick
+    // started both handshakes) to its own new connections, and
+    // `lsp--auto-attach-backfill-matches-p' (lsp.el:3567-3568) is what
+    // decides the match using `lsp--project-root-for-command' (the
+    // per-command root) rather than plain `lsp--project-root'.
+    // Reverting that one line to `(lsp--project-root file)' would make
+    // the `workspace'-style secondary's root ("proj") mismatch the
+    // buffer's own plain project root ("proj/rtl"), so the secondary
+    // would silently never attach here -- and this is the first
+    // assertion in this file that would notice.
+    let has_primary = run(
+        &mut i,
+        &format!(
+            "(and (member {:?} (mapcar #'lsp--client-command (lsp--effective-buffer-clients))) t)",
+            primary_script
+        ),
+    );
+    let has_secondary = run(
+        &mut i,
+        &format!(
+            "(and (member {:?} (mapcar #'lsp--client-command (lsp--effective-buffer-clients))) t)",
+            secondary_script
+        ),
+    );
+    assert_eq!(
+        has_primary, "t",
+        "the buffer that started autostart must end up attached to the \
+         filelist-style primary's connection"
+    );
+    assert_eq!(
+        has_secondary, "t",
+        "the buffer that started autostart must end up attached to the \
+         workspace-style secondary's connection"
+    );
+
+    ok(
+        &mut i,
+        "(dolist (c lsp--buffer-clients) (lsp-kill (lsp--client-conn c)))",
+    );
+}
+
+#[test]
+fn auto_attach_uses_the_per_command_root_for_a_workspace_style_server() {
+    // Same fixture as above, but exercising `lsp--auto-attach-client'
+    // (M132's lsp.el:3011 site): connect buffer A (proj/verif/tb.sv) to
+    // a `workspace'-style PRIMARY (basename `slang-server') via a real
+    // `M-x lsp', then confirm `lsp--auto-attach-client' finds that SAME
+    // live connection for buffer B (proj/rtl/core/alu.sv) -- a
+    // DIFFERENT file, with a DIFFERENT narrow `lsp--project-root'
+    // (`proj/rtl' vs `proj/verif'), but the SAME widened `workspace'
+    // root (`proj') since both file lists share `core/alu.sv'.
+    //
+    // Before M132, `lsp--auto-attach-client' looked up
+    // `(lsp--get-connection command (lsp--project-root file))' -- the
+    // plain, narrow root -- so this exact case (one server, one widened
+    // root, two buffers reaching it through two different narrower file
+    // lists) would miss the live connection entirely and return nil.
+    let mut i = setup();
+    let dir = scratch_dir("m132_auto_attach_workspace_root");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(dir.join("verif")).unwrap();
+    std::fs::write(
+        dir.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = dir.join("rtl/core/alu.sv");
+    let tb = dir.join("verif/tb.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        dir.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(&tb, "module tb; endmodule\n").unwrap();
+
+    let script = write_script(&dir, "slang-server", ECHO_INIT_SCRIPT);
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'verilog-mode (list {:?})))",
+            script
+        ),
+    );
+
+    // Buffer A: connect for real via `M-x lsp'.
+    ok(&mut i, &format!("(find-file {:?})", tb.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'verilog-mode)");
+    ok(&mut i, "(lsp)");
+    assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
+    ok(&mut i, "(setq test--m132-client lsp--buffer-client)");
+
+    // Buffer B: a different file, never connected itself.
+    ok(&mut i, &format!("(find-file {:?})", alu.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'verilog-mode)");
+
+    let found = run(
+        &mut i,
+        &format!(
+            "(eq (lsp--auto-attach-client {:?} 'verilog-mode) test--m132-client)",
+            alu.to_str().unwrap()
+        ),
+    );
+    assert_eq!(
+        found, "t",
+        "lsp--auto-attach-client must find buffer A's connection for buffer B, \
+         since both resolve to the same widened workspace root"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--m132-client))");
+}
+
+#[test]
+fn autostart_warns_about_duplicate_declarations_under_a_widened_root() {
+    // FIX 3 (M132 fix round, review #4): the second of
+    // `lsp--workspace-maybe-warn-duplicates''s two real call sites is
+    // `lsp--autostart-begin''s success path (lsp.el:4547, inside the
+    // `lsp-request-async' completion callback), and nothing in this
+    // file exercised it before this test -- every M132 test above
+    // reads `lsp--autostart-pending'/`lsp--connections' state, never
+    // `message' output. Deleting that call line must make THIS test
+    // fail.
+    //
+    // Same widened-root fixture as `lsp_connect_warns_about_duplicate_
+    // declarations_under_a_widened_root' (lsp_mode_tests.rs): rtl/ and
+    // verif/ share `core/alu.sv' via their own `verible.filelist's, so
+    // a `workspace'-style command (`slang-server' basename) widens to
+    // the top `dir', capped at `.git' -- plus one duplicate module
+    // (`dup_widened') declared under `rtl/top' and again under
+    // `verif`, which only the WIDENED root covers.
+    let mut i = setup();
+    let dir = scratch_dir("m132_fix3_autostart_warns");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(dir.join("verif")).unwrap();
+    std::fs::write(
+        dir.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = dir.join("rtl/core/alu.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        dir.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("verif/tb.sv"), "module tb; endmodule\n").unwrap();
+    // The actual duplicate the widened root (but neither individual
+    // filelist) covers.
+    std::fs::write(
+        dir.join("rtl/top/extra_a.sv"),
+        "module dup_widened; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/extra_b.sv"),
+        "module dup_widened; endmodule\n",
+    )
+    .unwrap();
+
+    // `verilog-mode' already has REAL default entries in both
+    // `lsp-server-alist' (`verible-verilog-ls') and `lsp-secondary-
+    // server-alist' (`slang-server', unqualified) -- and both binaries
+    // are actually installed on this machine's PATH, so leaving either
+    // default in place would autostart a real server race instead of
+    // this test's controlled fake. Override BOTH explicitly (same
+    // shape as `autostart_gives_primary_and_secondary_different_roots'
+    // above) so `lsp--server-for-mode'/`lsp--secondary-server-for-mode'
+    // (both plain `assq', first match wins, and `add-to-list' prepends)
+    // resolve to these two fakes instead.
+    let primary_script = write_script(&dir, "verible_primary.sh", ECHO_INIT_SCRIPT);
+    let secondary_script = write_script(&dir, "slang-server", ECHO_INIT_SCRIPT);
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'verilog-mode (list {:?})))",
+            primary_script
+        ),
+    );
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-secondary-server-alist (cons 'verilog-mode (list {:?})))",
+            secondary_script
+        ),
+    );
+
+    capture_messages(&mut i);
+    ok(&mut i, &format!("(find-file {:?})", alu.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'verilog-mode)");
+    set_frontend_started(&mut i);
+
+    ok(&mut i, "(lsp--autostart-tick)");
+    assert_eq!(
+        run(&mut i, "(length lsp--autostart-pending)"),
+        "2",
+        "both the filelist-style primary's and the workspace-style \
+         secondary's autostart must be pending"
+    );
+    dispatch_one_pending(&mut i);
+    dispatch_one_pending(&mut i);
+
+    let messages = run(&mut i, "test--messages");
+    assert!(
+        messages.contains("dup_widened"),
+        "expected the duplicate-declaration warning to have been \
+         messaged via the real lsp--autostart-begin completion path \
+         (the workspace-style secondary only -- the filelist-style \
+         primary's own narrower root never contains the duplicate): {}",
+        messages
+    );
+
+    ok(
+        &mut i,
+        "(dolist (c lsp--buffer-clients) (lsp-kill (lsp--client-conn c)))",
+    );
+}

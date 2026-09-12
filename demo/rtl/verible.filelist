@@ -17,3 +17,11 @@ mem/sram_dual_channel.sv
 bus/axi4_lite_arbiter.sv
 bus/axi4_lite_if.sv
 top/soc_top.sv
+
+# M133: NOT a source file -- an include search path. verible-verilog-ls
+# ignores `+'-prefixed lines outright (measured: a references answer on
+# `top/soc_top.sv' is byte-identical with and without this line), but
+# reticle's own `lsp--filelist-incdirs' reads it to learn where this
+# design's `` `include `` headers live, so it can tell slang-server
+# (which never reads THIS file at all) via `slang.setBuildFile'.
++incdir+include

@@ -108,19 +108,31 @@ the testbench files plus everything they depend on
 `verif/` itself, the same convention `rtl/verible.filelist` already
 uses relative to `rtl/`.
 
-`rtl/.slang/server.json` is the equivalent per-project config file for
-`slang-server`, the other Verilog language server Reticle talks to.
-Without it, slang can't find `rtl/include/soc_defs.svh` from
-`rtl/top/soc_top.sv` and reports a spurious severity-1 error —
-`'soc_defs.svh': No such file or directory` — even though the file is
-right there. `{"flags": "-I include"}` fixes that. Two details worth
-knowing if you're setting this up in your own project: the file name
-must be exactly `server.json` (`config.json` or anything else under
-`.slang/` is silently ignored), and the paths inside `flags` are
-resolved relative to the language server process's own working
-directory, not the workspace root or the config file's location —
-Reticle pins that directory to the project root itself (M99) so this
-works regardless of where the editor was launched from.
+`rtl/.slang/server.json` is `slang-server`'s own per-project config
+file format — `slang-server` is the other Verilog language server
+Reticle talks to, and this is what you'd hand-author if you pointed a
+plain `slang-server` (e.g. from a VS Code workspace opened at `rtl/`
+directly) at this design without going through Reticle at all:
+`{"flags": "-I include"}` tells it where `rtl/include/soc_defs.svh`
+lives, so `rtl/top/soc_top.sv`'s `` `include `` resolves instead of
+reporting a spurious severity-1 `'soc_defs.svh': No such file or
+directory`.
+
+Reticle itself no longer depends on this file (M133): its own project
+root for this design is `demo/` (M132's filelist connected-component
+computation), so a config that only slang reads from `<rootUri>/.slang/`
+is never seen by the server Reticle actually starts. Instead, Reticle
+computes the include directories itself — from the very `+incdir+
+include` line in `rtl/verible.filelist` you can see above — and pushes
+them to a connecting slang-server via its `slang.setBuildFile` command
+after the handshake completes. `rtl/.slang/server.json` stays in the
+tree anyway, as a correct example of the format for anyone pointing
+their own slang-server at `rtl/` by hand. Two details worth knowing if
+you do that: the file name must be exactly `server.json` (`config.json`
+or anything else under `.slang/` is silently ignored), and the paths
+inside `flags` are resolved relative to the language server process's
+own working directory, not the workspace root or the config file's
+location.
 
 ## Verilog-2001 vs SystemVerilog
 

@@ -828,6 +828,39 @@ never machine-generated, exactly like an ANSI module header's (see
 `verilog-delete-auto')."
   (member (treesit-node-type header) verilog-auto--ansi-header-types))
 
+(defun verilog-auto--ansi-header-with-ports-p (header)
+  "Non-nil if HEADER is an ANSI header (`verilog-auto--ansi-header-p')
+AND it actually carries an inline port list -- i.e. it has a real port-
+parens child, found via `verilog-auto--header-port-list' (defined
+below, forward-referenced here in the doc string only).
+
+This is a DIFFERENT question from what `verilog-auto--ansi-header-p'
+answers, and conflating them is the M134 defect. The grammar makes a
+`module_ansi_header''s whole port-parens group OPTIONAL: `module top;'
+(no parens anywhere) and `module top #(parameter int W = 8);' (a
+`parameter_port_list' but no `list_of_port_declarations') are BOTH
+`module_ansi_header' by node TYPE alone -- so a bare node-type check
+reads either of them as \"ports already declared in the header, nothing
+left for AUTOOUTPUT/AUTOINPUT/AUTOINOUT/AUTOREG to add\" and silently
+drops output/reg generation real GNU performs there (M134 recon,
+measured against GNU Emacs 30.2: `module top;' with an unconnected
+submodule instance gets the SAME `/*AUTOOUTPUT*/' body as `module top
+();').
+
+Call sites whose real question is \"does this header already declare
+its own ports inline, so there's nothing left to add/convert\" must use
+THIS predicate. Call sites asking a genuinely different question --
+does this NODE happen to be the ANSI header shape at all, e.g. to find
+a `parameter_port_list' for parameter completion
+(`verilog-complete--parameters-of-module'), or to decide `assign' vs
+`wire' tie-off declaration STYLE (`verilog-auto--expand-autotieoff-
+site') -- must keep using `verilog-auto--ansi-header-p' instead. See
+this file's M134 header for the full 11-call-site audit that decided
+which of the two each one needed."
+  (and (verilog-auto--ansi-header-p header)
+       (verilog-auto--header-port-list header)
+       t))
+
 (defun verilog-auto--comment-p (node text)
   (and (string= (treesit-node-type node) "block_comment")
        (string= (treesit-node-text node) text)))
@@ -1086,7 +1119,29 @@ gap in this file. This is deliberately not treated as a bug: it is the
 SAME root `verible-verilog-ls' itself would compute from the same
 `rootUri' algorithm, so this function's blind spot matches the
 server's own, rather than second-guessing it with a different, only
-locally-motivated project-root heuristic."
+locally-motivated project-root heuristic.
+
+M132: this deliberately keeps calling `lsp--project-root' here, NOT
+`lsp--project-root-for-command' or `lsp--filelist-component-root' --
+this is a CLIENT-side lookup for where `verible.filelist' actually
+sits ON DISK, and a `workspace'-style widened root does not contain
+one (the filelist lives at the NARROWER, `lsp--project-root' directory
+-- widening is exactly the operation that walks past it). Switching
+this site to the widened root would make `expand-file-name
+\"verible.filelist\" root' resolve to a directory with no such file at
+all, silently breaking every `verilog-library-*' lookup that depends
+on this function. See `lsp--project-root-for-command''s own docstring
+for the general rule this is the documented exception to.
+
+M132: the parsing loop itself now lives in `lsp--filelist-entries'
+(`lsp.el') -- extracted verbatim, this function calls it and applies
+its own two EXTRA filters (`verilog-auto--library-file-name-p' and
+`file-exists-p') on top, so its behavior here is unchanged by the
+extraction. `lsp--filelist-entries' resolves each line relative to the
+file list's OWN directory rather than to a caller-supplied ROOT, but
+that is the same directory as ROOT here (the filelist is always read
+from directly inside ROOT, per the resolution-rule paragraph above),
+so the two are not observably different in this call site."
   (when verilog-library-use-filelist
     (let* ((probe-file (if (buffer-file-name)
                             (buffer-file-name)
@@ -1095,23 +1150,12 @@ locally-motivated project-root heuristic."
            (root (lsp--project-root probe-file))
            (filelist-path (expand-file-name "verible.filelist" root)))
       (when (file-exists-p filelist-path)
-        (let ((text (condition-case nil
-                        (file-contents-as-string filelist-path)
-                      (error nil)))
-              acc)
-          (when text
-            (dolist (raw (split-string text "\n"))
-              (let ((line (string-trim raw)))
-                (unless (or (string= line "")
-                            (string-prefix-p "#" line)
-                            (string-prefix-p "//" line)
-                            (string-prefix-p "+" line)
-                            (string-prefix-p "-" line))
-                  (let ((path (expand-file-name line root)))
-                    (when (and (verilog-auto--library-file-name-p
-                                (file-name-nondirectory path))
-                               (file-exists-p path))
-                      (push path acc)))))))
+        (let (acc)
+          (dolist (path (lsp--filelist-entries filelist-path))
+            (when (and (verilog-auto--library-file-name-p
+                        (file-name-nondirectory path))
+                       (file-exists-p path))
+              (push path acc)))
           (nreverse acc))))))
 
 (defun verilog-auto--library-files ()
@@ -1703,8 +1747,16 @@ divergence 2 exists specifically so AUTOTIEOFF is useful on
 branch entirely was a real M126 fix-round bug: an ANSI-header
 AUTOTIEOFF site silently expanded to NOTHING instead of the `assign'
 form divergence 2 promises, because `output_declaration' (the non-ANSI
-node type) never appears at all in an ANSI header."
-  (if (verilog-auto--ansi-header-p header)
+node type) never appears at all in an ANSI header.
+
+M134: gated on `verilog-auto--ansi-header-with-ports-p', not the bare
+`verilog-auto--ansi-header-p' -- a port-less ANSI header (`module top;')
+has no `ansi_port_declaration' children to enumerate in the first
+branch, but DOES have body-level `output_declaration' nodes once
+AUTOOUTPUT has generated them (or if the user wrote any by hand, which
+is legal Verilog even with no header port list). Falling into the
+non-ANSI branch below is what lets AUTOREG/AUTOTIEOFF see those."
+  (if (verilog-auto--ansi-header-with-ports-p header)
       (let (acc)
         (dolist (decl (verilog-auto--find-all-of-type header "ansi_port_declaration"))
           (when (eq (verilog-auto--port-direction-of decl) 'output)
@@ -3358,14 +3410,15 @@ or without a regexp argument (spec section 2.10)."
                        (string-match-p pat (treesit-node-text n)))))))
 
 (defun verilog-auto--any-auto-port-block-marker-p (node)
-  "Non-nil if NODE is any of the SIX block-style AUTO markers this file
-recognizes -- `/*AUTOWIRE*/', an AUTOOUTPUT/AUTOINPUT/AUTOINOUT marker,
-or an AUTOREG/AUTOTIEOFF marker (M126: widened from four; with or
-without its own regexp argument -- AUTOREG/AUTOTIEOFF never actually
-accept one, but the marker-recognition SHAPE is identical, and a
-malformed-argument marker still needs to be recognized here). Used by
+  "Non-nil if NODE is any of the SEVEN block-style AUTO markers this
+file recognizes -- `/*AUTOWIRE*/', an AUTOOUTPUT/AUTOINPUT/AUTOINOUT
+marker, an AUTOREG/AUTOTIEOFF marker, or an AUTORESET marker (M126:
+widened from four to six; M134: widened from six to seven; with or
+without its own regexp argument -- AUTOREG/AUTOTIEOFF/AUTORESET never
+actually accept one, but the marker-recognition SHAPE is identical, and
+a malformed-argument marker still needs to be recognized here). Used by
 `verilog-auto--autowire-stale-end' (M125: generalized) to recognize
-ANY of the six as proof that ITS OWN \"// End of automatics\" is
+ANY of the seven as proof that ITS OWN \"// End of automatics\" is
 missing, not just another `/*AUTOWIRE*/' -- see this file's M125 header
 for why that generalization matters now that several DIFFERENT marker
 kinds sitting immediately adjacent (AUTOTIEOFF directly followed by
@@ -3378,7 +3431,8 @@ corrupted one."
              (string-match-p "\\`/\\*AUTOINPUT\\(?:\\*/\\|(\\)" text)
              (string-match-p "\\`/\\*AUTOINOUT\\(?:\\*/\\|(\\)" text)
              (string-match-p "\\`/\\*AUTOREG\\(?:\\*/\\|(\\)" text)
-             (string-match-p "\\`/\\*AUTOTIEOFF\\(?:\\*/\\|(\\)" text)))))
+             (string-match-p "\\`/\\*AUTOTIEOFF\\(?:\\*/\\|(\\)" text)
+             (string-match-p "\\`/\\*AUTORESET\\(?:\\*/\\|(\\)" text)))))
 
 (defun verilog-auto--port-marker-arg (comment keyword)
   "COMMENT's own optional regexp argument (spec section 2.10), as a
@@ -3632,12 +3686,19 @@ markers). Returns the number of declarations inserted."
   "Expand one AUTOOUTPUT/AUTOINPUT/AUTOINOUT site (per KIND).
 ANSI-header guard (spec section 2.2) and the malformed-argument notice
 (spec section 2.10) both happen here, before candidates are ever
-computed for an ANSI-guarded module (nothing would use them)."
+computed for an ANSI-guarded module (nothing would use them).
+
+M134: the guard is `verilog-auto--ansi-header-with-ports-p', not the
+bare `verilog-auto--ansi-header-p' -- a port-less ANSI header (`module
+top;') declares no ports inline at all, so there is nothing for this
+site to be redundant with; GNU (measured, M134 recon) expands it
+exactly like a non-ANSI header. Only a header that actually carries an
+inline port list has \"nothing left to add\"."
   (let* ((keyword (nth 1 (assoc kind verilog-auto--port-kind-specs)))
          (module-decl (verilog-auto--enclosing-of-types
                        comment '("module_declaration" "interface_declaration")))
          (header (verilog-auto--header-node module-decl)))
-    (if (verilog-auto--ansi-header-p header)
+    (if (verilog-auto--ansi-header-with-ports-p header)
         (progn
           (let ((nm (verilog-auto--module-name module-decl)))
             (unless (member nm verilog-auto--ansi-port-auto-modules)
@@ -4038,11 +4099,16 @@ notice, the same scope decision M125 made for its own three commands
 
 (defun verilog-auto--expand-autoreg-site (comment)
   "Expand one /*AUTOREG*/ site. Returns the number of `reg' declarations
-inserted (0 if nothing qualifies -- no Beginning/End markers, R9)."
+inserted (0 if nothing qualifies -- no Beginning/End markers, R9).
+
+M134: gated on `verilog-auto--ansi-header-with-ports-p', not the bare
+`verilog-auto--ansi-header-p' -- see that predicate's doc string; a
+port-less ANSI header (`module top;') has no inline ports to conflict
+with AUTOREG's own job of adding `reg'/`logic' to undeclared outputs."
   (let* ((module-decl (verilog-auto--enclosing-of-types
                        comment '("module_declaration" "interface_declaration")))
          (header (verilog-auto--header-node module-decl)))
-    (if (verilog-auto--ansi-header-p header)
+    (if (verilog-auto--ansi-header-with-ports-p header)
         (progn
           (let ((nm (verilog-auto--module-name module-decl)))
             (unless (member nm verilog-auto--ansi-autoreg-modules)
@@ -4097,6 +4163,446 @@ autotieoff' above (see that function's own doc string)."
     (let ((total 0))
       (dolist (c sorted total)
         (setq total (+ total (verilog-auto--expand-autoreg-site c)))))))
+
+;; --- M134: AUTORESET ----------------------------------------------------
+;;
+;; GNU verilog-mode's `/*AUTORESET*/': expands, INSIDE the always-block
+;; branch it sits in, one reset assignment per signal that always-block
+;; assigns ANYWHERE -- except a signal already assigned in the marker's
+;; OWN branch (spec section 1, measured GNU Emacs 30.2). Unlike every
+;; other AUTO command in this file, the marker is scoped to its own
+;; ENCLOSING ALWAYS BLOCK, not to the enclosing module -- two `always'
+;; blocks in one module, each with its own `/*AUTORESET*/', both expand
+;; independently (measured; this is why `verilog-auto--first-autowire-
+;; per-module', which keeps only the first marker PER MODULE, must NOT
+;; be reused here -- see this file's M134 header note at the top of the
+;; expander below).
+
+(defcustom verilog-auto-reset-widths t
+  "How `/*AUTORESET*/' formats each signal's own reset constant (GNU
+default `t', kept as the default here too, per this file's M134 header
+divergence 2 -- even though `demo/rtl/' itself writes `\\='0' for
+every reset, a reader following GNU's own manual should see GNU's own
+output by default):
+- `t' (GNU default): sized hex matching the signal's own declared
+  width -- `16\\='h0'/`4\\='sh0' -- or, for a single SYMBOLIC packed
+  dimension, a `{WIDTH{1\\='b0}}'-shaped brace expression
+  (`verilog-auto--tieoff-constant', shared with AUTOTIEOFF).
+- nil: a plain, unsized, untyped `0' for every signal, regardless of
+  width.
+- `unbased: SystemVerilog's unsized, unbased `\\='0' for every signal --
+  not GNU's default, but the recommended setting for a parameterized
+  width (this file's own M134 header): it survives a WIDTH change with
+  no noise and needs no brace expression at all. `demo/rtl/' writes
+  exactly this by hand."
+  :type '(choice (const :tag "Sized (GNU default)" t)
+                 (const :tag "Unsized 0" nil)
+                 (const :tag "Unsized, unbased '0 (SystemVerilog)" unbased))
+  :group 'verilog-auto)
+
+(defcustom verilog-auto-reset-blocking-in-non t
+  "Whether `/*AUTORESET*/' resets a signal that this always block
+assigns with `=' (blocking) even though the block's own dominant idiom
+is non-blocking (`<=' used somewhere else in the same always block) --
+GNU default `t' (measured, M134 recon). With `t', such a signal is
+reset with `=' too, mirroring how it's actually assigned; with nil, it
+is excluded from the reset set entirely rather than mixing operators.
+Has no effect on a block that uses only `=' throughout, or only `<='
+throughout -- there is no \"otherwise\" idiom for either signal to be
+an exception to."
+  :type 'boolean
+  :group 'verilog-auto)
+
+(defvar verilog-auto--autoreset-memory-skips nil
+  "Position-ordered notice list (M125 convention, see this file's
+\"Position-ordered notice lists\" section) of (MARKER-START . TEXT) for
+every unpacked-array (memory) signal `/*AUTORESET*/' skipped rather
+than emitting GNU's own illegal `mem <= 8\\='h0;' (divergence 1,
+`demo/rtl/core/regfile.sv' is exactly this shape).")
+
+(defvar verilog-auto--autoreset-symbolic-multidim-skips nil
+  "Names (plain list, AUTOTIEOFF's own `verilog-auto--tieoff-symbolic-
+multidim-skips' convention -- NOT position-ordered) of every signal
+`/*AUTORESET*/' skipped because its declared range is multi-dimensional
+with at least one symbolic dimension (`verilog-auto--tieoff-constant''s
+own `SKIP-REASON', M134 fix round). `logic [WIDTH-1:0][7:0] arr;' is
+exactly this shape: measured GNU emits `arr <= 8'h0;' (its own
+divergence-5 quirk of silently using only the LAST dimension, already
+documented on `verilog-auto--tieoff-constant'); this file refuses
+instead, same divergence 5 policy AUTOTIEOFF already applies, rather
+than the alternative a cold review caught -- discarding the SKIP-REASON
+and emitting a bare `arr <= ;', a syntax error written silently into
+the user's file.")
+
+(defun verilog-auto--reset-decl-for-name (module-decl header name)
+  "DECL node that declares NAME somewhere in MODULE-DECL, whichever of
+the three shapes AUTORESET's own candidates can come from (this file's
+M134 header \"Declaration lookup is the real gap\" note): an ANSI port
+(`ansi_port_declaration'), a non-ANSI port
+(`input_declaration'/`output_declaration'/`inout_declaration'), or a
+body `net_declaration'/`data_declaration' (found via its own
+`net_decl_assignment'/`variable_decl_assignment' child, walked back up
+to the enclosing declaration that actually carries the type/range/
+signed information `verilog-auto--decl-raw-type-keyword'/
+`verilog-auto--decl-signed-p'/`verilog-auto--all-range-texts' read).
+nil if NAME is declared nowhere -- spec section 1's undeclared-signal
+case, still reset, as 1 bit.
+
+NOT scoped to module-level declarations only (M134 fix round, item 6):
+the `net_decl_assignment'/`variable_decl_assignment' search below walks
+EVERY such node anywhere under MODULE-DECL, including inside a `task'/
+`function'/`generate' body. A same-named LOCAL inside one of those
+would shadow the real module-level signal, first document-order match
+winning -- low likelihood (AUTORESET only fires on names actually
+assigned in an always block, and a task/function-local variable is
+vanishingly unlikely to share a reset signal's name) and left
+UNTESTED. Deliberately not scoped further: every existing DECL-node
+caller in this file (`--output-port-candidate-decls', `--body-declared-
+names') has the identical blanket-search shape, so narrowing only this
+one caller would be new, unvalidated surface area for a corner this
+project has no measured evidence about either way."
+  (or
+   (and (verilog-auto--ansi-header-p header)
+        (catch 'found
+          (dolist (decl (verilog-auto--find-all-of-type header "ansi_port_declaration"))
+            (when (equal (treesit-node-text (treesit-node-child-by-field-name decl "port_name")) name)
+              (throw 'found decl)))
+          nil))
+   (catch 'found
+     (dolist (kind '("output_declaration" "input_declaration" "inout_declaration"))
+       (dolist (decl (verilog-auto--find-all-of-type module-decl kind))
+         (let ((idlist (or (verilog-auto--find-first-of-type decl "list_of_port_identifiers")
+                            (verilog-auto--find-first-of-type decl "list_of_variable_port_identifiers"))))
+           (when (and idlist
+                      (member name (mapcar #'treesit-node-text
+                                            (verilog-auto--find-all-of-type idlist "simple_identifier"))))
+             (throw 'found decl)))))
+     nil)
+   (catch 'found
+     (dolist (n (verilog-auto--find-all-of-type module-decl "net_decl_assignment"))
+       (when (equal (treesit-node-text (treesit-node-child n 0)) name)
+         (throw 'found (verilog-auto--enclosing-of-type n "net_declaration"))))
+     (dolist (n (verilog-auto--find-all-of-type module-decl "variable_decl_assignment"))
+       (when (equal (treesit-node-text (treesit-node-child-by-field-name n "name")) name)
+         (throw 'found (verilog-auto--enclosing-of-type n "data_declaration"))))
+     nil)))
+
+(defun verilog-auto--reset-decl-id-node (decl name)
+  "The `simple_identifier' node spelling NAME inside DECL -- needed
+(unlike every other AUTOREG/AUTOTIEOFF caller of DECL) to find NAME's
+own `unpacked_dimension' siblings via `verilog-auto--all-unpacked-
+range-texts-after', which takes the identifier node itself, not the
+declaration. nil if DECL is nil (NAME undeclared) or, defensively,
+if no identifier matching NAME is found in it."
+  (and decl
+       (catch 'found
+         (dolist (id (verilog-auto--find-all-of-type decl "simple_identifier"))
+           (when (equal (treesit-node-text id) name)
+             (throw 'found id)))
+         nil)))
+
+(defun verilog-auto--variable-lvalue-driven-names (lvalue)
+  "Base signal name(s) driven by LVALUE, a `variable_lvalue' node (the
+left-hand side of a procedural `blocking_assignment'/`nonblocking_
+assignment') -- the procedural-LHS mirror of `verilog-auto--net-
+lvalue-driven-names' (continuous-assign LHS); same recursion for
+concatenation (see that function's own doc string), a SEPARATE function
+because the two are different node TYPES in this grammar (M134 recon,
+dump-verified) and `verilog-auto--find-all-of-type' matches by exact
+type string, so scoping each search to its own type is what keeps them
+from cross-matching.
+
+M134 fix round (item 4): a bit-select/part-select LHS (`c[3:0]')
+dump-verifies as `variable_lvalue' > `hierarchical_identifier' (ONE
+`simple_identifier' child) + a SIBLING `select' node -- so taking the
+first `simple_identifier' found anywhere under LVALUE happens to give
+the base name there. But a DOTTED hierarchical LHS (`top.inner.sig')
+dump-verifies as `variable_lvalue' > `hierarchical_identifier' with
+its PATH COMPONENTS as flat, ordered `simple_identifier' children
+(`top' `.' `inner' `.' `sig') -- taking the FIRST one there grabs only
+`top', the outermost component, not the actual driven signal. Measured
+against real GNU Emacs 30.2 (scratchpad/gnu/p7.v): GNU resets
+`top.inner.sig' by its own full dotted name, not `top' alone. So this
+now branches on the `hierarchical_identifier' child's own
+`simple_identifier' COUNT: more than one means a dotted path, and the
+whole `hierarchical_identifier' node's own text (the full dotted name)
+is the driven name; exactly one is the bit-select/part-select/plain
+case, unchanged from before.
+
+M134 fix round 2 (item 2): an ESCAPED identifier LHS (`\\esc+id <=
+1\\='b1;', SystemVerilog's `\\NAME ' escape syntax for identifiers
+containing characters an ordinary identifier can't) dump-verifies as
+`hierarchical_identifier' > `escaped_identifier' with NO `simple_
+identifier' descendant at all -- so the plain-case COUNT above is
+zero, and without this clause the signal would be silently invisible
+to both the candidate scan and the exclusion scan (this predates the
+fix round; not a regression, just never covered). Handled here rather
+than left as a documented gap, since it's a one-clause fallback: zero
+`simple_identifier's under HIER falls through to its own `escaped_
+identifier' child, if any, using that node's own text (which already
+excludes the terminating whitespace -- dump-verified) as the name."
+  (let ((nested (verilog-auto--find-all-of-type lvalue "variable_lvalue")))
+    (if nested
+        (apply #'append (mapcar #'verilog-auto--variable-lvalue-driven-names nested))
+      (let ((hier (verilog-auto--find-first-of-type lvalue "hierarchical_identifier")))
+        (if hier
+            (let ((ids (verilog-auto--find-all-of-type hier "simple_identifier")))
+              (cond
+               ((> (length ids) 1) (list (treesit-node-text hier)))
+               (ids (list (treesit-node-text (car ids))))
+               (t (let ((esc (verilog-auto--find-first-of-type hier "escaped_identifier")))
+                    (and esc (list (treesit-node-text esc)))))))
+          (let ((id (verilog-auto--find-first-of-type lvalue "simple_identifier")))
+            (and id (list (treesit-node-text id)))))))))
+
+(defun verilog-auto--assigned-names-in (node)
+  "Alist of (NAME . STYLE) for every procedural assignment anywhere
+under NODE (an `always_construct', or any of its own sub-statements) --
+STYLE is `nonblocking' for a bare `nonblocking_assignment', `blocking'
+for a `blocking_assignment' (M134 recon: which of the two wraps the
+assignment is the ONLY signal that matters -- `blocking_assignment'
+always wraps `operator_assignment', `nonblocking_assignment' never
+does, so the outer node type alone decides; the operator text itself
+is never inspected). Descends into every nested `begin'/`end' block,
+`case' branch, and `for' loop, unlike `verilog-auto--find-all-of-type'
+on \"statement_or_null\" (which deliberately stops at direct children
+to find a conditional's own two BRANCHES, not for this assignment
+sweep) -- `verilog-auto--find-all-of-types' walks the whole subtree
+with no such stop, which is exactly what a sweep for every assignment
+anywhere inside NODE needs. The FIRST assignment found for a given
+NAME wins its STYLE; this project doesn't invent behaviour for a
+signal assigned with both operators in the same always block, since
+nothing in spec section 1 measures that shape."
+  (let (acc)
+    (dolist (n (verilog-auto--find-all-of-types node '("nonblocking_assignment" "blocking_assignment")))
+      (let* ((style (if (string= (treesit-node-type n) "nonblocking_assignment") 'nonblocking 'blocking))
+             (lvalue (verilog-auto--find-first-of-type n "variable_lvalue")))
+        (when lvalue
+          (dolist (nm (verilog-auto--variable-lvalue-driven-names lvalue))
+            (unless (assoc nm acc)
+              (push (cons nm style) acc))))))
+    (nreverse acc)))
+
+(defun verilog-auto--assigned-names-before (node cutoff-pos)
+  "Like `verilog-auto--assigned-names-in', but keeps only an assignment
+whose own node START position is strictly before CUTOFF-POS -- the
+marker's own `/*AUTORESET*/' comment start, M134 fix round item 2.
+
+The spec this file was originally built from said the exclusion was
+\"the branch the marker sits in\", and the first implementation excluded
+every assignment ANYWHERE in that whole branch subtree, regardless of
+where it sat relative to the marker. That spec was WRONG: measured
+against real GNU Emacs 30.2 (scratchpad/gnu/p1.v vs p2.v, both share
+one `if (!rst_n) begin ... end else begin a<=1'b1; b<=1'b1; end' shape,
+differing only in whether `a <= 1'b0;' sits BEFORE or AFTER the marker
+inside the if-branch), GNU excludes `a' only when the assignment comes
+BEFORE the marker in the SAME branch (p2); when it comes AFTER (p1),
+GNU resets `a' anyway, right alongside `b'. p3.v confirms nesting depth
+is irrelevant to this, only position is: with `if (x) a<=1'b0;' BEFORE
+the marker and `if (x) c<=1'b0;' AFTER it, both nested one level deeper
+than the marker itself, GNU excludes `a' and keeps `c'. So the
+exclusion set is not \"assigned anywhere in the branch\" but \"assigned
+before the marker's own text position, anywhere in the branch\" --
+this function, not `verilog-auto--assigned-names-in', is what the
+expander's own OWN-BRANCH computation must use."
+  (let (acc)
+    (dolist (n (verilog-auto--find-all-of-types node '("nonblocking_assignment" "blocking_assignment")))
+      (when (< (treesit-node-start n) cutoff-pos)
+        (let* ((style (if (string= (treesit-node-type n) "nonblocking_assignment") 'nonblocking 'blocking))
+               (lvalue (verilog-auto--find-first-of-type n "variable_lvalue")))
+          (when lvalue
+            (dolist (nm (verilog-auto--variable-lvalue-driven-names lvalue))
+              (unless (assoc nm acc)
+                (push (cons nm style) acc)))))))
+    (nreverse acc)))
+
+(defun verilog-auto--reset-marker-own-branch (comment always)
+  "The `statement_or_null' branch of the nearest enclosing
+`conditional_statement' that contains COMMENT, stopping the upward walk
+at ALWAYS (COMMENT's own enclosing `always_construct') -- nil if
+COMMENT sits directly in ALWAYS's body, outside any `if'/`else' at all
+\(the nil case, per M134 fix round item 1, is now what makes the
+EXPANDER refuse to run at all -- see `verilog-auto--expand-autoreset-
+site').
+
+M134 fix round (item 5) CORRECTION: an earlier version of this doc
+string, following the spec it was written from, described an `else if'
+chain as NESTED `conditional_statement's, with this function walking
+into the innermost one. Dump-verified (M134 fix round) that this
+grammar does NOT nest an `else if' chain at all -- `if (a) ... else if
+(b) ... else if (c) ... else ...' parses as exactly ONE
+`conditional_statement' node with N `statement_or_null' children, one
+per branch, all flat SIBLINGS (`if' `(' cond `)' branch1 `else' `if'
+`(' cond `)' branch2 `else' branch3 ... with no wrapper in between).
+The ALGORITHM below is unaffected by the correction -- walking up from
+COMMENT to the nearest ancestor whose PARENT is `conditional_statement'
+still lands on exactly the one direct-child branch COMMENT sits in,
+regardless of how many total branches that conditional_statement has --
+only the prose describing the shape was wrong, and is fixed here rather
+than in the spec, since this docstring is what the next reader
+actually consults."
+  (let ((n comment) (found nil))
+    (while (and n (not found) (not (eq n always)))
+      (let ((parent (treesit-node-parent n)))
+        (when (and parent (string= (treesit-node-type parent) "conditional_statement"))
+          (setq found n))
+        (setq n parent)))
+    found))
+
+(defun verilog-auto--reset-constant-for (dims signed)
+  "AUTORESET's own reset-constant for DIMS/SIGNED
+(`verilog-auto--all-range-texts'/`verilog-auto--decl-signed-p'),
+honoring `verilog-auto-reset-widths'. Returns (CONST . SKIP-REASON),
+mirroring `verilog-auto--tieoff-constant''s own contract (M134 fix
+round item 3): `t' defers to `verilog-auto--tieoff-constant' itself,
+SKIP-REASON included unchanged -- a multi-dimensional DIMS with at
+least one symbolic dimension comes back as (nil . 'symbolic-multidim),
+which the caller MUST check, exactly as AUTOTIEOFF's own call site
+already does (`verilog-auto--expand-autotieoff-site'). Discarding
+SKIP-REASON here and blindly `concat'ing a nil CONST is what a cold
+review caught: `logic [WIDTH-1:0][7:0] arr;' produced the syntax error
+`arr <= ;', silently written into the user's file, worse than the skip
+divergence 5 already establishes for this exact shape. `nil'/`unbased
+never produce a SKIP-REASON -- both are unconditional regardless of
+DIMS/SIGNED, so both return `(TEXT . nil)'."
+  (cond
+   ((eq verilog-auto-reset-widths nil) (cons "0" nil))
+   ((eq verilog-auto-reset-widths 'unbased) (cons "'0" nil))
+   (t (verilog-auto--tieoff-constant dims signed))))
+
+(defun verilog-auto--reset-decl-line (indent op name const)
+  "One AUTORESET assignment line's own full text: INDENT NAME OP CONST;
+-- spec section 1's own measured layout has no `// From ...' provenance
+comment (unlike AUTOOUTPUT/AUTOINPUT/AUTOINOUT/AUTOTIEOFF/AUTOREG,
+every one of which names an instance or a port this file invented the
+declaration FOR; an AUTORESET line just restates an assignment the
+user's own always block already makes, so there's nothing to attribute
+it to)."
+  (concat indent name " " op " " const ";"))
+
+(defun verilog-auto--expand-autoreset-site (comment)
+  "Expand one /*AUTORESET*/ site. Returns the number of reset
+assignments inserted (0 if nothing qualifies -- no Beginning/End
+markers, same convention as every other block-style AUTO command).
+
+M134 fix round 2 item 1 CORRECTION: an earlier version of this function
+refused to expand at all unless COMMENT sat inside a `conditional_
+statement' branch. That gate was itself wrong -- measured against real
+GNU Emacs 30.2 (scratchpad/gnu/q1.v: `/*AUTORESET*/' as the FIRST
+statement in a bare `always' body, no `if' anywhere, followed by
+`a <= 1'b1; b <= 1'b1;'), GNU resets both `a' and `b' there; the gated
+version emitted nothing. The two fixtures the gate was built from
+(r6.v/r16.v) both happen to have the marker LAST, with nothing assigned
+after it anywhere in scope -- \"refuse when there's no conditional\" and
+\"the positional rule with OWN SCOPE falling back to the whole always
+body\" give the same answer for THOSE two, which is why the gate looked
+right until a marker-first fixture (q1.v) and a `for'/`fork'-body
+fixture distinguished them.
+
+The single rule, with no gate: OWN SCOPE is COMMENT's enclosing
+`conditional_statement' branch (`verilog-auto--reset-marker-own-
+branch') if one exists, else the enclosing `always_construct' itself.
+A signal is EXCLUDED if it is assigned inside OWN SCOPE, textually
+BEFORE the marker's own position (`verilog-auto--assigned-names-
+before') -- nesting depth within OWN SCOPE is irrelevant (p3.v), and
+critically the cutoff applies ONLY within OWN SCOPE, never across a
+SIBLING branch (r8.v: an `if (x) a <= 1'b1;' branch that textually
+precedes an `else if' marker branch does NOT exclude `a', because `a''s
+assignment is not IN the marker's own branch at all)."
+  (let* ((module-decl (verilog-auto--enclosing-of-types
+                       comment '("module_declaration" "interface_declaration")))
+         (header (verilog-auto--header-node module-decl))
+         (always (verilog-auto--enclosing-of-type comment "always_construct"))
+         (text (treesit-node-text comment)))
+    (if (not (string= text "/*AUTORESET*/"))
+        (progn
+          (push (cons (treesit-node-start comment)
+                      (format "AUTORESET(...) in module %s: takes no argument, expansion skipped"
+                              (verilog-auto--module-name module-decl)))
+                verilog-auto--port-marker-arg-warnings)
+          0)
+      (if (not always)
+          0
+        (let* ((own-scope (or (verilog-auto--reset-marker-own-branch comment always) always))
+               (all-assigned (verilog-auto--assigned-names-in always))
+               ;; M134 fix round 2: OWN-SCOPE is the branch if COMMENT
+               ;; has one, else the whole always block -- see this
+               ;; function's own doc string. POSITIONAL exclusion within
+               ;; it, unchanged from fix round 1 (p1/p2/p3), now also
+               ;; covers the marker-first/no-conditional shape (q1/r6/
+               ;; r16) for free, since OWN-SCOPE degenerates to ALWAYS
+               ;; itself there.
+               (own-assigned (verilog-auto--assigned-names-before
+                              own-scope (treesit-node-start comment)))
+               (own-names (mapcar #'car own-assigned))
+               (block-has-nonblocking (verilog-auto--filter
+                                       (lambda (e) (eq (cdr e) 'nonblocking))
+                                       all-assigned))
+               (candidates nil))
+          (dolist (e all-assigned)
+            (let* ((nm (car e)) (style (cdr e)))
+              (unless (member nm own-names)
+                (if (and (eq style 'blocking) block-has-nonblocking
+                         (not verilog-auto-reset-blocking-in-non))
+                    nil
+                  (push (cons nm style) candidates)))))
+          (setq candidates (nreverse candidates))
+          (setq candidates (sort (copy-sequence candidates) (lambda (a b) (string< (car a) (car b)))))
+          (let (resolved)
+            (dolist (c candidates)
+              (let* ((nm (car c)) (style (cdr c))
+                     (decl (verilog-auto--reset-decl-for-name module-decl header nm))
+                     (id (verilog-auto--reset-decl-id-node decl nm))
+                     (unpacked (and id (verilog-auto--all-unpacked-range-texts-after id))))
+                (cond
+                 (unpacked
+                  (unless (verilog-auto--notice-contains-p verilog-auto--autoreset-memory-skips nm)
+                    (push (cons (treesit-node-start comment)
+                                (format "%s is an unpacked array (memory) -- AUTORESET cannot assign a scalar to it, skipped"
+                                        nm))
+                          verilog-auto--autoreset-memory-skips)))
+                 (t
+                  (let* ((dims (and decl (verilog-auto--all-range-texts decl)))
+                         (signed (and decl (verilog-auto--decl-signed-p decl)))
+                         (cr (verilog-auto--reset-constant-for dims signed))
+                         (op (if (eq style 'blocking) "=" "<=")))
+                    ;; M134 fix round item 3: SKIP-REASON (CDR) must be
+                    ;; checked, exactly as AUTOTIEOFF's own call site
+                    ;; does -- discarding it and using a nil CONST
+                    ;; produced the syntax error `arr <= ;'.
+                    (if (cdr cr)
+                        (unless (member nm verilog-auto--autoreset-symbolic-multidim-skips)
+                          (push nm verilog-auto--autoreset-symbolic-multidim-skips))
+                      (push (list nm op (car cr)) resolved)))))))
+            (setq resolved (nreverse resolved))
+            (when resolved
+              (let ((indent (verilog-auto--line-indent (treesit-node-start comment))))
+                (goto-char (treesit-node-end comment))
+                (insert
+                 "\n" indent "// Beginning of autoreset for uninitialized flops"
+                 (mapconcat
+                  (lambda (r)
+                    (concat "\n" (verilog-auto--reset-decl-line indent (nth 1 r) (nth 0 r) (nth 2 r))))
+                  resolved "")
+                 "\n" indent "// End of automatics")))
+            (length resolved)))))))
+
+(defun verilog-auto--expand-all-autoreset ()
+  "Expand EVERY /*AUTORESET*/ site in the current buffer, independently
+-- unlike every other block-style AUTO command in this file, which
+keeps only the first marker per MODULE, AUTORESET is scoped to its own
+enclosing always block (measured GNU behaviour: two always blocks each
+with their own `/*AUTORESET*/' both expand -- this file's M134 header).
+So there is no per-module `verilog-auto--first-autowire-per-module'
+filtering step here at all -- every marker found is its own independent
+site."
+  (let* ((root (verilog-auto--parse-current-buffer))
+         (comments (verilog-auto--find-port-marker-comments root "AUTORESET"))
+         (sorted (sort (copy-sequence comments)
+                       (lambda (a b) (> (treesit-node-start a) (treesit-node-start b))))))
+    (let ((total 0))
+      (dolist (c sorted total)
+        (setq total (+ total (verilog-auto--expand-autoreset-site c)))))))
 
 ;; --- AUTOARG ----------------------------------------------------------------
 
@@ -4158,6 +4664,17 @@ file's header."
 
 ;; --- verilog-delete-auto -----------------------------------------------------
 
+(defun verilog-auto--begin-block-comment-p (node)
+  "Non-nil if NODE's own text is a block-style AUTO command's Beginning
+line: `// Beginning of automatic ...' (AUTOOUTPUT/AUTOINPUT/AUTOINOUT/
+AUTOWIRE/AUTOREG/AUTOTIEOFF, spec section 2.1's shared layout) OR `//
+Beginning of autoreset ...' (AUTORESET, M134 -- GNU's own measured text
+does NOT share the other six's \"automatic\" spelling, so it needs its
+own prefix, not a widened version of theirs)."
+  (let ((text (treesit-node-text node)))
+    (or (string-prefix-p "// Beginning of automatic" text)
+        (string-prefix-p "// Beginning of autoreset" text))))
+
 (defun verilog-auto--autowire-stale-end (comment)
   "End position of the matching \"// End of automatics\" line if
 COMMENT (an /*AUTOWIRE*/ block_comment) is immediately followed by a
@@ -4197,11 +4714,21 @@ test literally for `/*AUTOWIRE*/'; generalized to
 block-style markers this file now recognizes) since AUTOOUTPUT
 immediately followed by AUTOINPUT immediately followed by AUTOINOUT is
 now a NORMAL, expected shape in one module, not a corrupted one -- see
-this file's M125 header for the full story."
+this file's M125 header for the full story.
+
+M134: the literal prefix check below is generalized to
+`verilog-auto--begin-block-comment-p', because AUTORESET's own
+Beginning line (GNU-measured, this file's M134 header: \"// Beginning
+of autoreset for uninitialized flops\") does NOT share the \"//
+Beginning of automatic\" prefix every other block-style marker's own
+Beginning line does -- a bare `string-prefix-p' check here would never
+recognize an AUTORESET site's own Beginning line at all, silently
+treating it as ordinary buffer text rather than proof of a stale
+range."
   (let ((next (verilog-auto--next-sibling comment)))
     (when (and next
                (string= (treesit-node-type next) "one_line_comment")
-               (string-prefix-p "// Beginning of automatic" (treesit-node-text next)))
+               (verilog-auto--begin-block-comment-p next))
       (let ((n (verilog-auto--next-sibling next)) (found nil) (blocked nil))
         (while (and n (not found) (not blocked))
           (cond
@@ -4210,7 +4737,7 @@ this file's M125 header for the full story."
             (setq found (treesit-node-end n)))
            ((or (verilog-auto--any-auto-port-block-marker-p n)
                 (and (string= (treesit-node-type n) "one_line_comment")
-                     (string-prefix-p "// Beginning of automatic" (treesit-node-text n))))
+                     (verilog-auto--begin-block-comment-p n)))
             (setq blocked t))
            (t (setq n (verilog-auto--next-sibling n)))))
         found))))
@@ -4897,16 +5424,17 @@ clobbered by the phases that run afterward)."
           (let ((close (verilog-auto--last-child (verilog-auto--header-port-list header))))
             (when close
               (push (cons (treesit-node-end c) (treesit-node-start close)) ranges))))))
-    ;; M125/M126: all six block-style markers (AUTOWIRE plus the five
-    ;; other ones) share this one path -- `verilog-auto--autowire-stale-
-    ;; end' doesn't care which marker COMMENT itself is, only what
-    ;; follows it (see this file's M125/M126 headers).
+    ;; M125/M126/M134: all seven block-style markers (AUTOWIRE plus the
+    ;; six other ones) share this one path -- `verilog-auto--autowire-
+    ;; stale-end' doesn't care which marker COMMENT itself is, only what
+    ;; follows it (see this file's M125/M126/M134 headers).
     (dolist (c (append (verilog-auto--find-comments root "/*AUTOWIRE*/")
                         (verilog-auto--find-port-marker-comments root "AUTOOUTPUT")
                         (verilog-auto--find-port-marker-comments root "AUTOINPUT")
                         (verilog-auto--find-port-marker-comments root "AUTOINOUT")
                         (verilog-auto--find-port-marker-comments root "AUTOTIEOFF")
-                        (verilog-auto--find-port-marker-comments root "AUTOREG")))
+                        (verilog-auto--find-port-marker-comments root "AUTOREG")
+                        (verilog-auto--find-port-marker-comments root "AUTORESET")))
       (let ((end (verilog-auto--autowire-stale-end c)))
         (when end
           (push (cons (treesit-node-end c) end) ranges))))
@@ -4940,11 +5468,13 @@ clobbered by the phases that run afterward)."
 
 (defun verilog-auto ()
   "Expand every /*AUTOINST*/, /*AUTOOUTPUT*/, /*AUTOINPUT*/,
-/*AUTOINOUT*/, /*AUTOTIEOFF*/, /*AUTOWIRE*/, /*AUTOREG*/, and
-/*AUTOARG*/ construct in the current buffer, in that order (M125: GNU's
-own ordering restricted to what this file implements; M126 inserts
-AUTOTIEOFF after AUTOINOUT and AUTOREG after AUTOWIRE -- see this
-file's M126 header for why AUTOTIEOFF must run BEFORE AUTOREG).
+/*AUTOINOUT*/, /*AUTOTIEOFF*/, /*AUTOWIRE*/, /*AUTOREG*/, /*AUTORESET*/,
+and /*AUTOARG*/ construct in the current buffer, in that order (M125:
+GNU's own ordering restricted to what this file implements; M126
+inserts AUTOTIEOFF after AUTOINOUT and AUTOREG after AUTOWIRE -- see
+this file's M126 header for why AUTOTIEOFF must run BEFORE AUTOREG;
+M134 inserts AUTORESET after AUTOREG and before AUTOARG, GNU's own
+ordering).
 Idempotent: always starts by deleting every existing machine-generated
 region (`verilog-delete-auto') and re-expanding from scratch, so
 running it twice in a row leaves the buffer byte-for-byte unchanged the
@@ -4970,11 +5500,13 @@ second time. The whole command is one undo group."
           (verilog-auto--ansi-tieoff-assign-modules nil)
           (verilog-auto--tieoff-port-reg-skips nil)
           (verilog-auto--tieoff-symbolic-multidim-skips nil)
+          (verilog-auto--autoreset-memory-skips nil)
+          (verilog-auto--autoreset-symbolic-multidim-skips nil)
           (verilog-auto--template-numbers-t-notices nil)
           (verilog-auto--template-instance-number-notices nil)
           (verilog-auto--template-forward-fallback-notices nil)
           (verilog-auto--template-lisp-eval-failures nil)
-          (n-inst 0) (n-wire 0) (n-arg 0) (n-port 0) (n-tieoff 0) (n-reg 0))
+          (n-inst 0) (n-wire 0) (n-arg 0) (n-port 0) (n-tieoff 0) (n-reg 0) (n-reset 0))
       (setq n-inst (verilog-auto--expand-all-autoinst))
       (setq n-port (+ (verilog-auto--expand-all-port-propagation 'output)
                        (verilog-auto--expand-all-port-propagation 'input)
@@ -4982,6 +5514,7 @@ second time. The whole command is one undo group."
       (setq n-tieoff (verilog-auto--expand-all-autotieoff))
       (setq n-wire (verilog-auto--expand-all-autowire))
       (setq n-reg (verilog-auto--expand-all-autoreg))
+      (setq n-reset (verilog-auto--expand-all-autoreset))
       (setq n-arg (verilog-auto--expand-all-autoarg))
       (undo-amalgamate-boundary)
       (setq verilog-auto--missing-modules (nreverse verilog-auto--missing-modules))
@@ -4993,6 +5526,12 @@ second time. The whole command is one undo group."
       (setq verilog-auto--ansi-tieoff-assign-modules (nreverse verilog-auto--ansi-tieoff-assign-modules))
       (setq verilog-auto--tieoff-port-reg-skips (nreverse verilog-auto--tieoff-port-reg-skips))
       (setq verilog-auto--tieoff-symbolic-multidim-skips (nreverse verilog-auto--tieoff-symbolic-multidim-skips))
+      (setq verilog-auto--autoreset-symbolic-multidim-skips (nreverse verilog-auto--autoreset-symbolic-multidim-skips))
+      ;; M134: `verilog-auto--autoreset-memory-skips' is ALSO a
+      ;; (POSITION . TEXT) list (see its own doc string) and joins the
+      ;; group below that is deliberately NOT `nreverse'd -- same
+      ;; `verilog-auto--notice-first' reasoning applies unchanged.
+      ;;
       ;; M125 trailing fix round: NOT `nreverse'd, unlike every other
       ;; notice list above. These three are (POSITION . TEXT) conses now
       ;; (see the "Position-ordered notice lists" section header, above
@@ -5121,6 +5660,26 @@ second time. The whole command is one undo group."
                           (length verilog-auto--tieoff-symbolic-multidim-skips)
                           (car verilog-auto--tieoff-symbolic-multidim-skips))
                 "")
+              ;; M134 divergence 1: an unpacked array (memory) AUTORESET
+              ;; would otherwise have to assign a scalar to -- GNU emits
+              ;; that anyway (illegal Verilog); this file skips it and
+              ;; says so, rather than silently doing nothing or writing
+              ;; code that doesn't compile.
+              (if verilog-auto--autoreset-memory-skips
+                  (format "; %d signal(s) an unpacked array, AUTORESET skipped (first: %s)"
+                          (length verilog-auto--autoreset-memory-skips)
+                          (verilog-auto--notice-first verilog-auto--autoreset-memory-skips))
+                "")
+              ;; M134 fix round item 3: same divergence-5 policy
+              ;; AUTOTIEOFF already applies to a symbolic multi-
+              ;; dimensional range -- refuse and report, rather than
+              ;; either silently doing nothing or (the cold-review-
+              ;; caught bug) emitting a bare `sig <= ;' syntax error.
+              (if verilog-auto--autoreset-symbolic-multidim-skips
+                  (format "; %d signal(s) with a symbolic multi-dimensional range, AUTORESET skipped (first: %s)"
+                          (length verilog-auto--autoreset-symbolic-multidim-skips)
+                          (car verilog-auto--autoreset-symbolic-multidim-skips))
+                "")
               ;; M127 divergence 3: `@' resolved to the empty string
               ;; (no digits, or a custom regexp that didn't match) --
               ;; silent in GNU.
@@ -5157,22 +5716,22 @@ second time. The whole command is one undo group."
                 ""))))
         (cond
          (verilog-auto--missing-modules
-          (message "verilog-auto: module %s not found%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs%s"
+          (message "verilog-auto: module %s not found%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
                     (car verilog-auto--missing-modules)
                     (if (> (length verilog-auto--missing-modules) 1)
                         (format " (%d total)" (length verilog-auto--missing-modules))
                       "")
-                    n-inst n-wire n-arg n-port n-tieoff n-reg suffix))
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix))
          (verilog-auto--ansi-autoarg-modules
-          (message "verilog-auto: AUTOARG in ANSI header (module %s)%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs%s"
+          (message "verilog-auto: AUTOARG in ANSI header (module %s)%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
                     (car verilog-auto--ansi-autoarg-modules)
                     (if (> (length verilog-auto--ansi-autoarg-modules) 1)
                         (format " (%d total)" (length verilog-auto--ansi-autoarg-modules))
                       "")
-                    n-inst n-wire n-arg n-port n-tieoff n-reg suffix))
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix))
          (t
-          (message "verilog-auto: %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs%s"
-                    n-inst n-wire n-arg n-port n-tieoff n-reg suffix)))))))
+          (message "verilog-auto: %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix)))))))
 
 ;; --- Keybindings -------------------------------------------------------------
 ;; Buffer-local, added via `verilog-mode-hook' -- the same pattern

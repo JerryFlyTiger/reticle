@@ -758,6 +758,19 @@ def main():
         "(slang-server) returns empty under the wrong root, "
         "which looks like unsupported -- use this flag to mimic the editor's behavior",
     )
+    ap.add_argument(
+        "--init-options",
+        help="JSON object sent as initialize's `initializationOptions'. Use this to ASK "
+        "whether a server reads its own configuration from here at all, rather than "
+        "assuming it does -- measured 2026-09-12 (M133): slang-server 0.2.9+4f33c99 "
+        "IGNORES this entirely (`{\"flags\": \"-I/abs/dir\"}' here does nothing -- the "
+        "include error stays; three shapes tried, `{\"flags\":...}', "
+        "`{\"settings\":{\"flags\":...}}', `{\"slang\":{\"flags\":...}}', none worked). "
+        "That negative result is why M133 built the `workspace/executeCommand' "
+        "`slang.setBuildFile' route instead. Still useful against OTHER servers that "
+        "do read initializationOptions, or to re-confirm slang-server's own behavior "
+        "hasn't changed in a later release",
+    )
     ap.add_argument("--method", help="the LSP method to send, e.g. textDocument/documentHighlight")
     ap.add_argument("--line", type=int, help="0-based line number")
     ap.add_argument("--char", type=int, help="0-based character position")
@@ -904,6 +917,11 @@ def main():
                 # it" when the real answer is "it was never told".
                 "rootUri": "file://" + os.path.abspath(args.root or os.path.dirname(path)),
                 "capabilities": {"textDocument": text_document_caps},
+                **(
+                    {"initializationOptions": json.loads(args.init_options)}
+                    if args.init_options
+                    else {}
+                ),
             },
         )
         if not init:

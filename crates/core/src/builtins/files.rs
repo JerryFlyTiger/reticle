@@ -209,6 +209,24 @@ pub fn register(interp: &mut Interp) {
         }
         Ok(Value::Nil)
     });
+    // M133: GNU's signature is `(make-directory DIR &optional PARENTS)'.
+    // With PARENTS non-nil, missing intermediate directories are created
+    // and an already-existing DIR is not an error (`create_dir_all`'s own
+    // behavior matches this exactly). Without it, DIR's parent must
+    // already exist and DIR must not, or this errors (`create_dir`'s own
+    // behavior, also an exact match) -- no divergence from GNU taken.
+    // Local paths only, like the rest of this file's directory-shaped
+    // builtins have no `/ssh:' dispatch (`file-directory-p'/`delete-
+    // directory' do; `make-directory' was never called remotely by
+    // anything in this codebase before M133 needed it locally for
+    // `~/.reticle/lsp/').
+    defun(interp, "make-directory", 1, Some(2), |i, a| {
+        let p = need_str(i, &a[0])?.to_string();
+        let p = crate::complete::expand_file_input(&p);
+        make_directory(&p, opt(a, 1).truthy())
+            .map_err(|e| i.error(format!("Cannot create directory {}: {}", p, e)))?;
+        Ok(Value::Nil)
+    });
     defun(interp, "delete-directory", 1, Some(2), |i, a| {
         let p = need_str(i, &a[0])?.to_string();
         let p = crate::complete::expand_file_input(&p);
@@ -404,6 +422,18 @@ pub(crate) fn expand_file_name(name: &str, dir: Option<&str>) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// M133: the disk-touching core of `make-directory`, split out of the
+/// builtin closure so it can be unit-tested directly against a real
+/// scratch directory without going through `Interp` -- see the
+/// `#[cfg(test)]` block below.
+pub(crate) fn make_directory(dir: &str, parents: bool) -> std::io::Result<()> {
+    if parents {
+        std::fs::create_dir_all(dir)
+    } else {
+        std::fs::create_dir(dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +472,65 @@ mod tests {
             let twice = expand_file_name(&once, None);
             assert_eq!(once, twice, "not idempotent for input {:?}", input);
         }
+    }
+
+    // M133: `make_directory` (the disk-touching core of `make-directory`).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "reticle_files_rs_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::remove_dir_all(&p).ok();
+        p
+    }
+
+    #[test]
+    fn make_directory_creates_a_plain_directory() {
+        let root = scratch("mkdir_plain");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("child");
+        make_directory(target.to_str().unwrap(), false).unwrap();
+        assert!(target.is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn make_directory_without_parents_errors_when_the_parent_is_missing() {
+        let root = scratch("mkdir_no_parent");
+        // ROOT itself is never created, so "ROOT/a/b" has a missing
+        // grandparent -- GNU errors here without PARENTS.
+        let target = root.join("a").join("b");
+        assert!(make_directory(target.to_str().unwrap(), false).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn make_directory_without_parents_errors_when_dir_already_exists() {
+        let root = scratch("mkdir_exists");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(make_directory(root.to_str().unwrap(), false).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn make_directory_with_parents_creates_intermediate_directories() {
+        let root = scratch("mkdir_parents");
+        let target = root.join("a").join("b").join("c");
+        make_directory(target.to_str().unwrap(), true).unwrap();
+        assert!(target.is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn make_directory_with_parents_does_not_error_if_dir_already_exists() {
+        let root = scratch("mkdir_parents_exists");
+        std::fs::create_dir_all(&root).unwrap();
+        make_directory(root.to_str().unwrap(), true).unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

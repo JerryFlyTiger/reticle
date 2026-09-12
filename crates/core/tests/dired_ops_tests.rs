@@ -609,3 +609,63 @@ fn do_rename_skips_missing_file_but_renames_the_rest_and_reverts() {
     );
     assert!(!rows(&mut i).iter().any(|r| r.contains("run.sh")));
 }
+
+// ============================================================
+// M133: `make-directory` (GNU signature: DIR &optional PARENTS) --
+// added for `lsp--verilog-write-build-file' (lsp.el), which needs to
+// create `~/.reticle/lsp/' the first time a project connects, and
+// this codebase's elisp had no way to create a directory at all
+// before this milestone.
+// ============================================================
+
+#[test]
+fn make_directory_creates_a_missing_directory() {
+    let (mut i, _ed) = setup();
+    let root = Scratch::new("mkdir_int_plain");
+    std::fs::create_dir_all(&*root).unwrap();
+    let target = root.join("child");
+    let r = run(
+        &mut i,
+        &format!("(make-directory {:?})", target.to_str().unwrap()),
+    );
+    assert!(!r.starts_with("ERROR"), "{}", r);
+    assert!(target.is_dir());
+}
+
+#[test]
+fn make_directory_with_parents_creates_intermediate_directories() {
+    let (mut i, _ed) = setup();
+    let root = Scratch::new("mkdir_int_parents");
+    let target = root.join("a").join("b").join("c");
+    let r = run(
+        &mut i,
+        &format!("(make-directory {:?} t)", target.to_str().unwrap()),
+    );
+    assert!(!r.starts_with("ERROR"), "{}", r);
+    assert!(target.is_dir());
+}
+
+#[test]
+fn make_directory_without_parents_errors_on_a_missing_parent() {
+    let (mut i, _ed) = setup();
+    let root = Scratch::new("mkdir_int_no_parent");
+    let target = root.join("a").join("b");
+    let r = run(
+        &mut i,
+        &format!("(make-directory {:?})", target.to_str().unwrap()),
+    );
+    assert!(r.starts_with("ERROR"), "{}", r);
+    assert!(!target.exists());
+}
+
+#[test]
+fn make_directory_without_parents_errors_if_dir_already_exists() {
+    let (mut i, _ed) = setup();
+    let root = Scratch::new("mkdir_int_exists");
+    std::fs::create_dir_all(&*root).unwrap();
+    let r = run(
+        &mut i,
+        &format!("(make-directory {:?})", root.to_str().unwrap()),
+    );
+    assert!(r.starts_with("ERROR"), "{}", r);
+}

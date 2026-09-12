@@ -480,7 +480,7 @@
                           ; major mode, which only says the LANGUAGE, not
                           ; which of possibly several configured servers
                           ; for it (`lsp-server-alist') is actually running.
-  root)                   ; M131: the ROOT-PATH string `lsp-connect'/the
+  root                    ; M131: the ROOT-PATH string `lsp-connect'/the
                           ; autostart path actually sent as this
                           ; connection's own `rootUri', or nil for a client
                           ; predating this field (or a test's
@@ -497,6 +497,22 @@
                           ; server, which is worse than not showing one at
                           ; all. See `lsp--client-root-or-computed', the
                           ; only sanctioned way to read this for display.
+  verilog-include-info)   ; M133: an alist recording what
+                          ; `lsp--verilog-maybe-push-include-directories'
+                          ; did for THIS client, right after `initialized'
+                          ; -- either `((:sent . t) (:build-file . PATH)
+                          ; (:directories . DIRS))' or `((:sent . nil)
+                          ; (:reason . STRING))'. nil for a client
+                          ; predating this field (or a test's
+                          ; `make-lsp--client' stub), NOT "nothing was
+                          ; sent" -- see that function's own docstring.
+                          ; `slang.setBuildFile''s own reply carries no
+                          ; success signal at all (measured: `{"result":
+                          ; null}' on both a real success and a silently-
+                          ; ignored bad argument), so this slot is the
+                          ; ONLY place the outcome is ever recorded;
+                          ; `lsp-verilog-show-include-directories' reads
+                          ; it back.
 
 ;; Every live client, so the editor's idle tick can pump all of them
 ;; without the user threading handles around (M15).
@@ -1147,6 +1163,398 @@ behaviour on the caller's declared capabilities."
     (puthash "textDocument" text-document caps)
     caps))
 
+;; --- M133: pushing include directories to slang-server, on connect ---
+;;
+;; `lsp--verilog-include-directories' (above, next to the filelist-root
+;; machinery) computes WHAT to send; everything below decides WHETHER to
+;; send it and actually sends it, right after `initialized' on BOTH
+;; connection paths (`lsp-connect' just below, and `lsp--autostart-
+;; begin' further down this file).
+
+(defvar lsp-verilog-push-include-directories 'auto
+  "Controls whether `lsp--verilog-maybe-push-include-directories' (M133)
+sends a connecting slang-server client a generated `.f' build file
+naming this project's include directories, via `workspace/
+executeCommand' `slang.setBuildFile' -- the only route measured to
+actually work (`initializationOptions' and `workspace/
+didChangeConfiguration' are both measured IGNORED; see the M133 spec's
+own \"measured facts\" section).
+
+  - `auto' (the default): push unless the user appears to have
+    configured slang themselves -- i.e. unless
+    `lsp--verilog-user-configured-slang-p' says one of
+    `<ROOT>/.slang/server.json', `<ROOT>/.slang/local/server.json', or
+    `~/.slang/server.json' exists. A hand-authored config may set its
+    own `build', which makes slang do a real whole-design build
+    (server log: `Creating ServerDriver with N trees', N > 0); an
+    unconditional `slang.setBuildFile' from this editor REPLACES that
+    (back to `0 trees') -- a silent downgrade of a configuration the
+    user chose, measured 2026-09-12.
+  - `t': push regardless, even over a user's own config.
+  - nil: never push.
+
+Only ever takes effect against a server that itself declares
+`slang.setBuildFile' in its `initialize' reply's own
+`executeCommandProvider.commands' -- see
+`lsp--verilog-server-declares-set-build-file-p' for why this is
+deliberately NOT gated through `lsp--capability-supported-p''s usual
+permissive \"absent means assume supported\" policy.")
+
+(defun lsp--verilog-slang-command-p (command)
+  "Non-nil if COMMAND (an `lsp--client-command' string, or nil) names a
+slang binary -- same discipline as this file's own
+`lsp--verible-command-p': a substring match on COMMAND's own basename
+(`file-name-nondirectory'), so a full path still matches. nil COMMAND
+means \"don't know\", treated as NOT slang."
+  (and command (string-match-p "slang" (file-name-nondirectory command)) t))
+
+(defun lsp--verilog-user-configured-slang-p (root)
+  "Non-nil if ROOT or the user's home directory already carries a
+slang-server config file the `auto' branch of
+`lsp-verilog-push-include-directories' must not silently override --
+any of `<ROOT>/.slang/server.json', `<ROOT>/.slang/local/server.json',
+`~/.slang/server.json' (the exact three paths, in that order, slang
+itself layers its own config from -- see the M133 spec's own \"measured
+facts\" section, sourced from the server's own stderr). ROOT nil counts
+as \"nothing to check there\"; the home-directory leg still applies on
+its own."
+  (or (and root (file-exists-p (concat (file-name-as-directory root) ".slang/server.json")))
+      (and root (file-exists-p (concat (file-name-as-directory root) ".slang/local/server.json")))
+      (file-exists-p (concat (lsp--home-directory) "/.slang/server.json"))))
+
+(defun lsp--verilog-vector-member-string-p (needle vec)
+  "Non-nil if VEC (a JSON-array-shaped `Value::Vector', which is what
+every JSON array becomes on the elisp side -- see `crates/elisp/src/
+json.rs') contains a string `equal' to NEEDLE. `member' only walks
+lists; `executeCommandProvider.commands' arrives as a vector, so this
+is the vector-shaped equivalent, used only by
+`lsp--verilog-server-declares-set-build-file-p'."
+  (catch 'lsp--verilog-vector-member-found
+    (dotimes (idx (length vec))
+      (when (equal (aref vec idx) needle)
+        (throw 'lsp--verilog-vector-member-found t)))
+    nil))
+
+(defun lsp--verilog-server-declares-set-build-file-p (client)
+  "Non-nil ONLY if CLIENT's own advertised `initialize' capabilities
+name `slang.setBuildFile' inside `executeCommandProvider.commands'.
+
+Deliberately NOT `lsp--capability-supported-p''s usual permissive
+default (absent capabilities, or a non-`lsp--client-p' test stand-in,
+both count as SUPPORTED there -- see that function's own docstring for
+why that default is right for every OTHER caller in this file): a
+server with no `executeCommandProvider' key at all (verible, measured)
+must never receive this `workspace/executeCommand', and an unknown
+client (capabilities not yet a hash table, or a non-struct stand-in)
+must not either. `lsp--capability-supported-p''s permissive default
+exists because a wrongly-sent request there just answers nothing extra
+-- graceful degradation. Here, a wrongly-sent request has a REAL side
+effect this project must never guess at: it writes a `.f' file to disk
+and, per the danger note in `lsp-verilog-push-include-directories''s
+own docstring, can silently downgrade a build a user configured on
+purpose."
+  (and (lsp--client-p client)
+       (let ((caps (lsp--client-capabilities client)))
+         (and (hash-table-p caps)
+              (let ((ecp (gethash "executeCommandProvider" caps)))
+                (and (hash-table-p ecp)
+                     (let ((commands (gethash "commands" ecp)))
+                       (and (vectorp commands)
+                            (lsp--verilog-vector-member-string-p
+                             "slang.setBuildFile" commands)))))))))
+
+(defun lsp--verilog-build-file-path (root)
+  "Where `lsp--verilog-maybe-push-include-directories' writes the
+generated `.f' build file for ROOT: `~/.reticle/lsp/incdirs-<sanitised
+ROOT>.f', deliberately OUTSIDE the user's own repository -- writing
+into their tree would show up in `git status', and worse, would match
+slang's own `**/*.f' auto-candidate glob (`buildPattern''s default;
+see the M133 spec's own measured facts for why that still wouldn't
+even help -- slang does not auto-select a `.f' from the workspace).
+
+Sanitises ROOT into an INJECTIVE filename -- fix-round finding: turning
+every `/' into `-' alone is NOT injective (`/tmp/x/proj-a/sub' and
+`/tmp/x/proj/a-sub' both became `-tmp-x-proj-a-sub'), so two unrelated
+project checkouts could silently share, and overwrite, one generated
+build file.
+
+A SECOND fix-round finding: the first attempt at fixing this --
+escaping a literal `-' to `--' first, then mapping `/' to a single
+`-' -- is ALSO not injective, because both the escape and the map land
+in the same one-character alphabet (`-') with no way to tell an
+escaped original `-' apart from two mapped `/'s once they're adjacent:
+`/foo/-bar' (a `/', then a literal `-') and `/foo-/bar' (a literal `-',
+then a `/') BOTH became `-foo---bar'. Do not reintroduce that scheme.
+
+The actual fix: two DISTINCT two-character tags, so every `-' in the
+output begins a two-character escape and the encoding is prefix-
+unambiguous (no output byte is ever a lone, un-tagged `-'). Every
+literal `-' in ROOT is first replaced with `-d' (\"dash\"), THEN every
+`/' is replaced with `-s' (\"slash\") -- the order matters, so the `-'
+this second pass introduces is never itself re-escaped by the first.
+Decoding is never needed in practice, but the invariant that makes this
+injective is: reading left to right, a `-' is ALWAYS immediately
+followed by either `d' or `s', unambiguously telling you which original
+character it stands for, so two different ROOT strings can never
+produce the same output."
+  (concat (lsp--home-directory) "/.reticle/lsp/incdirs"
+          (replace-regexp-in-string
+           "/" "-s"
+           (replace-regexp-in-string "-" "-d" root))
+          ".f"))
+
+(defun lsp--verilog-write-build-file (path root directories)
+  "Write PATH (M133's generated `.f' build file for ROOT) with a
+comment header naming the generator and ROOT, then one `-I \"<dir>\"'
+line per absolute directory in DIRECTORIES.
+
+Fix-round finding, measured against a real `slang-server': `+incdir+'
+(this function's original directive) is the wrong thing to emit,
+because slang splits its ARGUMENT on both whitespace and `+' -- a
+directory named `.../inc+plus' emitted as `+incdir+/abs/inc+plus' comes
+back as TWO separate (both wrong) include directories, `.../inc' and
+`plus', each individually reported missing; a directory with a space
+in it splits into a bogus include directory and a bogus bare filename.
+Double-quoting the `+incdir+' argument fixes the SPACE case but NOT the
+`+' case -- `+incdir+\"/abs/inc+plus\"' still splits on the `+'. `-I
+\"<dir>\"' (quoted) has NEITHER problem: measured clean (0 diagnostics,
+0 include errors, 0 stray notifications) against directories containing
+a `+', a space, and both at once, and against the real `demo/rtl/'
+tree, byte-for-byte the same 17-diagnostic, 0-include-error result
+`+incdir+' gave when it happened to work. `--include-directory \"<dir>\"'
+and `-I<dir>' (no space, no quotes) also work but were not chosen:
+`-I<dir>' regains the `+' problem (unquoted, whitespace-split only,
+still ok, but no quoting margin against a future space-containing
+value), and `--include-directory' is needlessly verbose for a
+generated, never-hand-edited file.
+
+This changes only what THIS function WRITES. What this project READS
+from `verible.filelist' (`lsp--filelist-incdirs') is UNCHANGED and
+still `+incdir+' -- that is verible's own file-list format, a different
+document with a different reader, not this generated `.f' file.
+
+The comment header uses `//', NOT `;;' -- an earlier fix-round finding,
+also measured against a real `slang-server': `.f' command-file format
+has no comment syntax of its own that recognises `;;' at all, so a
+`;;'-commented header is read as a run of bare, whitespace-separated
+FILE NAMES (`;;', `Generated', `by', ... each individually reported
+\"No such file or directory\", plus one `Is a directory' for a bare
+directory path caught the same way), and the whole file's effect was
+lost along with it. `;;' is elisp's own comment syntax -- the obvious
+thing to reach for writing THIS function -- and it is wrong for the
+format this function writes; the failure is also SILENT as far as this
+client is concerned, since `slang.setBuildFile' replies `{\"result\":
+null}' whether it worked or not (see this file's `lsp--verilog-maybe-
+push-include-directories' docstring). Measured comment prefixes against
+the real server: `//' clean, `#' also clean, `;;' broken exactly as
+above. `//' is used here rather than `#' for consistency with
+`verible.filelist', which this generated file is the slang-facing
+analog of.
+
+Any directory in DIRECTORIES whose name contains a literal `\"', a
+backslash, or a newline is DROPPED rather than emitted -- fix-round
+finding: none of the three can be safely represented on a quoted `-I
+\"<dir>\"' line. This format defines no escape convention for a quoted
+`\"' or backslash, and slang was never measured to honor one this
+client might invent, so making one up would be worse than silence; a
+newline is worse still, since it would break the GENERATED FILE'S OWN
+line structure outright rather than just one directive's quoting.
+`message's once, naming which directories were dropped and why -- a
+mechanism that decides what to include must never be seen to have
+silently decided wrong.
+
+Uses a throwaway buffer plus `write-region' -- the only route this
+codebase's elisp has to write an arbitrary string to an arbitrary path
+(there is no single \"write a string to a file\" primitive, and no
+`with-temp-buffer' macro here -- see `file-contents-as-string''s own
+docstring for that same gap on the read side) -- and kills that buffer
+again (`unwind-protect') so it never lingers in the buffer list.
+Ensures PATH's parent directory exists first (`make-directory' with
+PARENTS, M133's own new Rust builtin). Signals a real elisp error on
+any IO failure (`make-directory' or `write-region' both do) -- the
+caller, `lsp--verilog-maybe-push-include-directories', is responsible
+for catching that; this function itself does not."
+  (make-directory (file-name-directory path) t)
+  (let ((buf (generate-new-buffer " *lsp-verilog-build-file*"))
+        safe dropped)
+    (dolist (d directories)
+      (if (string-match-p "[\"\\\n]" d)
+          (push d dropped)
+        (push d safe)))
+    (setq safe (nreverse safe))
+    (when dropped
+      (setq dropped (nreverse dropped))
+      (message "LSP: Verilog include-directory build file dropped %d \
+director%s containing a `\"', a backslash, or a newline -- none of the \
+three can be safely quoted in slang's `.f' format: %s"
+               (length dropped)
+               (if (= (length dropped) 1) "y" "ies")
+               (mapconcat #'identity dropped ", ")))
+    (unwind-protect
+        (with-current-buffer-internal buf
+          (lambda ()
+            (insert (format "// Generated by reticle -- Verilog include \
+directories for %s\n// Rewritten on every LSP connect (M133); editing \
+this file by hand is pointless.\n" root))
+            (dolist (d safe)
+              (insert (format "-I \"%s\"\n" d)))
+            (write-region (point-min) (point-max) path)))
+      (kill-buffer buf))))
+
+(defun lsp--verilog-maybe-push-include-directories (client)
+  "Right after `initialized' on BOTH connection paths (`lsp-connect'
+and `lsp--autostart-begin'), tell CLIENT (M133) where this project's
+Verilog/SystemVerilog include directories are, via slang-server's own
+`workspace/executeCommand' `slang.setBuildFile' -- see this section's
+header comment and `lsp-verilog-push-include-directories''s own
+docstring for why this, and not `initializationOptions' or
+`workspace/didChangeConfiguration' (both measured IGNORED), is the
+route that works.
+
+Fire-and-forget (`lsp-request-async', never `lsp--request'+`lsp--await')
+-- this must never turn `lsp-connect''s handshake into a longer
+synchronous wait, and the reply carries no success signal to wait for
+anyway (measured: `{\"result\": null}' on both a real success and a
+silently-ignored bad argument). Because nothing else will ever know
+the outcome, it is recorded on CLIENT's own `verilog-include-info' slot
+instead -- `lsp-verilog-show-include-directories' (section 3.6) reads
+it back.
+
+The ENTIRE body runs under `condition-case' and NO ERROR CAN ESCAPE
+this function -- fix-round finding: this push is an optimisation
+layered on top of an already-healthy LSP connection, and before this
+fix a failure inside it (most concretely `lsp--verilog-write-build-file'
+signaling because `~/.reticle/lsp/' can't be created or written -- no
+permission, a full disk, or `~/.reticle' existing as a plain file
+instead of a directory) escaped uncaught into contexts that were never
+meant to see it: on the `lsp-connect' path it propagated into that
+function's OWN handshake `condition-case', whose handler kills the
+brand-new connection and re-signals, so a working slang-server got torn
+down over a `.f' file it never needed for anything but this
+convenience; on the `lsp--autostart-begin' path it propagated out of
+the async `initialize' completion callback, funcalled with no guard of
+its own from inside `lsp--dispatch''s `dolist' (`lsp-process-pending'),
+which could leave a client registered in `lsp--clients' but NEVER in
+`lsp--connections', with the server process still alive and the
+triggering buffer never attached -- silently and permanently broken
+until the editor restarts. Any such failure is now caught and recorded
+as an ordinary `(:sent . nil) (:reason . ...)' outcome instead, exactly
+like the four gates below.
+
+Sends nothing unless ALL of:
+ 1. `lsp-verilog-push-include-directories' is non-nil.
+ 2. CLIENT's server actually declares `slang.setBuildFile'
+    (`lsp--verilog-server-declares-set-build-file-p') -- a server with
+    no `executeCommandProvider' at all (verible) is refused here, not
+    assumed supported.
+ 3. Under `auto' (not `t'), the user has no slang config of their own
+    (`lsp--verilog-user-configured-slang-p') for CLIENT's own ROOT.
+ 4. CLIENT has a ROOT at all, and `lsp--verilog-include-directories'
+    found at least one directory for it.
+
+Records the outcome on `lsp--client-verilog-include-info' either way:
+an alist `((:sent . t) (:build-file . PATH) (:directories . DIRS))' on
+success, or `((:sent . nil) (:reason . STRING))' when nothing was
+sent -- naming exactly which of the checks above stopped it (a nil
+ROOT and \"ROOT was searched and came back empty\" are two DIFFERENT
+reasons, not folded together, so a reader of `lsp-verilog-show-include-
+directories' can tell which one actually happened).
+
+Not actually reachable for a `/ssh:' remote buffer, and this function
+carries no special-case for one -- fix-round correction of an earlier,
+wrong claim here that it could still be called with a remote ROOT and
+would silently fall through to \"no include directories found\". It
+cannot: `M-x lsp' rejects a remote FILE before ever computing a root or
+calling `lsp-connect' (`lsp--remote-path-p' checked in the `cond' right
+after `(not file)', message \"LSP: remote (/ssh:) files are not
+supported\"), and `lsp--autostart-maybe-begin' requires `(not (lsp--
+remote-path-p file))' before it does ANYTHING else -- no root
+computation, no `lsp--autostart-try-one' call, nothing that could reach
+`lsp--autostart-begin' and this function from it. Both are this file's
+ONLY two callers (see this function's own header comment). So a remote
+buffer never produces a live CLIENT for this function to be handed in
+the first place -- this feature inherits the project's existing
+\"no remote LSP\" limitation rather than having a gap of its own. (`rg'
+and `make-directory'/`write-region' being LOCAL-ONLY remains true, and
+would matter the day this project ever does grow remote LSP support --
+just not today, and not as a caveat on this specific function.)"
+  (let* ((root (lsp--client-root client))
+         (info
+          (condition-case err
+              (cond
+               ((not lsp-verilog-push-include-directories)
+                (list (cons :sent nil)
+                      (cons :reason "lsp-verilog-push-include-directories is nil")))
+               ((not (lsp--verilog-server-declares-set-build-file-p client))
+                (list (cons :sent nil)
+                      (cons :reason "server does not declare slang.setBuildFile")))
+               ((and (not (eq lsp-verilog-push-include-directories t))
+                     (lsp--verilog-user-configured-slang-p root))
+                (list (cons :sent nil)
+                      (cons :reason "user has their own .slang/server.json")))
+               ((not root)
+                (list (cons :sent nil)
+                      (cons :reason "client has no root -- nothing to search for include directories")))
+               (t
+                (let ((dirs (lsp--verilog-include-directories root)))
+                  (if (not dirs)
+                      (list (cons :sent nil)
+                            (cons :reason "no include directories found"))
+                    (let ((path (lsp--verilog-build-file-path root)))
+                      (lsp--verilog-write-build-file path root dirs)
+                      (lsp-request-async
+                       client "workspace/executeCommand"
+                       (let ((p (make-hash-table)))
+                         (puthash "command" "slang.setBuildFile" p)
+                         (puthash "arguments" (list path) p)
+                         p)
+                       (lambda (_result) nil))
+                      (list (cons :sent t)
+                            (cons :build-file path)
+                            (cons :directories dirs)))))))
+            (error
+             (list (cons :sent nil)
+                   (cons :reason (format "could not push include directories: %s"
+                                          (lsp--error-string err))))))))
+    (setf (lsp--client-verilog-include-info client) info)))
+
+(defun lsp-verilog-show-include-directories (&optional force)
+  "Report, for the current buffer's slang-server client, what M133's
+`lsp--verilog-maybe-push-include-directories' did at connect time: the
+generated build-file path and each include directory, or -- when
+nothing was sent -- the exact reason. This command is this feature's
+ONLY observable surface: `slang.setBuildFile''s own reply carries no
+success signal at all (see that function's own docstring).
+
+With a prefix argument (FORCE non-nil), first drops this project's
+ROOT from `lsp--verilog-include-directories-cache'
+(`lsp--verilog-include-directories-clear-cache') so a FUTURE connect
+re-scans from disk instead of reusing a cached answer -- this does NOT
+itself resend anything to an already-connected server; the wire only
+ever fires from `lsp-connect'/`lsp--autostart-begin' at connect time."
+  (interactive "P")
+  (let ((client (let (found)
+                  (dolist (c (lsp--effective-buffer-clients) found)
+                    (when (lsp--verilog-slang-command-p (lsp--client-command c))
+                      (setq found c))))))
+    (cond
+     ((not client)
+      (message "LSP: no slang-server client attached to this buffer"))
+     (t
+      (when force
+        (lsp--verilog-include-directories-clear-cache (lsp--client-root client)))
+      (let ((info (lsp--client-verilog-include-info client)))
+        (cond
+         ((not info)
+          (message "LSP: no include-directory info recorded for this client yet"))
+         ((cdr (assq :sent info))
+          (message "LSP: build file %s, %d directories: %s"
+                   (cdr (assq :build-file info))
+                   (length (cdr (assq :directories info)))
+                   (mapconcat #'identity (cdr (assq :directories info)) ", ")))
+         (t
+          (message "LSP: nothing sent -- %s" (cdr (assq :reason info))))))))))
+
 (defun lsp-connect (command &optional args root-path)
   "Start COMMAND (ARGS) as an LSP server and perform the initialize
 handshake. Returns a `lsp--client'.
@@ -1201,11 +1609,22 @@ that fails outright."
                (result (lsp--await client id)))
           (setf (lsp--client-capabilities client)
                 (and (hash-table-p result) (gethash "capabilities" result)))
-          (lsp--notify client "initialized" (make-hash-table)))
+          (lsp--notify client "initialized" (make-hash-table))
+          ;; M133: immediately after `initialized' -- see
+          ;; `lsp--verilog-maybe-push-include-directories''s own
+          ;; docstring for why here and what it does.
+          (lsp--verilog-maybe-push-include-directories client))
       (error
        (lsp-kill conn)
        (signal (car err) (cdr err))))
     (setq lsp--clients (cons client lsp--clients))
+    ;; M132 F2: a `workspace'-style connection can widen its root over
+    ;; two designs that share no file list -- see
+    ;; `lsp--workspace-maybe-warn-duplicates''s own docstring for why
+    ;; this has to happen HERE, at the point a connection actually
+    ;; starts, rather than inside `lsp--project-root-for-command' itself
+    ;; (which is called far more often than a connection is ever made).
+    (when root-path (lsp--workspace-maybe-warn-duplicates command root-path))
     client))
 
 (defun lsp--capability-supported-p (client key)
@@ -2628,6 +3047,828 @@ in `verilog-auto.el' and is not this function's job."
          (found (or filelist-root (lsp--nearest-marker-root start))))
     (directory-file-name (or found start))))
 
+;; --- M132: per-server rootUri for the Verilog LSP pair ---
+;;
+;; `lsp--project-root' above computes ONE root per buffer and hands the
+;; same string to every server. That is wrong for the Verilog pair
+;; specifically, because the two servers this project ships disagree
+;; about what a root MEANS: `verible-verilog-ls' scopes to the
+;; `verible.filelist' sitting AT rootUri (a narrow, single-file-list
+;; view), while `slang-server' scopes to the ENTIRE TREE under rootUri
+;; (a workspace-wide index). Measured 2026-09-11 against real binaries:
+;; `textDocument/references' on `demo/rtl/core/alu.sv' under
+;; `--root demo/rtl' finds a cross-file hit in `demo/rtl/top/soc_top.sv';
+;; under `--root demo' (no `demo/verible.filelist' exists) it finds
+;; nothing. In the other direction, `slang --diagnostics' on
+;; `demo/verif/sram_bank_tb.sv' under `--root demo/verif' (today's
+;; single shared answer) reports 9 diagnostics, 7 of them phantom
+;; "unknown class/module" errors for symbols that are real and defined
+;; in `demo/rtl'; under the wider `--root demo' those 7 vanish and only
+;; 3 real (severity-2) diagnostics remain. One shared root cannot
+;; satisfy both servers at once.
+
+(defvar lsp-server-root-style-alist
+  '(("slang-server" . workspace))
+  "Alist of COMMAND -> root-computation STYLE for `lsp--project-root-
+for-command'. Two styles:
+
+  `filelist' -- today's `lsp--project-root', unchanged. This is the
+  DEFAULT for any COMMAND not listed here at all -- `verible-verilog-ls'
+  is deliberately absent from this alist rather than listed with an
+  explicit `filelist' entry, so a user who registers a differently-
+  named verible binary (`add-to-list' onto `lsp-server-alist') still
+  gets the safe, narrower default without needing to also edit this
+  table.
+
+  `workspace' -- `lsp--filelist-component-root's A-prime rule (widen to
+  the smallest directory covering every file list connected to the
+  buffer's own, capped at the nearest `.git'), falling back to
+  `lsp--project-root' when that rule does not apply (a non-Verilog
+  buffer, or a Verilog buffer with no `verible.filelist' ancestor at
+  all).
+
+This is an explicit, hand-maintained table rather than something
+inferred from each server's own `initialize' capabilities on purpose:
+capabilities are untrustworthy in BOTH directions in this project (see
+`dev/lsp-probe.py''s header, lesson 1 -- a server can decline to
+declare a capability it actually supports, or declare one it then
+answers incorrectly), and neither `verible-verilog-ls' nor
+`slang-server' advertises anything about its OWN root-scoping semantics
+at all -- there is no LSP field this could even be read from. The
+difference above was found by testing two real servers side by side,
+not by reading a spec; a table populated by hand is the only way to
+carry that finding forward.")
+
+(defun lsp--server-root-style (command)
+  "STYLE for COMMAND per `lsp-server-root-style-alist': `workspace' or
+`filelist' (the default for a nil/empty COMMAND, or any COMMAND not
+matched below).
+
+Matches on COMMAND's own basename (`file-name-nondirectory'), the same
+discipline `lsp--verible-command-p' already uses for the sibling
+verible-detection case -- so a full path like
+\"/usr/local/bin/slang-server\" still matches the bare \"slang-server\"
+entry `lsp-server-root-style-alist' ships by default, not just an exact
+string match against however the alist happens to spell it."
+  (or (and command (not (string= command ""))
+           (cdr (assoc (file-name-nondirectory command)
+                       lsp-server-root-style-alist)))
+      'filelist))
+
+(defun lsp--filelist-entries (filelist-path)
+  "Absolute path of every source file named by the file list at
+FILELIST-PATH, in file order, with NO existence check and NO extension
+filter -- this is a pure parser over the file list's own text, nothing
+more.
+
+Skips: blank lines, and lines whose TRIMMED text starts with `#'
+(verible comment), `//' (verible comment), `+' (a plusarg-style tool
+flag, e.g. `+incdir+...'), or `-' (a flag-with-argument, e.g. `-f
+other.f' -- the whole line is dropped, no attempt is made to split
+flag from argument). Every remaining line is `expand-file-name'-
+resolved against FILELIST-PATH's OWN DIRECTORY (`file-name-directory'),
+not against any caller-supplied root -- this matters for
+`lsp--filelist-component-root' below, which reads file lists that live
+in different directories from each other and from the buffer being
+resolved.
+
+This exact parsing loop used to live inlined inside
+`verilog-auto--library-filelist-files' (`verilog-auto.el') -- extracted
+here, with that function now calling this one and applying its own two
+EXTRA filters (`verilog-auto--library-file-name-p' and `file-exists-p')
+on top, so its own behavior is unchanged by the extraction. The
+direction of this dependency (`verilog-auto.el' calling into `lsp.el')
+is not new -- `verilog-auto--library-filelist-files' already calls
+`lsp--project-root' at that same call site.
+
+Known limitation, documented rather than fixed (M132 fix round, review
+#8): `expand-file-name' is a PURE STRING normalization -- it folds
+`.'/`..' and resolves relative-to-absolute, but never touches symlinks
+or filesystem case. Two `verible.filelist' files that both name what
+is, physically, the SAME file -- one through a symlinked path, or on a
+case-insensitive filesystem through two differently-cased spellings --
+are therefore NOT recognized as sharing that file by
+`lsp--filelist-component-root''s (below) connected-component merge, so
+two halves of one design that should widen into a single `workspace'
+root can stay split into two. This matches the project's existing,
+already-accepted policy for `find-file' path comparison (M61's record
+in `PLAN.md', \"Tradeoff one\" -- NOT a docstring: `expand_file_name's
+own Rust doc comment in `crates/core/src/builtins/files.rs' states
+only the GNU-parity reason, and all four live in that PLAN.md section:
+pure-string `expand-file-name' rather than `canonicalize', for
+consistency with this codebase's other path machinery, nonexistent-path
+support, GNU parity, and this platform's own `/var' -> `/private/var'
+symlink breaking existing tests). Not
+fixed here for the same reason, plus the error direction is the safe
+one: this only makes the widening rule apply in FEWER cases than a
+canonicalizing version would (\"widens less than it could\"), never in
+MORE (\"widens more than it should\") -- the failure mode is a missed
+merge, never a false one."
+  (let ((dir (file-name-directory filelist-path))
+        (text (condition-case nil
+                  (file-contents-as-string filelist-path)
+                (error nil)))
+        acc)
+    (when text
+      (dolist (raw (split-string text "\n"))
+        (let ((line (string-trim raw)))
+          (unless (or (string= line "")
+                      (string-prefix-p "#" line)
+                      (string-prefix-p "//" line)
+                      (string-prefix-p "+" line)
+                      (string-prefix-p "-" line))
+            (push (expand-file-name line dir) acc)))))
+    (nreverse acc)))
+
+(defun lsp--filelist-incdirs (filelist-path)
+  "Absolute include directories declared by `+incdir+' lines in the
+file list at FILELIST-PATH (M133) -- a SECOND reader over the same
+text `lsp--filelist-entries' parses just above, not a change to it:
+that function deliberately drops every `+'/`-' line (see its own
+docstring) and that stays exactly as it is here too -- this function
+exists only to recover the information those dropped `+incdir+' lines
+carry, for `lsp--verilog-include-directories' below.
+
+Recognises the standard packed form `+incdir+A+B+C' -- several
+directories bundled into one token, `+'-separated -- by stripping the
+literal `+incdir+' prefix and splitting the remainder on `+', discarding
+empty segments (so a line ending in a stray trailing `+', or one with
+no directory after the prefix at all, contributes nothing rather than
+an empty-string directory). Any other `+'-prefixed line (a plusarg this
+project has no other use for) is skipped, same as blank lines and
+`#'/`//' comments.
+
+Each directory is resolved with `expand-file-name' against FILELIST-
+PATH's OWN DIRECTORY -- the exact rule `lsp--filelist-entries' uses,
+not against any caller-supplied root, so this agrees with that
+function about where a relative entry in this same file points.
+Directories that do not exist on disk (`file-directory-p') are dropped
+silently: a stale or mistyped `+incdir+' should contribute nothing to
+what gets handed to slang, not fabricate a search path that was never
+real."
+  (let ((dir (file-name-directory filelist-path))
+        (text (condition-case nil
+                  (file-contents-as-string filelist-path)
+                (error nil)))
+        acc)
+    (when text
+      (dolist (raw (split-string text "\n"))
+        (let ((line (string-trim raw)))
+          (unless (or (string= line "")
+                      (string-prefix-p "#" line)
+                      (string-prefix-p "//" line))
+            (when (string-prefix-p "+incdir+" line)
+              (dolist (seg (split-string
+                            (substring line (length "+incdir+")) "\\+"))
+                (unless (string= seg "")
+                  (let ((full (expand-file-name seg dir)))
+                    (when (file-directory-p full)
+                      (push full acc))))))))))
+    (nreverse acc)))
+
+(defvar lsp--filelist-component-root-cache (make-hash-table :test 'equal)
+  "Memoization table for `lsp--filelist-component-root', keyed on
+`(START . CAP)' (both directories, trailing slash), mapping to a
+one-element list wrapping the answer (a root string or nil) -- the
+same \"wrap so a cached nil is distinguishable from never-computed\"
+shape `lsp--nearest-filelist-root-cache' uses, for the same reason (a
+hash table's own miss value is also nil). Never invalidated in v1,
+same acceptance rationale as that cache's own docstring: a project's
+file-list layout changing shape underneath a live session is rare, a
+stale answer costs at most one wrong `rootUri' recoverable by
+restarting the editor, and every OTHER repeated call already re-reads
+every file list from disk with no caching layered under IT either.")
+
+(defvar lsp--filelist-component-root-rg-warned nil
+  "Non-nil once `lsp--filelist-component-root' has already `message'd
+that `rg' is missing or failed, for the life of the process --
+messaged ONCE per session, not once per call, so a missing `rg' binary
+degrades to a single visible notice instead of either silently
+widening never at all (indistinguishable from the feature simply
+working) or spamming the echo area on every idle tick.")
+
+(defun lsp--filelist-component-root--covering-dir (dirs)
+  "The deepest directory that is an ancestor of, or equal to, every
+directory in DIRS (a list of directory strings, trailing slash) --
+i.e. the smallest directory that covers all of them. Named and kept
+separate from `lsp--filelist-component-root' so the \"smallest common
+ancestor of a set of directories\" step is independently testable.
+
+Algorithm: start from the first entry of DIRS and repeatedly walk it
+upward (`file-name-directory' on the `directory-file-name'd value)
+until every remaining entry in DIRS is `string-prefix-p' of it (i.e.
+it is an ancestor of, or equal to, all of them). DIRS is never empty
+when this is called (the caller always seeds it with at least the
+resolved FILE's own directory)."
+  (let ((candidate (car dirs)))
+    (while (not (let ((covers t))
+                  (dolist (d dirs covers)
+                    (unless (string-prefix-p candidate d)
+                      (setq covers nil)))))
+      (let ((parent (file-name-directory (directory-file-name candidate))))
+        (setq candidate (if (and parent (not (string= parent candidate)))
+                             parent
+                           ;; No further ancestor to climb to (hit the
+                           ;; filesystem root) -- stop here rather than
+                           ;; loop forever; the caller's own `.git' cap
+                           ;; (step 10 of `lsp--filelist-component-root')
+                           ;; is the actual backstop against ever
+                           ;; returning something this wide in practice.
+                           candidate))))
+    candidate))
+
+(defun lsp--filelist-component-root (file)
+  "The A-prime workspace root for FILE: the smallest directory covering
+every file named by the `verible.filelist' CONNECTED COMPONENT FILE's
+own nearest file list belongs to, capped at the nearest `.git'
+ancestor -- or nil when the rule does not apply, meaning \"fall back to
+`lsp--project-root'\".
+
+Two file lists that name any source file in common are describing ONE
+design; two that share nothing are two independent designs and must
+never be merged into a single widened root (see the duplicate-
+declaration hazard `lsp--workspace-duplicate-declarations' exists to
+catch, for what happens when two designs sharing no file list DO end up
+under one root anyway).
+
+Returns a string with no trailing slash (`directory-file-name',
+matching `lsp--project-root's own return shape), or nil.
+
+Steps:
+1. nil unless FILE is Verilog/SystemVerilog (`lsp--verilog-buffer-p').
+2. `start' = FILE's own directory.
+3. `fl' = `(lsp--nearest-filelist-root start)'; nil short-circuits to
+   nil here (no file list ancestor at all -- nothing to widen from).
+4. `cap' = `(search--find-root start)', the nearest `.git' ancestor
+   (`search.el') -- NOT another call to
+   `lsp--project-root', deliberately: this needs the REPO boundary,
+   not the narrower filelist-aware project boundary that function
+   itself already special-cases for Verilog. `search--find-root'
+   returns START ITSELF when no `.git' exists anywhere above -- in that
+   case `fl' will not normally be under `cap' (they're unrelated
+   directories unless `fl' happens to equal `start'), so step 5 below
+   returns nil, which is the intended conservative answer: NEVER widen
+   a root without a real `.git' boundary to cap the widening against.
+5. nil unless `fl' is `cap' itself or lies under it.
+6. Enumerate every `verible.filelist' under `cap' via
+   `rg --files -g verible.filelist CAP' (`call-process-string', 2000ms
+   budget -- the same mechanism and budget
+   `lsp--references-outside-root-files' already uses). If `rg' is
+   missing or exits non-zero, `message' once per session
+   (`lsp--filelist-component-root-rg-warned') that the per-server root
+   fell back, and return nil -- a fallback nobody can see is
+   indistinguishable from the feature simply working, which is the
+   exact silent-degradation failure this whole project keeps re-
+   learning the cost of. If the enumeration does not include `fl's own
+   file list, return nil (should not happen given step 5, but guards
+   against a stale cache/race rather than asserting it away).
+7. Build the CONNECTED COMPONENT starting from `fl': repeatedly absorb
+   any OTHER enumerated file list whose own `lsp--filelist-entries' set
+   intersects the entries accumulated so far. This is TRANSITIVE -- A
+   sharing an entry with B and B sharing one with C merges all three
+   into one component even though A and C may share nothing directly.
+8. `covered' = every entry of every file list in the component, plus
+   each of those file lists' own directories, plus FILE itself.
+9. `root' = `lsp--filelist-component-root--covering-dir' over the
+   directories of every member of `covered'.
+10. Clamp: if `root' is not `cap' and not under `cap', use `cap'
+    instead -- this function must never return anything above `cap'.
+11. Memoized on `(start . cap)' in
+    `lsp--filelist-component-root-cache', mirroring
+    `lsp--nearest-filelist-root-cache''s own \"never invalidated,
+    process lifetime\" shape and rationale (see that cache's own
+    docstring).
+
+Known limitation, documented rather than fixed (M132 fix round, review
+#8; the mechanism is `lsp--filelist-entries''s own, see that
+function's docstring for the full rationale): step 7's \"shares an
+entry\" test is `equal' on `expand-file-name'-normalized strings, never
+symlink- or case-resolved, so two file lists reaching the same
+physical file through a symlinked path, or through two differently-
+cased spellings on a case-insensitive filesystem, are not seen as
+sharing it. This widens LESS than a canonicalizing version would,
+never MORE -- the failure mode is a missed merge (two halves of one
+design staying split), never a false one."
+  (if (not (lsp--verilog-buffer-p file))
+      nil
+    (let* ((start (file-name-directory (expand-file-name file)))
+           (cap (search--find-root start))
+           (cache-key (cons start cap))
+           (cached (gethash cache-key lsp--filelist-component-root-cache
+                             'lsp--filelist-component-root-not-cached)))
+      (if (not (eq cached 'lsp--filelist-component-root-not-cached))
+          (car cached)
+        (let ((answer (lsp--filelist-component-root--compute file start cap)))
+          (puthash cache-key (list answer) lsp--filelist-component-root-cache)
+          answer)))))
+
+(defun lsp--filelist-component-root--compute (file start cap)
+  "Uncached body of `lsp--filelist-component-root' -- see that
+function's own docstring, steps 3-10, for the algorithm. Split out
+purely so the caller's memoization wrapper stays short; not meant to
+be called directly outside it."
+  (let ((fl (lsp--nearest-filelist-root start)))
+    (if (not fl)
+        nil
+      (if (not (or (string= fl cap) (string-prefix-p cap fl)))
+          nil
+        (let* ((rg-args (list "--files" "-g" "verible.filelist" cap))
+               (rg-result (call-process-string "rg" rg-args "" 2000 nil)))
+          (if (not (and rg-result (= (nth 0 rg-result) 0)))
+              (progn
+                (unless lsp--filelist-component-root-rg-warned
+                  (setq lsp--filelist-component-root-rg-warned t)
+                  (message "LSP: per-server workspace root falls back to \
+the default (rg is missing or failed) -- verible/slang may misresolve \
+cross-file symbols"))
+                nil)
+            (let ((filelists
+                   (mapcar (lambda (rel) (expand-file-name rel cap))
+                           (split-string (nth 1 rg-result) "\n" t))))
+              (if (not (member fl (mapcar #'file-name-directory filelists)))
+                  nil
+                (lsp--filelist-component-root--finish file fl cap filelists)))))))))
+
+(defun lsp--filelist-component-root--finish (file fl cap filelists)
+  "Steps 7-10 of `lsp--filelist-component-root': given FL's own file
+list directory already confirmed present among FILELISTS (every
+`verible.filelist' found under CAP), build FL's transitive connected
+component, compute the covering directory of everything it names plus
+FILE itself, and clamp the result to CAP. See
+`lsp--filelist-component-root's own docstring for the full algorithm
+this implements."
+  (let* ((fl-path (concat fl "verible.filelist"))
+         (component (list fl-path))
+         (entries (make-hash-table :test 'equal))
+         (changed t))
+    (dolist (e (lsp--filelist-entries fl-path))
+      (puthash e t entries))
+    (while changed
+      (setq changed nil)
+      (dolist (other filelists)
+        (unless (member other component)
+          (let ((other-entries (lsp--filelist-entries other)) (shares nil))
+            (dolist (e other-entries)
+              (when (gethash e entries) (setq shares t)))
+            (when shares
+              (push other component)
+              (dolist (e other-entries) (puthash e t entries))
+              (setq changed t))))))
+    (let ((dirs (list (file-name-directory (expand-file-name file)))))
+      (dolist (fp component)
+        (push (file-name-directory fp) dirs)
+        (dolist (e (lsp--filelist-entries fp))
+          (push (file-name-directory e) dirs)))
+      (let ((root (lsp--filelist-component-root--covering-dir dirs)))
+        (directory-file-name
+         (if (or (string= root cap) (string-prefix-p cap root))
+             root
+           cap))))))
+
+(defun lsp--project-root-for-command (command file)
+  "The ROOT to use for COMMAND's own connection to FILE: `lsp--filelist-
+component-root' when `lsp--server-root-style' says COMMAND is
+`workspace'-scoped (falling back to `lsp--project-root' when the A-
+prime rule does not apply), or plain `lsp--project-root' for
+`filelist'-scoped commands (the default). See `lsp-server-root-style-
+alist''s own docstring for what the two styles mean and why a hand-
+maintained table decides between them.
+
+This is the ONE function every root-as-connection-identity call site in
+this file must route through instead of calling `lsp--project-root'
+directly -- see that function's own callers below (`lsp--client-root-
+or-computed' is deliberately the sole exception, see its own docstring)."
+  (if (eq (lsp--server-root-style command) 'workspace)
+      (or (lsp--filelist-component-root file) (lsp--project-root file))
+    (lsp--project-root file)))
+
+;; --- M133: Verilog include-directory discovery, for slang-server -----
+;;
+;; slang-server never gets told where a project's `+incdir+' headers
+;; live unless something says so (see the M133 spec's own "what is
+;; actually broken" section): `initializationOptions' and `workspace/
+;; didChangeConfiguration' are both measured IGNORED, and its own
+;; `.slang/server.json' config file only ever gets read from the
+;; server's OWN rootUri, which M132 can compute to be an ancestor the
+;; user never authored a config file in. This section computes the
+;; directory list; `lsp--verilog-maybe-push-include-directories' below
+;; (next to `lsp-connect') is what actually sends it.
+
+(defvar lsp-verilog-include-directories nil
+  "A list of directories `lsp--verilog-include-directories' (M133)
+should hand slang-server as include search paths, INSTEAD of
+discovering them itself. Relative entries are expanded against the
+project ROOT being connected to. When this is non-nil it is the ONLY
+source consulted -- the `verible.filelist'/`.svh'-scanning discovery
+below never runs at all -- so a user who wants an exact, predictable
+list (or who wants to opt out of the `rg' scan entirely on a huge
+tree) can pin one here. nil (the default) means \"discover\".")
+
+(defvar lsp-verilog-include-directories-max 64
+  "Cap on how many directories `lsp--verilog-include-directories' (M133)
+will discover before truncating. Falling short of this is fine and
+common; EXCEEDING it must never be silent -- truncating without saying
+so would look identical to \"this project only has that many
+directories\", the same silent-degradation failure this file's other
+`rg'-backed discovery already guards against (see
+`lsp--filelist-component-root-rg-warned''s own docstring). A truncation
+always `message's the true count and the cap.")
+
+(defvar lsp--verilog-include-directories-cache (make-hash-table :test 'equal)
+  "Session-lifetime memo for `lsp--verilog-include-directories', keyed
+on ROOT (an absolute directory string, no trailing slash). Added
+because the discovery it wraps runs once per LSP connect, and this
+project can have TWO servers (verible and slang) each independently
+reconnecting to the SAME project any number of times (M132 gave each
+its own per-server root) -- without this, a large tree would pay for
+two full `rg' scans per connect, forever, for an answer that never
+changes within one session. Never invalidated automatically in v1,
+same acceptance rationale as `lsp--nearest-filelist-root-cache': a
+project's headers changing shape underneath a live editing session is
+rare, and a stale answer costs at most one missed or extra include
+directory, recoverable by `lsp-verilog-show-include-directories''s own
+prefix-argument cache-clear (section 3.6) or by restarting the editor.
+`lsp--verilog-include-directories-clear-cache' is the one sanctioned
+way to drop an entry early.")
+
+(defun lsp--verilog-include-directories-clear-cache (root)
+  "Drop ROOT's entry from `lsp--verilog-include-directories-cache', if
+any -- the escape hatch `lsp-verilog-show-include-directories' (M133,
+section 3.6) uses under a prefix argument, for the rare case a
+project's headers changed shape mid-session and a user wants the next
+connect to re-scan rather than reuse a cached answer."
+  (remhash root lsp--verilog-include-directories-cache))
+
+(defun lsp--verilog-include-directories--cap (dirs)
+  "Apply `lsp-verilog-include-directories-max' to DIRS (already
+deduplicated and sorted), `message'ing -- naming both the true count
+and the cap -- exactly when it truncates. See that variable's own
+docstring for why silent truncation is unacceptable here."
+  (let ((n (length dirs)))
+    (if (> n lsp-verilog-include-directories-max)
+        (progn
+          (message "LSP: Verilog include-directory discovery found %d \
+directories, truncated to %d (see `lsp-verilog-include-directories-max')"
+                   n lsp-verilog-include-directories-max)
+          (let (acc (kept 0))
+            (dolist (d dirs)
+              (when (< kept lsp-verilog-include-directories-max)
+                (push d acc)
+                (setq kept (1+ kept))))
+            (nreverse acc)))
+      dirs)))
+
+(defun lsp--verilog-degenerate-root-p (root)
+  "Non-nil if ROOT is nil, `/', or the user's own home directory
+(`lsp--home-directory') -- shared by BOTH branches of
+`lsp--verilog-include-directories': the discovery branch
+(`--discover') refuses to crawl any of these because root detection
+found nothing useful to scope a scan to, and the explicit-variable
+branch (`lsp-verilog-include-directories' non-nil) has the SAME trap
+for a RELATIVE entry -- fix-round finding: `expand-file-name' would
+silently resolve a relative entry against the EDITOR's own current
+working directory instead of ROOT, with no indication anything went
+wrong, if this guard were only applied to the discovery branch (as it
+originally was)."
+  (or (not root) (string= root "/") (string= root (lsp--home-directory))))
+
+(defun lsp--verilog-include-directories--dedup-sort (dirs)
+  "DIRS (a list of absolute directory strings, possibly with
+duplicates) deduplicated and sorted (`string<'), for a predictable,
+diff-stable generated build file (section 3.4) and predictable test
+assertions."
+  (let ((seen (make-hash-table :test 'equal)) acc)
+    (dolist (d dirs)
+      (unless (gethash d seen)
+        (puthash d t seen)
+        (push d acc)))
+    (sort (nreverse acc) #'string<)))
+
+(defun lsp--verilog-include-directories--discover (root)
+  "Uncached body of `lsp--verilog-include-directories' for the
+discovery path (`lsp-verilog-include-directories' is nil) -- split out
+purely so that function's memoization wrapper stays short.
+
+Refuses to scan a degenerate ROOT -- nil, `/', or the user's own home
+directory (`lsp--home-directory') -- because any of those means root
+detection found nothing useful to scope a scan to: crawling the whole
+home directory (or the filesystem) is both slow and, for this purpose,
+meaningless. `message's once that discovery was skipped and why, so a
+resulting empty answer reads as \"skipped\", not as \"there are no
+headers here\" -- returns nil in that case (nothing else to fall back
+to; `lsp-verilog-include-directories' is nil on this path by
+definition).
+
+Otherwise the union of:
+  - every `+incdir+' entry (`lsp--filelist-incdirs') of every
+    `verible.filelist' found under ROOT via one
+    `rg --files -g verible.filelist ROOT' call, the same mechanism and
+    2000ms budget `lsp--filelist-component-root' already uses.
+  - the parent directory of every `.svh'/`.vh' file found under ROOT
+    via one `rg --files -g \"*.svh\" -g \"*.vh\" ROOT' call. `rg'
+    honours `.gitignore', which is exactly what's wanted here: a
+    build's own generated/vendored headers under an ignored directory
+    should not turn into a search path handed to the server.
+
+Either `rg' call failing or `rg' being entirely missing makes that ONE
+source contribute nothing -- never an error -- so a missing `rg' still
+lets the `+incdir+' union (if any) through. If both sources end up
+empty, returns nil, and the caller
+(`lsp--verilog-maybe-push-include-directories') skips sending anything
+rather than pretend a directory exists."
+  (if (lsp--verilog-degenerate-root-p root)
+      (progn
+        (message "LSP: Verilog include-directory discovery skipped -- \
+root (%s) is nil, `/', or the home directory" (or root "nil"))
+        nil)
+    (let (acc)
+      (let ((rg-result (call-process-string
+                         "rg" (list "--files" "-g" "verible.filelist" root)
+                         "" 2000 nil)))
+        (when (and rg-result (= (nth 0 rg-result) 0))
+          (dolist (rel (split-string (nth 1 rg-result) "\n" t))
+            (dolist (d (lsp--filelist-incdirs (expand-file-name rel root)))
+              (push d acc)))))
+      (let ((rg-result (call-process-string
+                         "rg" (list "--files" "-g" "*.svh" "-g" "*.vh" root)
+                         "" 2000 nil)))
+        (when (and rg-result (= (nth 0 rg-result) 0))
+          (dolist (rel (split-string (nth 1 rg-result) "\n" t))
+            (push (directory-file-name
+                   (file-name-directory (expand-file-name rel root)))
+                  acc))))
+      (and acc (lsp--verilog-include-directories--cap
+                (lsp--verilog-include-directories--dedup-sort acc))))))
+
+(defun lsp--verilog-include-directories--explicit (root)
+  "Uncached body of `lsp--verilog-include-directories' for the explicit
+`lsp-verilog-include-directories' path -- split out to match
+`--discover''s own shape, and to carry the SAME degenerate-ROOT guard
+that function has (`lsp--verilog-degenerate-root-p').
+
+Each entry of `lsp-verilog-include-directories' is
+`expand-file-name'-resolved against ROOT and kept only if the result is
+an existing directory (`file-directory-p'). An entry that is ALREADY
+ABSOLUTE never actually needs ROOT to resolve (`expand-file-name' with
+an absolute NAME ignores its DEFAULT-DIRECTORY argument), so it is
+always tried regardless of ROOT. A RELATIVE entry under a degenerate
+ROOT (nil, `/', or the home directory) is refused instead of resolved
+-- fix-round finding: resolving it anyway would silently fall back to
+the EDITOR's own current working directory (`expand-file-name's
+behavior for a nil/nonexistent DEFAULT-DIRECTORY), which is never what
+a relative entry in this variable was meant to mean. `message's once,
+naming how many entries were dropped this way, so a resulting empty (or
+smaller-than-expected) answer is legible rather than silently
+incomplete."
+  (let ((degenerate (lsp--verilog-degenerate-root-p root))
+        dropped acc)
+    (dolist (d lsp-verilog-include-directories)
+      (if (and degenerate (not (string-prefix-p "/" d)))
+          (push d dropped)
+        (let ((full (expand-file-name d root)))
+          (when (file-directory-p full)
+            (push full acc)))))
+    (when dropped
+      (message "LSP: Verilog include-directory list skipped %d relative \
+entry(ies) -- root (%s) is nil, `/', or the home directory, so \
+resolving a relative entry against it would silently fall back to the \
+editor's own working directory" (length dropped) (or root "nil")))
+    (and acc (lsp--verilog-include-directories--cap
+              (lsp--verilog-include-directories--dedup-sort acc)))))
+
+(defun lsp--verilog-include-directories (root)
+  "Absolute Verilog/SystemVerilog include directories to give
+slang-server for ROOT (M133) -- see this section's header comment for
+why. Memoized for the process's lifetime in
+`lsp--verilog-include-directories-cache', keyed on ROOT; see that
+variable's own docstring for why and `lsp--verilog-include-directories-
+clear-cache' for how to drop an entry early.
+
+If `lsp-verilog-include-directories' is non-nil, it is the ONLY source
+(`lsp--verilog-include-directories--explicit') -- discovery
+(`lsp--verilog-include-directories--discover') never runs at all.
+Otherwise see that function's own docstring for the discovery
+algorithm. Either way the result is capped
+(`lsp--verilog-include-directories--cap')."
+  (let ((cached (gethash root lsp--verilog-include-directories-cache
+                          'lsp--verilog-include-directories-not-cached)))
+    (if (not (eq cached 'lsp--verilog-include-directories-not-cached))
+        cached
+      (let ((answer
+             (if lsp-verilog-include-directories
+                 (lsp--verilog-include-directories--explicit root)
+               (lsp--verilog-include-directories--discover root))))
+        (puthash root answer lsp--verilog-include-directories-cache)
+        answer))))
+
+;; --- M132 F2: duplicate-declaration detector for a widened root ---
+;;
+;; A `workspace'-style root can legitimately cover two sibling trees
+;; that happen to declare the same module/package/interface/program
+;; name -- and when it does, `slang-server' gives NO signal of any
+;; kind: measured 2026-09-11 on a synthetic two-chip fixture where
+;; `chipA/alu.sv' declares `module alu(a,b,sum)' and `chipB/alu.sv'
+;; declares `module alu(a,b,diff)', widening the root over both makes
+;; slang SILENTLY bind `textDocument/definition' on chipB's own
+;; instantiation to `chipA/alu.sv' instead, and then report a phantom
+;; severity-1 "port 'diff' does not exist in 'alu'" error on the
+;; perfectly valid `chipB/top_b.sv' -- neither `alu.sv' gets ANY
+;; duplicate-declaration diagnostic. The cause is invisible on the wire
+;; and the symptom blames the wrong file entirely. Since the server
+;; gives no signal, the client must.
+
+(defconst lsp--workspace-declaration-rg-pattern
+  "^[[:space:]]*(module|macromodule|package|interface(?:[[:space:]]+class)?|program)[[:space:]]+([A-Za-z_][A-Za-z0-9_$]*)"
+  "The declaration-line pattern `lsp--workspace-duplicate-declarations'
+hands to `rg' (default, non-PCRE regex syntax -- alternation and
+POSIX classes both work in it unmodified) to find candidate
+declaration lines, restricted by that function's own `-g' globs to the
+four Verilog/SystemVerilog extensions. Matches a `module'/`macromodule'/
+`package'/`interface'/`interface class'/`program' keyword at the start
+of a line (optional leading whitespace), followed by the declared
+NAME. `interface class' is matched as a unit so the NAME captured is
+the class name, not the keyword `class' itself -- without that, the
+identifier sitting right after `interface' in `interface class Foo;'
+is the keyword `class', and two files declaring two unrelated
+`interface class'es get reported as a duplicate of a thing called
+\"class\".
+
+Checked 2026-09-12 rather than assumed: `grep -rniE \"interface[[:space:]]+class\"'
+over this whole repo returns ZERO hits, `demo/verif/' included. So no
+demo material exercises this branch, and the only thing standing
+behind it is `workspace_duplicate_declarations_reads_the_name_of_an_
+interface_class's own synthetic fixture. (An earlier draft of this
+docstring asserted the construct was \"real in `demo/verif/'\"; it is
+not, and that sentence was removed rather than left for the next
+reader to act on.)")
+
+(defconst lsp--workspace-declaration-name-regexp
+  "^[[:space:]]*\\(?:module\\|macromodule\\|package\\|interface\\(?:[[:space:]]+class\\)?\\|program\\)[[:space:]]+\\([A-Za-z_][A-Za-z0-9_$]*\\)"
+  "Elisp-syntax mirror of `lsp--workspace-declaration-rg-pattern', used
+to pull the captured NAME back out of each matching line `rg' returns
+-- `rg' itself does not print capture groups without `--replace' or a
+PCRE engine, so the name is extracted client-side against the exact
+same logical pattern instead.")
+
+(defun lsp--workspace-duplicate-declarations (root)
+  "Alist of `(NAME . (FILE FILE ...))', sorted by NAME, for every
+module/package/interface/program NAME declared in TWO OR MORE distinct
+files under ROOT. nil for a clean root, and also nil if `rg' is
+missing or fails (advisory only, same silent-nil-on-failure discipline
+as `lsp--references-outside-root-files').
+
+Scans via `rg --no-heading -N' (one `path:content' line per match, no
+line numbers) restricted to `-g \\='*.sv\\=' -g \\='*.svh\\=' -g \\='*.v\\='
+-g \\='*.vh\\='', matching `lsp--workspace-declaration-rg-pattern' at the
+start of a line. Bounded to the same 2000ms budget
+`lsp--filelist-component-root' and `lsp--references-outside-root-files'
+both already use. Measured 2026-09-11 with `dev/gen-big-rtl.py'-
+generated trees: 8900 files / 35MB / 8900 declarations -> 0.13s.
+
+Each `path:content' line is split on its FIRST colon -- a Verilog
+source file whose own name contains a literal colon would corrupt this
+split, the same documented, accepted gap
+`lsp--references-outside-root-files' already carries for embedded
+newlines in a filename (see that function's own docstring); not fixed
+for the same reason -- not a shape this project's target RTL workflow
+produces. A line that doesn't actually match
+`lsp--workspace-declaration-name-regexp' after the split (should not
+happen given the `rg' pattern already filtered for it, but a defensive
+no-op rather than an assumption) is silently skipped.
+
+Known limitation, documented rather than fixed (M132 fix round, review
+#2): this scans line by line and tracks no block-comment state, so a
+declaration written inside a `/* ... */' block comment counts as a
+real one. `./real.sv:module foo(a,b); endmodule' next to
+`./commented.sv:/* module foo(a,b); */' is reported as a duplicate of
+`foo' even though only one of the two actually declares it. Not fixed
+because tracking block-comment state correctly needs a real parse (a
+naive \"toggle on every `/*'/`*/'\" scan breaks on `//' line comments
+that themselves contain `/*' or `*/', and on strings), which is more
+machinery than this advisory-only, best-effort scan is meant to carry
+-- and the error direction is the safe one: a spurious warning on a
+clean root, never a missed warning on an actually-duplicated one. The
+real cost, if this fires often on commented-out code, is that it
+erodes trust in the warning -- a reader who has seen it cry wolf once
+is more likely to ignore it the time it is right."
+  (let* ((args (list "--no-heading" "-N"
+                     "-g" "*.sv" "-g" "*.svh" "-g" "*.v" "-g" "*.vh"
+                     "-e" lsp--workspace-declaration-rg-pattern
+                     root))
+         (result (call-process-string "rg" args "" 2000 nil)))
+    (when (and result (= (nth 0 result) 0))
+      (let ((by-name (make-hash-table :test 'equal)))
+        (dolist (line (split-string (nth 1 result) "\n" t))
+          (let ((sep (string-match ":" line)))
+            (when sep
+              (let ((file (substring line 0 sep))
+                    (content (substring line (1+ sep))))
+                (when (string-match lsp--workspace-declaration-name-regexp content)
+                  (let* ((name (match-string 1 content))
+                         (existing (gethash name by-name)))
+                    (unless (member file existing)
+                      (puthash name (cons file existing) by-name))))))))
+        (let (out)
+          (maphash (lambda (name files)
+                     (when (>= (length files) 2)
+                       (push (cons name (reverse files)) out)))
+                   by-name)
+          (sort out (lambda (a b) (string< (car a) (car b)))))))))
+
+(defun lsp--workspace-duplicate-warning--first-n (list n)
+  "The first N elements of LIST, in order, or all of LIST if it has
+fewer than N. No sequence-library dependency (this project's `elisp'
+has no `seq-take'/`cl-subseq'/`take') -- a small hand-rolled loop
+instead."
+  (let (out (remaining n))
+    (dolist (x list (nreverse out))
+      (when (> remaining 0)
+        (push x out)
+        (setq remaining (1- remaining))))))
+
+(defun lsp--workspace-duplicate-warning (root)
+  "A one-line advisory message string naming every duplicate
+module/package/interface/program declaration under ROOT
+(`lsp--workspace-duplicate-declarations'), or nil for a clean root (or
+one `rg' could not scan).
+
+States the CONSEQUENCE, not just the fact -- a reader who has never
+seen this class of bug has no reason to treat \"two files declare the
+same name\" as urgent on its own: slang-server will bind one of them
+SILENTLY and misreport errors against the other, innocent file (see
+this section's own header comment for the concrete, measured case).
+Names only the first 3 duplicated NAMEs (with their files) when there
+are more, followed by a count of the rest, so the message stays one
+line for a large duplicate set instead of growing without bound."
+  (let ((dups (lsp--workspace-duplicate-declarations root)))
+    (when dups
+      (let* ((shown (lsp--workspace-duplicate-warning--first-n dups 3))
+             (rest (- (length dups) (length shown)))
+             (parts
+              (mapcar (lambda (entry)
+                        (format "%s (%s)" (car entry)
+                                (mapconcat #'identity (cdr entry) ", ")))
+                      shown)))
+        (format "LSP: %d duplicate declaration(s) under %s -- %s%s -- \
+slang-server will silently bind to ONE of them and may misreport errors \
+against the other(s)"
+                (length dups) root
+                (mapconcat #'identity parts "; ")
+                (if (> rest 0) (format "; and %d more" rest) ""))))))
+
+(defvar lsp--workspace-duplicate-warned-roots nil
+  "List of ROOT strings `lsp--workspace-duplicate-warning' has already
+been messaged for once, this session -- see the call sites in
+`lsp-connect'/`lsp--autostart-begin' for where the warning is actually
+emitted. Never cleared (process lifetime), the same \"message once,
+not once per handshake\" discipline
+`lsp--filelist-component-root-rg-warned' uses, for the same reason: a
+warning nobody can see because it fires once and is instantly buried
+by other startup messages is still better than one that fires on every
+autostart tick, but firing it EXACTLY once per root, ever, is the
+actual goal.")
+
+(defun lsp--workspace-maybe-warn-duplicates (command root)
+  "If COMMAND is `workspace'-style (`lsp--server-root-style') and ROOT
+has not already been warned about this session
+(`lsp--workspace-duplicate-warned-roots'), `message' `lsp--workspace-
+duplicate-warning's answer for ROOT (if non-nil) and record ROOT as
+warned either way -- a clean root is recorded too, so a later
+connection for the SAME root never re-scans it. Called from both
+`lsp-connect' and `lsp--autostart-begin', the two places a real
+connection actually starts (`M-x lsp' and autostart respectively), so
+the scan runs once per newly-started workspace-style connection, not
+on every root computation."
+  (when (and (eq (lsp--server-root-style command) 'workspace)
+             (not (member root lsp--workspace-duplicate-warned-roots)))
+    (push root lsp--workspace-duplicate-warned-roots)
+    (let ((warning (lsp--workspace-duplicate-warning root)))
+      (when warning
+        (message "%s" warning)))))
+
+(defun lsp-verilog-duplicate-declarations ()
+  "Interactive: run `lsp--workspace-duplicate-declarations' on the
+current buffer's `workspace'-style root (via `lsp--project-root-for-
+command', using the SECONDARY server registered for this buffer's
+mode, since `slang-server' -- the default and, as of M132, only
+`workspace'-style command -- is registered as a secondary, not a
+primary) and `message' the result, including the clean case (a root
+with no duplicates), so this command is never silently useless."
+  (interactive)
+  (let ((file (buffer-file-name)))
+    (if (not file)
+        (message "Buffer is not visiting a file")
+      (let* ((mode (major-mode-internal-get))
+             (entry (or (lsp--secondary-server-for-mode mode)
+                        (lsp--server-for-mode mode))))
+        (if (not entry)
+            (message "No LSP server registered for %s" mode)
+          (let ((root (lsp--project-root-for-command (car entry) file)))
+            (let ((warning (lsp--workspace-duplicate-warning root)))
+              (message "%s" (or warning
+                                 (format "LSP: no duplicate declarations under %s"
+                                         root))))))))))
+
 (defun lsp--client-root-or-computed (client file)
   "The ROOT to label CLIENT's own answers with (M131): CLIENT's stored
 `lsp--client-root' when it has one, else `lsp--project-root' on FILE.
@@ -2992,8 +4233,8 @@ Guard order is significant -- cheapest and most-common-case-first:
    ssh invocations just to decide whether to auto-attach -- on the
    open-file path, no less.
 5. No `lsp-server-alist' entry for MODE -> nil.
-6. No live connection already open for (COMMAND . `lsp--project-root'
-   of FILE) -> nil.
+6. No live connection already open for (COMMAND . `lsp--project-root-
+   for-command' of COMMAND and FILE, M132) -> nil.
 
 Deliberately NOT prefix-matching FILE's path against a connection's
 root (\"root is an ancestor of file\"): that would be a second, looser
@@ -3008,7 +4249,8 @@ different server instance than another buffer in the same project."
    (t
     (let ((entry (lsp--server-for-mode mode)))
       (when entry
-        (lsp--get-connection (car entry) (lsp--project-root file)))))))
+        (lsp--get-connection (car entry)
+                              (lsp--project-root-for-command (car entry) file)))))))
 
 (defun lsp--buffer-has-live-client-for-command-p (command)
   "Non-nil if the current buffer already has a LIVE client (per
@@ -3065,7 +4307,9 @@ honor it), regressing M88's F4b fix."
          (and command
               (or (equal (car (lsp--server-for-mode mode)) command)
                   (equal (car (lsp--secondary-server-for-mode mode)) command))
-              (eq (lsp--get-connection command (lsp--project-root file)) client)))))
+              (eq (lsp--get-connection
+                   command (lsp--project-root-for-command command file))
+                  client)))))
 
 (defun lsp--auto-attach-backfill (mode client)
   "Called by `lsp' right after it successfully attaches the current
@@ -3205,7 +4449,7 @@ independent reasons, not one:
      (t
       (let* ((command (car entry))
              (args (cdr entry))
-             (root (lsp--project-root file)))
+             (root (lsp--project-root-for-command command file)))
         ;; M88 F1 review fix: an explicit `M-x lsp' always wins a race
         ;; against an in-flight autostart for this exact key -- cancel
         ;; it first (kills nothing that's attached yet, since nothing
@@ -3796,13 +5040,21 @@ pending for it, anywhere, ever -- the mode line's `LSP…' indicator was
 simply dead for the entire secondary autostart window, silently.
 Mirrors `lsp--auto-attach-backfill-matches-p''s own two-table check
 (added at the same review point, for the actual attach rather than
-just this cosmetic marker)."
+just this cosmetic marker).
+
+M132: the final ROOT comparison routes through `lsp--project-root-for-
+command' (keyed on COMMAND, already in scope here), not the plain
+`lsp--project-root' this predicate used before -- a `workspace'-style
+server's ROOT can legitimately differ from what `lsp--project-root'
+alone would compute for FILE, and comparing against the wrong one
+would make this predicate wrongly say \"no match\" for a buffer that
+autostart's own pending handshake actually does cover."
   (and file
        (not (lsp--remote-path-p file))
        (eq buf-mode mode)
        (or (equal (car (lsp--server-for-mode buf-mode)) command)
            (equal (car (lsp--secondary-server-for-mode buf-mode)) command))
-       (equal (lsp--project-root file) root)))
+       (equal (lsp--project-root-for-command command file) root)))
 
 (defun lsp--autostart-mark-pending (command root marked &optional mode)
   "Add (MARKED non-nil) or remove (MARKED nil) `(COMMAND . ROOT)' in/from
@@ -4026,9 +5278,18 @@ succeed into a failure."
                (setf (lsp--client-capabilities client)
                      (and (hash-table-p result) (gethash "capabilities" result)))
                (lsp--notify client "initialized" (make-hash-table))
+               ;; M133: immediately after `initialized' -- see
+               ;; `lsp--verilog-maybe-push-include-directories''s own
+               ;; docstring; this is the SECOND, async call site, the
+               ;; one the default file-open path actually goes through.
+               (lsp--verilog-maybe-push-include-directories client)
                (push (cons (cons command root) client) lsp--connections)
                (lsp--autostart-mark-pending command root nil)
                (message "LSP: autostarted %s for %s" command root)
+               ;; M132 F2: see `lsp-connect''s own matching call for why
+               ;; this happens here, at the point the connection is
+               ;; actually established, not inside root computation.
+               (lsp--workspace-maybe-warn-duplicates command root)
                (lsp--auto-attach-backfill mode client))))))
         (push (cons (cons command root)
                     (list conn client (+ (float-time) lsp-autostart-timeout)))
@@ -4053,22 +5314,34 @@ session, and `message' once."
     (message "LSP autostart: %s gave up waiting for %s"
              (car key) (cdr key))))
 
-(defun lsp--autostart-try-one (entry root mode)
+(defun lsp--autostart-try-one (entry file mode)
   "If ENTRY -- a (COMMAND . ARGS) pair, possibly nil -- is non-nil and
 the current buffer has no LIVE client already attached for its COMMAND
 (`lsp--buffer-has-live-client-for-command-p', M94), and there is no
 live connection, pending handshake, or prior give-up for `(COMMAND .
-ROOT)', begin an autostart attempt for it. A silent no-op for ENTRY
+ROOT)' -- ROOT computed HERE, per COMMAND, via `lsp--project-root-for-
+command' -- begin an autostart attempt for it. A silent no-op for ENTRY
 nil (MODE has no `lsp-server-alist'/`lsp-secondary-server-alist' entry
 at all).
 
 Shared by `lsp--autostart-maybe-begin' for BOTH `lsp-server-alist' and
 `lsp-secondary-server-alist' entries (M94) -- the two calls are
 independent, so a live primary never blocks a secondary from
-autostarting, and vice versa."
+autostarting, and vice versa.
+
+M132: this used to take ROOT as a parameter, computed ONCE by the
+caller and handed to both the primary and the secondary call --
+which made a shared root the only thing representable, silently wrong
+the instant the two servers need different roots (see `lsp-server-
+root-style-alist''s own docstring for why they do). Taking FILE
+instead and computing `(lsp--project-root-for-command command file)'
+here, after COMMAND is already destructured out of ENTRY, makes a
+shared root UNREPRESENTABLE rather than merely something the caller
+happens not to do today."
   (when entry
     (let* ((command (car entry))
            (args (cdr entry))
+           (root (lsp--project-root-for-command command file))
            (key (cons command root)))
       (when (and (not (lsp--buffer-has-live-client-for-command-p command))
                  (not (lsp--get-connection command root))
@@ -4131,7 +5404,13 @@ docstring already justifies skipping ahead of. Each of PRIMARY and
 SECONDARY is then tried independently via `lsp--autostart-try-one',
 whose own per-command \"already attached\" guard
 (`lsp--buffer-has-live-client-for-command-p') is what actually lets
-one attaching not block the other."
+one attaching not block the other.
+
+M132: no longer computes ROOT here at all -- `lsp--autostart-try-one'
+now takes FILE and computes its own per-COMMAND root, so PRIMARY and
+SECONDARY can end up with genuinely different roots (see that
+function's own docstring for why the old shared-ROOT shape was itself
+the defect)."
   (when (and lsp-autostart lsp-auto-attach)
     (let ((file (buffer-file-name))
           (mode (major-mode-internal-get)))
@@ -4140,9 +5419,8 @@ one attaching not block the other."
           (when (or secondary (not (lsp--live-buffer-client)))
             (let ((primary (lsp--server-for-mode mode)))
               (when (or primary secondary)
-                (let ((root (lsp--project-root file)))
-                  (lsp--autostart-try-one primary root mode)
-                  (lsp--autostart-try-one secondary root mode))))))))))
+                (lsp--autostart-try-one primary file mode)
+                (lsp--autostart-try-one secondary file mode)))))))))
 
 (defun lsp--autostart-tick ()
   "The idle-tick step (M88) for automatic LSP startup: called once per

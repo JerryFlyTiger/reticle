@@ -129,6 +129,19 @@ fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Same message-capturing shape used by `lsp_action_tests.rs`,
+/// `lsp_autostart_tests.rs`, `lsp_format_tests.rs`, `lsp_highlight_tests.rs`,
+/// `lsp_references_tests.rs`: `fset`s (via `defun`) a capturing lambda in
+/// place of the real `message` builtin, since `Editor::echo`/`message` is
+/// not observable through `Interp::out` (M62 precedent).
+fn capture_messages(i: &mut Interp) {
+    ok(i, "(setq test--messages nil)");
+    ok(
+        i,
+        "(defun message (fmt &rest args) (push (apply 'format fmt args) test--messages) fmt)",
+    );
+}
+
 /// Overrides `$HOME` for the duration of one test and restores it on
 /// drop (even on panic/assertion failure), the same discipline as
 /// `ssh_tests.rs`'s `TmpdirGuard`. `lsp--home-directory' (lsp.el) reads
@@ -537,6 +550,661 @@ fn project_root_falls_back_to_the_files_own_directory_when_nothing_matches() {
 
     let src = format!("(lsp--project-root {:?})", file.to_str().unwrap());
     assert_eq!(run(&mut i, &src), format!("{:?}", root.to_str().unwrap()));
+}
+
+// ============================================================
+// M132: per-server rootUri -- `lsp--server-root-style',
+// `lsp--project-root-for-command', `lsp--filelist-entries',
+// `lsp--filelist-component-root', and the duplicate-declaration
+// detector (`lsp--workspace-duplicate-declarations'/`-warning').
+// ============================================================
+
+#[test]
+fn project_root_for_command_unlisted_command_uses_project_root() {
+    // A command with no entry in `lsp-server-root-style-alist' (the
+    // default `verible-verilog-ls', or any other name entirely) must
+    // fall back to plain `lsp--project-root' -- the exact same answer,
+    // for a non-Verilog file so no filelist logic can be in play at
+    // all.
+    let mut i = setup();
+    let root = scratch_dir("unlisted_command");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let plain = run(
+        &mut i,
+        &format!("(lsp--project-root {:?})", file.to_str().unwrap()),
+    );
+    let for_command = run(
+        &mut i,
+        &format!(
+            "(lsp--project-root-for-command \"clangd\" {:?})",
+            file.to_str().unwrap()
+        ),
+    );
+    assert_eq!(for_command, plain);
+}
+
+#[test]
+fn project_root_for_command_workspace_style_widens_to_the_filelist_component() {
+    // proj/.git, proj/rtl/verible.filelist and proj/verif/verible.filelist
+    // share `core/alu.sv' -- one connected component, smallest covering
+    // directory is `proj' itself.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("workspace_widens");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(root.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(root.join("verif")).unwrap();
+    std::fs::write(
+        root.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = root.join("rtl/core/alu.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        root.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("verif/tb.sv"), "module tb; endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--project-root-for-command \"slang-server\" {:?})",
+        alu.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), format!("{:?}", root.to_str().unwrap()));
+}
+
+#[test]
+fn project_root_for_command_filelist_style_stays_at_the_nearest_filelist() {
+    // Same file, same fixture as the widening test above -- the two
+    // styles must disagree: `filelist' stays at `proj/rtl' (the
+    // nearest `verible.filelist' ancestor, exactly what plain
+    // `lsp--project-root' already returns), `workspace' widens all the
+    // way to `proj'. This is the per-server claim itself.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("filelist_style_stays_narrow");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(root.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(root.join("verif")).unwrap();
+    std::fs::write(
+        root.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = root.join("rtl/core/alu.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        root.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("verif/tb.sv"), "module tb; endmodule\n").unwrap();
+
+    let filelist_style = run(
+        &mut i,
+        &format!(
+            "(lsp--project-root-for-command \"verible-verilog-ls\" {:?})",
+            alu.to_str().unwrap()
+        ),
+    );
+    let workspace_style = run(
+        &mut i,
+        &format!(
+            "(lsp--project-root-for-command \"slang-server\" {:?})",
+            alu.to_str().unwrap()
+        ),
+    );
+    assert_eq!(
+        filelist_style,
+        format!("{:?}", root.join("rtl").to_str().unwrap())
+    );
+    assert_eq!(workspace_style, format!("{:?}", root.to_str().unwrap()));
+    assert_ne!(
+        filelist_style, workspace_style,
+        "the two root styles must disagree for the same file"
+    );
+}
+
+#[test]
+fn filelist_component_root_disjoint_lists_do_not_merge() {
+    // chipA and chipB each have their own `verible.filelist' with no
+    // entry in common, one `.git' above both -- each buffer must
+    // resolve to its OWN chip directory, never to the shared `.git'
+    // directory.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("disjoint_no_merge");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("chipA")).unwrap();
+    std::fs::create_dir_all(root.join("chipB")).unwrap();
+    std::fs::write(root.join("chipA/verible.filelist"), "alu.sv\ntop_a.sv\n").unwrap();
+    std::fs::write(root.join("chipB/verible.filelist"), "alu.sv\ntop_b.sv\n").unwrap();
+    std::fs::write(
+        root.join("chipA/alu.sv"),
+        "module alu(a,b,sum); endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("chipA/top_a.sv"), "module top_a; endmodule\n").unwrap();
+    std::fs::write(
+        root.join("chipB/alu.sv"),
+        "module alu(a,b,diff); endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("chipB/top_b.sv"), "module top_b; endmodule\n").unwrap();
+
+    let a_file = root.join("chipA/alu.sv");
+    let b_file = root.join("chipB/alu.sv");
+    let a_root = run(
+        &mut i,
+        &format!(
+            "(lsp--filelist-component-root {:?})",
+            a_file.to_str().unwrap()
+        ),
+    );
+    let b_root = run(
+        &mut i,
+        &format!(
+            "(lsp--filelist-component-root {:?})",
+            b_file.to_str().unwrap()
+        ),
+    );
+    assert_eq!(
+        a_root,
+        format!("{:?}", root.join("chipA").to_str().unwrap())
+    );
+    assert_eq!(
+        b_root,
+        format!("{:?}", root.join("chipB").to_str().unwrap())
+    );
+}
+
+#[test]
+fn filelist_component_root_is_nil_without_a_filelist_ancestor() {
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("no_filelist_ancestor");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let file = root.join("buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--filelist-component-root {:?})",
+        file.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "nil");
+}
+
+#[test]
+fn filelist_component_root_is_capped_at_git() {
+    // `verible.filelist' sits ABOVE the nearest `.git' -- no widening
+    // (and no honouring of the filelist at all): nil.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("capped_at_git");
+    std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+    std::fs::write(root.join("verible.filelist"), "sub/buf.sv\n").unwrap();
+    let file = root.join("sub/buf.sv");
+    std::fs::write(&file, "module buf; endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--filelist-component-root {:?})",
+        file.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "nil");
+}
+
+#[test]
+fn filelist_component_root_clamps_an_entry_that_escapes_the_git_root() {
+    // `rg --files -g verible.filelist CAP' only guarantees the filelist
+    // FILE ITSELF is under `.git' -- an ENTRY inside that filelist can
+    // still name a path outside the repo via `../..'. Without the clamp
+    // at step 10 of `lsp--filelist-component-root', the covering
+    // directory over that entry's directory would land ABOVE `.git',
+    // and this function would hand a workspace root outside the repo to
+    // the LSP server. `filelist_component_root_is_capped_at_git' above
+    // does NOT exercise this: there the filelist itself sits above
+    // `.git', which is rejected by an earlier, different guard (step 5)
+    // before the finishing function's own clamp is ever reached.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("clamp_escaping_entry");
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+    std::fs::create_dir_all(root.join("repo/rtl")).unwrap();
+    std::fs::write(root.join("outside/far.sv"), "module far; endmodule\n").unwrap();
+    std::fs::write(root.join("repo/rtl/alu.sv"), "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        root.join("repo/rtl/verible.filelist"),
+        "alu.sv\n../../outside/far.sv\n",
+    )
+    .unwrap();
+
+    let file = root.join("repo/rtl/alu.sv");
+    let src = format!(
+        "(lsp--filelist-component-root {:?})",
+        file.to_str().unwrap()
+    );
+    assert_eq!(
+        run(&mut i, &src),
+        format!("{:?}", root.join("repo").to_str().unwrap()),
+        "an entry escaping `.git' via `../..' must be clamped back to the \
+         repo root, never widen the workspace root outside the repo"
+    );
+}
+
+#[test]
+fn filelist_component_root_merges_transitively_across_three_lists() {
+    // A shares with B, B shares with C, A and C share nothing directly
+    // -- all three must still merge into one component.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let root = scratch_dir("transitive_merge");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::fs::create_dir_all(root.join("c")).unwrap();
+    std::fs::write(root.join("a/verible.filelist"), "a.sv\nshared_ab.sv\n").unwrap();
+    std::fs::write(
+        root.join("b/verible.filelist"),
+        "../a/shared_ab.sv\nshared_bc.sv\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("c/verible.filelist"), "../b/shared_bc.sv\nc.sv\n").unwrap();
+    std::fs::write(root.join("a/a.sv"), "module a; endmodule\n").unwrap();
+    std::fs::write(root.join("a/shared_ab.sv"), "module shared_ab; endmodule\n").unwrap();
+    std::fs::write(root.join("b/shared_bc.sv"), "module shared_bc; endmodule\n").unwrap();
+    std::fs::write(root.join("c/c.sv"), "module c; endmodule\n").unwrap();
+
+    let file = root.join("a/a.sv");
+    let src = format!(
+        "(lsp--filelist-component-root {:?})",
+        file.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), format!("{:?}", root.to_str().unwrap()));
+}
+
+#[test]
+fn filelist_entries_skips_comments_blanks_and_plusargs() {
+    let mut i = setup();
+    let root = scratch_dir("entries_skip");
+    std::fs::create_dir_all(&root).unwrap();
+    let list = root.join("x.f");
+    std::fs::write(
+        &list,
+        "# a comment\n// another comment\n+incdir+foo\n-f other.f\n\n   \nfoo.sv\n  bar.sv  \n",
+    )
+    .unwrap();
+
+    let src = format!("(lsp--filelist-entries {:?})", list.to_str().unwrap());
+    assert_eq!(
+        run(&mut i, &src),
+        format!(
+            "({:?} {:?})",
+            root.join("foo.sv").to_str().unwrap(),
+            root.join("bar.sv").to_str().unwrap()
+        )
+    );
+}
+
+#[test]
+fn filelist_entries_resolve_relative_to_the_filelist_directory() {
+    let mut i = setup();
+    let root = scratch_dir("entries_relative");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(root.join("rtl")).unwrap();
+    let list = root.join("sub/list.f");
+    std::fs::write(&list, "../rtl/x.sv\n").unwrap();
+
+    let src = format!("(lsp--filelist-entries {:?})", list.to_str().unwrap());
+    assert_eq!(
+        run(&mut i, &src),
+        format!("({:?})", root.join("rtl/x.sv").to_str().unwrap())
+    );
+}
+
+#[test]
+fn project_root_for_command_workspace_style_leaves_a_non_verilog_file_alone() {
+    // A `workspace'-style command on a non-Verilog file: `lsp--filelist-
+    // component-root' is structurally nil (guard 1), so this must fall
+    // back to, and exactly equal, plain `lsp--project-root'.
+    let mut i = setup();
+    let root = scratch_dir("workspace_style_non_verilog");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let plain = run(
+        &mut i,
+        &format!("(lsp--project-root {:?})", file.to_str().unwrap()),
+    );
+    let for_command = run(
+        &mut i,
+        &format!(
+            "(lsp--project-root-for-command \"slang-server\" {:?})",
+            file.to_str().unwrap()
+        ),
+    );
+    assert_eq!(for_command, plain);
+}
+
+#[test]
+fn filelist_component_root_of_demo_verif_is_the_demo_directory() {
+    // Real repo material (CLAUDE.md: use what's here, don't fabricate).
+    // `demo/rtl/verible.filelist' (11 paths) and `demo/verif/verible.
+    // filelist' (8 paths, 5 shared with `demo/rtl') share files ->
+    // one component -> smallest covering directory is `demo' itself.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/core has two ancestors up to the repo root");
+    let demo = repo_root.join("demo");
+    let file = demo.join("verif/sram_bank_tb.sv");
+    assert!(file.is_file(), "expected {:?} to exist", file);
+
+    let src = format!(
+        "(lsp--filelist-component-root {:?})",
+        file.to_str().unwrap()
+    );
+    assert_eq!(
+        run(&mut i, &src),
+        format!("{:?}", demo.to_str().unwrap()),
+        "expected the widened root to land on demo/, not demo/verif/ or the repo root"
+    );
+}
+
+#[test]
+fn workspace_duplicate_declarations_finds_a_name_declared_in_two_files() {
+    let mut i = setup();
+    let root = scratch_dir("dup_two_files");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "module foo(a,b,sum); endmodule\n").unwrap();
+    std::fs::write(root.join("b.sv"), "module foo(a,b,diff); endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--workspace-duplicate-declarations {:?})",
+        root.to_str().unwrap()
+    );
+    let result = run(&mut i, &src);
+    assert!(
+        result.contains("\"foo\""),
+        "expected the duplicated name in the result: {}",
+        result
+    );
+    assert!(result.contains("a.sv"), "expected a.sv named: {}", result);
+    assert!(result.contains("b.sv"), "expected b.sv named: {}", result);
+}
+
+#[test]
+fn workspace_duplicate_declarations_is_empty_when_every_name_is_unique() {
+    let mut i = setup();
+    let root = scratch_dir("dup_none");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "module foo; endmodule\n").unwrap();
+    std::fs::write(root.join("b.sv"), "module bar; endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--workspace-duplicate-declarations {:?})",
+        root.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "nil");
+}
+
+#[test]
+fn workspace_duplicate_declarations_covers_package_interface_and_program() {
+    let mut i = setup();
+    let root = scratch_dir("dup_all_kinds");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("m1.sv"), "module dup_a; endmodule\n").unwrap();
+    std::fs::write(root.join("m2.sv"), "module dup_a; endmodule\n").unwrap();
+    std::fs::write(root.join("p1.sv"), "package dup_b; endpackage\n").unwrap();
+    std::fs::write(root.join("p2.sv"), "package dup_b; endpackage\n").unwrap();
+    std::fs::write(root.join("i1.sv"), "interface dup_c; endinterface\n").unwrap();
+    std::fs::write(root.join("i2.sv"), "interface dup_c; endinterface\n").unwrap();
+    std::fs::write(root.join("g1.sv"), "program dup_d; endprogram\n").unwrap();
+    std::fs::write(root.join("g2.sv"), "program dup_d; endprogram\n").unwrap();
+
+    let src = format!(
+        "(mapcar #'car (lsp--workspace-duplicate-declarations {:?}))",
+        root.to_str().unwrap()
+    );
+    assert_eq!(
+        run(&mut i, &src),
+        "(\"dup_a\" \"dup_b\" \"dup_c\" \"dup_d\")"
+    );
+}
+
+#[test]
+fn workspace_duplicate_declarations_reads_the_name_of_an_interface_class() {
+    // `interface class Foo;' -- the first identifier after `interface'
+    // is the keyword `class', not the declared name. Before the fix,
+    // this reported the name "class" for both directions: two
+    // different `interface class'es falsely flagged as a duplicate of
+    // a thing called "class", and a real collision reported under a
+    // useless name.
+    let mut i = setup();
+    let root = scratch_dir("dup_interface_class");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("a.sv"),
+        "interface class comparable_if;\nendclass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.sv"),
+        "interface class comparable_if;\nendclass\n",
+    )
+    .unwrap();
+
+    let src = format!(
+        "(mapcar #'car (lsp--workspace-duplicate-declarations {:?}))",
+        root.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "(\"comparable_if\")");
+}
+
+#[test]
+fn workspace_duplicate_declarations_covers_macromodule() {
+    // `macromodule alu (a,b);' is a legacy synonym for `module' and was
+    // not in the keyword alternation at all -- two files both
+    // declaring the same `macromodule' name were silently reported
+    // clean.
+    let mut i = setup();
+    let root = scratch_dir("dup_macromodule");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "macromodule alu (a,b,sum);\nendmodule\n").unwrap();
+    std::fs::write(
+        root.join("b.sv"),
+        "macromodule alu (a,b,diff);\nendmodule\n",
+    )
+    .unwrap();
+
+    let src = format!(
+        "(mapcar #'car (lsp--workspace-duplicate-declarations {:?}))",
+        root.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "(\"alu\")");
+}
+
+#[test]
+fn workspace_duplicate_warning_names_the_symbol_and_both_files() {
+    let mut i = setup();
+    let root = scratch_dir("dup_warning_names");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "module foo(a,b,sum); endmodule\n").unwrap();
+    std::fs::write(root.join("b.sv"), "module foo(a,b,diff); endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--workspace-duplicate-warning {:?})",
+        root.to_str().unwrap()
+    );
+    let result = run(&mut i, &src);
+    assert!(
+        result.contains("foo"),
+        "expected the symbol name: {}",
+        result
+    );
+    assert!(result.contains("a.sv"), "expected a.sv named: {}", result);
+    assert!(result.contains("b.sv"), "expected b.sv named: {}", result);
+    assert!(
+        result.to_lowercase().contains("slang"),
+        "expected the consequence (slang binds silently) spelled out: {}",
+        result
+    );
+}
+
+#[test]
+fn workspace_duplicate_warning_is_nil_for_a_clean_root() {
+    let mut i = setup();
+    let root = scratch_dir("dup_warning_clean");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "module foo; endmodule\n").unwrap();
+    std::fs::write(root.join("b.sv"), "module bar; endmodule\n").unwrap();
+
+    let src = format!(
+        "(lsp--workspace-duplicate-warning {:?})",
+        root.to_str().unwrap()
+    );
+    assert_eq!(run(&mut i, &src), "nil");
+}
+
+#[test]
+fn workspace_duplicate_warning_is_emitted_once_per_root() {
+    // Deletion test for F2's wire: calling `lsp--workspace-maybe-warn-
+    // duplicates' twice for the SAME (command . root) must record ROOT
+    // as warned exactly once -- deleting the "already warned" guard
+    // would make the second call push a second entry.
+    let mut i = setup();
+    let root = scratch_dir("dup_warning_once");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.sv"), "module foo(a,b,sum); endmodule\n").unwrap();
+    std::fs::write(root.join("b.sv"), "module foo(a,b,diff); endmodule\n").unwrap();
+
+    let call = format!(
+        "(lsp--workspace-maybe-warn-duplicates \"slang-server\" {:?})",
+        root.to_str().unwrap()
+    );
+    ok(&mut i, &call);
+    assert_eq!(
+        run(&mut i, "(length lsp--workspace-duplicate-warned-roots)"),
+        "1"
+    );
+    ok(&mut i, &call);
+    assert_eq!(
+        run(&mut i, "(length lsp--workspace-duplicate-warned-roots)"),
+        "1",
+        "a second call for the same root must not record it a second time"
+    );
+}
+
+#[test]
+fn lsp_connect_warns_about_duplicate_declarations_under_a_widened_root() {
+    // FIX 3 (M132 fix round, review #4): every other test in this file
+    // calls `lsp--workspace-maybe-warn-duplicates' directly, bypassing
+    // BOTH real call sites (`lsp-connect' and `lsp--autostart-begin').
+    // Deleting `(when root-path (lsp--workspace-maybe-warn-duplicates
+    // command root-path))' from `lsp-connect' (lsp.el:1215) must make
+    // THIS test fail -- it goes through `(lsp)' -> `lsp-connect' for
+    // real, with a fixture whose widened root actually contains a
+    // duplicate module declaration.
+    //
+    // Fixture: same shape as `auto_attach_uses_the_per_command_root_for_
+    // a_workspace_style_server' (rtl/verible.filelist and
+    // verif/verible.filelist share `core/alu.sv', so a `workspace'-style
+    // command widens all the way to the top `dir', capped at `.git') --
+    // plus one duplicate module name (`dup_widened') declared in a file
+    // under `rtl/top' and another under `verif`, which the widened root
+    // covers but neither single filelist does on its own.
+    let mut i = setup();
+    let _lock = home_env_lock();
+    let dir = scratch_dir("m132_fix3_lsp_connect_warns");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/core")).unwrap();
+    std::fs::create_dir_all(dir.join("rtl/top")).unwrap();
+    std::fs::create_dir_all(dir.join("verif")).unwrap();
+    std::fs::write(
+        dir.join("rtl/verible.filelist"),
+        "core/alu.sv\ntop/soc_top.sv\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/verible.filelist"),
+        "../rtl/core/alu.sv\ntb.sv\n",
+    )
+    .unwrap();
+    let alu = dir.join("rtl/core/alu.sv");
+    std::fs::write(&alu, "module alu; endmodule\n").unwrap();
+    std::fs::write(
+        dir.join("rtl/top/soc_top.sv"),
+        "module soc_top; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("verif/tb.sv"), "module tb; endmodule\n").unwrap();
+    // The actual duplicate the widened root (but neither individual
+    // filelist) covers.
+    std::fs::write(
+        dir.join("rtl/top/extra_a.sv"),
+        "module dup_widened; endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("verif/extra_b.sv"),
+        "module dup_widened; endmodule\n",
+    )
+    .unwrap();
+
+    // A real, executable "slang-server" (basename match for
+    // `lsp-server-root-style-alist''s `workspace' entry) that just
+    // `exec's `cat' -- the same fake-server shape this file already
+    // uses successfully for every other `(lsp)' test, only renamed so
+    // `lsp--server-root-style' resolves it as `workspace'-style.
+    let script = dir.join("slang-server");
+    std::fs::write(&script, "#!/bin/sh\nexec cat\n").unwrap();
+    let mut perm = std::fs::metadata(&script).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&script, perm).unwrap();
+
+    ok(
+        &mut i,
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'verilog-mode (list {:?})))",
+            script.to_str().unwrap()
+        ),
+    );
+    capture_messages(&mut i);
+
+    ok(&mut i, &format!("(find-file {:?})", alu.to_str().unwrap()));
+    ok(&mut i, "(major-mode-internal-set 'verilog-mode)");
+    ok(&mut i, "(lsp)");
+
+    let messages = run(&mut i, "test--messages");
+    assert!(
+        messages.contains("dup_widened"),
+        "expected the duplicate-declaration warning to have been \
+         messaged via the real lsp-connect call site: {}",
+        messages
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
 }
 
 // ============================================================

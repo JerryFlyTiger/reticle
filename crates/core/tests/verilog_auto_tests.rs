@@ -1117,6 +1117,92 @@ fn verible_filelist_ignores_comments_blank_lines_flags_and_missing_paths() {
 }
 
 #[test]
+fn verible_filelist_files_drops_missing_paths_and_non_library_names() {
+    // `verilog-auto--library-filelist-files' applies TWO filters on top
+    // of `lsp--filelist-entries''s raw parse: `file-exists-p' and
+    // `verilog-auto--library-file-name-p'. This asserts the function's
+    // OWN return value directly (not a downstream AUTOINST result,
+    // which cannot tell "filtered out" apart from "filtered out but
+    // irrelevant to this instantiation" -- exactly the gap that let
+    // M132's extraction go untested: the sibling test above only checks
+    // that AUTOINST's OUTPUT TEXT is unaffected by a missing entry,
+    // which stays true whether or not that entry is filtered at all).
+    let (mut i, _ed) = setup();
+    let dir = m56_scratch_dir("filelist_files_two_filters");
+    let proj_dir = dir.join("proj");
+    let other_dir = dir.join("other");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&other_dir).unwrap();
+    // 1. Exists, qualifying extension -- must survive both filters.
+    std::fs::write(
+        other_dir.join("real_mod.v"),
+        "module real_mod (\n  input clk\n);\nendmodule\n",
+    )
+    .unwrap();
+    // 3. Exists, but a non-library extension -- must be dropped by
+    // `verilog-auto--library-file-name-p'.
+    std::fs::write(other_dir.join("readme.txt"), "not a source file\n").unwrap();
+    std::fs::write(
+        proj_dir.join("verible.filelist"),
+        "../other/real_mod.v\n../other/missing.sv\n../other/readme.txt\n",
+    )
+    .unwrap();
+    // 2. Named in the filelist, qualifying extension, but never created
+    // on disk -- must be dropped by `file-exists-p'.
+    let missing_path = other_dir.join("missing.sv");
+    assert!(!missing_path.exists());
+    let top_path = proj_dir.join("top.v");
+    std::fs::write(&top_path, "module top;\nendmodule\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+
+    let real_path = other_dir.join("real_mod.v");
+    let readme_path = other_dir.join("readme.txt");
+    assert_eq!(
+        run(&mut i, "(length (verilog-auto--library-filelist-files))"),
+        "1",
+        "exactly one of the three filelist entries must survive both filters"
+    );
+    assert_ne!(
+        run(
+            &mut i,
+            &format!(
+                "(member {:?} (verilog-auto--library-filelist-files))",
+                real_path.to_str().unwrap()
+            )
+        ),
+        "nil",
+        "the real, existing, qualifying-extension entry must be kept"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            &format!(
+                "(member {:?} (verilog-auto--library-filelist-files))",
+                missing_path.to_str().unwrap()
+            )
+        ),
+        "nil",
+        "a qualifying-extension entry with no file on disk must be dropped \
+         by `file-exists-p'"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            &format!(
+                "(member {:?} (verilog-auto--library-filelist-files))",
+                readme_path.to_str().unwrap()
+            )
+        ),
+        "nil",
+        "an existing file with a non-library extension must be dropped by \
+         `verilog-auto--library-file-name-p'"
+    );
+}
+
+#[test]
 fn use_filelist_nil_disables_filelist_based_resolution() {
     let (mut i, _ed) = setup();
     let dir = m56_scratch_dir("filelist_disabled");
@@ -3592,6 +3678,112 @@ fn autooutput_on_module_without_port_list_does_not_error() {
 }
 
 #[test]
+fn autooutput_on_module_without_port_list_declares_real_candidates() {
+    // M134 Part B: `autooutput_on_module_without_port_list_does_not_error'
+    // above uses a fixture with ZERO candidate signals, so it cannot tell
+    // the ANSI branch (silently wrong, drops output generation) from the
+    // non-ANSI branch (correct) -- both produce the same empty output.
+    // This fixture has a real unconnected submodule output, matching M134
+    // recon section 0's measured GNU behaviour: `module top;' (no parens
+    // at all) must expand identically to `module top ();'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top;\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", Some("logic"), None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autooutput_on_module_with_empty_parens_still_declares_real_candidates() {
+    // The `module top ();' counterpart of the test above -- already
+    // worked before M134 (non-ANSI header, real `list_of_ports'), and
+    // must keep working unchanged.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top ();\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", Some("logic"), None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreg_on_module_without_port_list_does_not_misreport_ansi_header() {
+    // M134 Part B, AUTOREG side. Unlike AUTOOUTPUT, AUTOREG's own
+    // candidates (`verilog-auto--output-port-candidate-decls', non-ANSI
+    // branch) come from body `output_declaration' nodes -- and this
+    // grammar (dump-verified, M134 recon) never parses a bare `output'
+    // body item at all when the header has NO port-parens container
+    // whatsoever (not even empty `()'): `output [3:0] b;' inside `module
+    // top; ... endmodule' lands in an `ERROR' node, not `output_
+    // declaration' -- matching real Verilog semantics, since a port_
+    // declaration item has nothing to attach to without a header port
+    // list. So a truly port-less module can never produce a REAL AUTOREG
+    // candidate either way, and this test pins the difference that IS
+    // observable instead: with the M134-fixed
+    // `verilog-auto--ansi-header-with-ports-p' gate, a port-less module
+    // with no candidates falls through to the ordinary empty-candidate
+    // path (silent, no notice) rather than being misreported via the
+    // bare `verilog-auto--ansi-header-p' gate as "ANSI header, nothing
+    // to add there" -- a false claim, since this module has no ports of
+    // ANY kind to have already declared. Reverting the gate back to
+    // `verilog-auto--ansi-header-p' (file backup + targeted edit, M134
+    // fix-round self-check) reproduces the old, misleading message:
+    // "AUTOREG in ANSI header (module top, has nothing to add there)".
+    let (mut i, _ed) = setup();
+    insert_src(&mut i, "module top;\n  /*AUTOREG*/\nendmodule\n");
+    let msg = verilog_auto(&mut i);
+    assert!(
+        !msg.contains("AUTOREG in ANSI header"),
+        "a module with NO ports at all must not be misreported as an \
+         ANSI header with nothing left to add: {}",
+        msg
+    );
+}
+
+#[test]
+fn parameter_completion_still_works_for_a_portless_parameterized_module() {
+    // M134 Part B's measured hazard: `module top #(parameter int W = 8);'
+    // is a `module_ansi_header' carrying a `parameter_port_list' but NO
+    // `list_of_port_declarations' -- flipping `verilog-auto--ansi-header-p'
+    // itself (instead of adding a second predicate) would have made
+    // `verilog-complete--parameters-of-module' stop reading that list.
+    let (mut i, _ed) = setup();
+    insert_src(&mut i, "module top #(parameter int W = 8);\nendmodule\n");
+    let names = run(
+        &mut i,
+        "(mapcar (function car) (verilog-complete--module-parameters \"top\"))",
+    );
+    assert!(
+        names.contains("\"W\""),
+        "parameter completion must still see W: {}",
+        names
+    );
+}
+
+#[test]
 fn autooutput_with_no_instances_leaves_buffer_unchanged() {
     let (mut i, _ed) = setup();
     insert_src(
@@ -4977,6 +5169,690 @@ fn delete_auto_adjacent_autowire_autoreg_blocks_with_hand_deleted_end_still_dete
         "AUTOREG's own INTACT block must still be deleted correctly, back to a bare marker: {}",
         text
     );
+}
+
+// ===================== M134: AUTORESET =====================
+// `/*AUTORESET*/', scoped to its own enclosing always block (spec section 1,
+// measured GNU Emacs 30.2) -- see this file's M134 header.
+
+#[test]
+fn autoreset_basic_emission_with_exact_header_and_footer_text() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [3:0] cnt_q;\n  logic q_o;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      cnt_q <= cnt_q + 1;\n      q_o <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops\n      cnt_q <= 4'h0;\n      q_o <= 1'h0;\n      // End of automatics";
+    assert!(
+        text.contains(expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreset_alphabetical_order_not_declaration_order() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic zebra;\n  logic apple;\n  logic mango;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      zebra <= 1'b1;\n      apple <= 1'b1;\n      mango <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let apple_pos = text.find("apple <= 1'h0;").expect("apple missing");
+    let mango_pos = text.find("mango <= 1'h0;").expect("mango missing");
+    let zebra_pos = text.find("zebra <= 1'h0;").expect("zebra missing");
+    assert!(
+        apple_pos < mango_pos && mango_pos < zebra_pos,
+        "must be alphabetical (apple, mango, zebra), not declaration/assignment order: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_scoped_to_markers_own_always_block() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q, b_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      b_q <= 1'b0;\n    end else begin\n      b_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 1'h0;"), "buffer: {}", text);
+    assert!(
+        !text.contains("b_q <= 1'h0;"),
+        "b_q is assigned only in a DIFFERENT always block -- must not be reset here: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_excludes_signal_assigned_before_the_marker_in_its_own_branch() {
+    // M134 fix round item 2 (GNU-measured, scratchpad/gnu/p2.v): the
+    // exclusion is POSITIONAL, not "assigned anywhere in the branch" --
+    // `cnt_q' is assigned BEFORE the marker, in the marker's own
+    // branch, so it is excluded.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic cnt_q, q_o;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      cnt_q <= 1'b0;\n      /*AUTORESET*/\n    end else begin\n      cnt_q <= 1'b1;\n      q_o <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("cnt_q <= 1'h0;"),
+        "cnt_q is assigned BEFORE the marker in its own branch -- must be excluded: {}",
+        text
+    );
+    assert!(text.contains("q_o <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_includes_signal_assigned_after_the_marker_in_its_own_branch() {
+    // M134 fix round item 2 (GNU-measured, scratchpad/gnu/p1.v): the
+    // SAME signal, assigned in the SAME branch, but AFTER the marker --
+    // GNU resets it anyway. Position is everything; "is it assigned
+    // anywhere in the branch" (the ORIGINAL, wrong implementation) is
+    // not the rule.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic cnt_q, q_o;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n      cnt_q <= 1'b0;\n    end else begin\n      cnt_q <= 1'b1;\n      q_o <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("cnt_q <= 1'h0;"),
+        "cnt_q is assigned AFTER the marker in its own branch -- must still be reset: {}",
+        text
+    );
+    assert!(text.contains("q_o <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_positional_exclusion_is_the_same_axis_when_nested() {
+    // M134 fix round item 2 (GNU-measured, scratchpad/gnu/p3.v):
+    // nesting depth is irrelevant -- only text position, within the
+    // marker's own branch, decides. `a' is nested one level deeper than
+    // the marker AND before it -- excluded. `c' is nested exactly the
+    // same way AND after it -- included, right alongside `b' (assigned
+    // only in the sibling `else' branch).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni, x;\n  logic a_q, b_q, c_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      if (x) a_q <= 1'b0;\n      /*AUTORESET*/\n      if (x) c_q <= 1'b0;\n    end else begin\n      a_q <= 1'b1; b_q <= 1'b1; c_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("a_q <= 1'h0;"),
+        "a_q is nested but BEFORE the marker -- excluded: {}",
+        text
+    );
+    assert!(text.contains("b_q <= 1'h0;"), "buffer: {}", text);
+    assert!(
+        text.contains("c_q <= 1'h0;"),
+        "c_q is nested but AFTER the marker -- included: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_else_if_still_catches_sibling_branch() {
+    // Marker sits in the innermost `else if' branch; a SIBLING branch of
+    // the OUTER `if' (both the outer `if' branch and the final `else')
+    // must still be counted as part of the whole always block's total.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni, foo;\n  logic a_q, b_q, c_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      a_q <= 1'b1;\n    end else if (foo) begin\n      /*AUTORESET*/\n    end else begin\n      c_q <= 1'b1;\n      b_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 1'h0;"), "outer sibling: {}", text);
+    assert!(text.contains("b_q <= 1'h0;"), "innermost sibling: {}", text);
+    assert!(text.contains("c_q <= 1'h0;"), "innermost sibling: {}", text);
+}
+
+#[test]
+fn autoreset_operator_mirrors_original_assignment_style() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q = 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("a_q = 1'h0;"),
+        "a_q is assigned with `=' elsewhere -- must be reset with `=' too: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_blocking_in_non_blocking_mode_t_includes_it() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q, b_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n      b_q = 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    ok(&mut i, "(setq verilog-auto-reset-blocking-in-non t)");
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 1'h0;"), "buffer: {}", text);
+    assert!(
+        text.contains("b_q = 1'h0;"),
+        "t: a blocking signal in an otherwise non-blocking block is still reset, with `=': {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_blocking_in_non_blocking_mode_nil_excludes_it() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q, b_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n      b_q = 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    ok(&mut i, "(setq verilog-auto-reset-blocking-in-non nil)");
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 1'h0;"), "buffer: {}", text);
+    assert!(
+        !text.contains("b_q = 1'h0;") && !text.contains("b_q <= 1'h0;"),
+        "nil: a blocking signal in an otherwise non-blocking block is excluded entirely: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_part_select_and_for_loop_lhs_reduced_to_base_identifier() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [7:0] c_q;\n  logic [7:0] d_q;\n  integer i;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      c_q[3:0] <= 4'hA;\n      for (i = 0; i < 4; i = i + 1) begin\n        d_q[i] <= 1'b1;\n      end\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("c_q <= 8'h0;"), "part-select LHS: {}", text);
+    assert!(text.contains("d_q <= 8'h0;"), "for-loop LHS: {}", text);
+}
+
+#[test]
+fn autoreset_undeclared_signal_treated_as_1_bit() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      undeclared_sig <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("undeclared_sig <= 1'h0;"),
+        "an undeclared signal is still reset, as 1 bit: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_two_markers_in_two_always_blocks_both_expand() {
+    // Pins the per-marker rule (M134) against the per-module
+    // `verilog-auto--first-autowire-per-module' helper, which would
+    // silently drop the second block's own AUTORESET.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q, b_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      b_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 1'h0;"), "first block: {}", text);
+    assert!(text.contains("b_q <= 1'h0;"), "second block: {}", text);
+    assert_eq!(
+        text.matches("// End of automatics").count(),
+        2,
+        "both markers must expand independently: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_empty_result_leaves_file_byte_unchanged() {
+    // M134 fix round item 2: the exclusion is POSITIONAL, so the
+    // signal must be assigned BEFORE the marker in its own branch to be
+    // excluded and leave the result empty -- see
+    // `autoreset_includes_signal_assigned_after_the_marker_in_its_own_branch'
+    // for the mirror-image case (after the marker: NOT excluded).
+    let (mut i, _ed) = setup();
+    let src = "module top;\n  logic clk, rst_ni;\n  logic a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      a_q <= 1'b0;\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "the marker's branch already resets everything BEFORE the marker -- byte-unchanged, marker left bare"
+    );
+}
+
+#[test]
+fn autoreset_widths_mode_t_symbolic_produces_brace_form() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [WIDTH-1:0] a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= a_q + 1;\n    end\n  end\nendmodule\n",
+    );
+    ok(&mut i, "(setq verilog-auto-reset-widths t)");
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("a_q <= {WIDTH{1'b0}};"),
+        "t mode, symbolic width: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_widths_mode_nil_is_plain_0() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [15:0] a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= a_q + 1;\n    end\n  end\nendmodule\n",
+    );
+    ok(&mut i, "(setq verilog-auto-reset-widths nil)");
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= 0;"), "nil mode: {}", text);
+}
+
+#[test]
+fn autoreset_widths_mode_unbased_is_tick_0() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [15:0] a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= a_q + 1;\n    end\n  end\nendmodule\n",
+    );
+    ok(&mut i, "(setq verilog-auto-reset-widths 'unbased)");
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a_q <= '0;"), "'unbased mode: {}", text);
+}
+
+#[test]
+fn autoreset_signed_form_preserved() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic signed [3:0] mango;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      mango <= mango + 1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("mango <= 4'sh0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_unpacked_array_skipped_with_message() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic [7:0] mem [0:3];\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      mem[0] <= 8'hFF;\n    end\n  end\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("mem <=") && !text.contains("mem <= "),
+        "an unpacked array must never be assigned a scalar: {}",
+        text
+    );
+    assert!(
+        msg.contains("unpacked array") && msg.contains("mem"),
+        "the skip must be visible in the echo: {}",
+        msg
+    );
+}
+
+#[test]
+fn autoreset_delete_auto_round_trip_returns_to_original_bytes() {
+    let (mut i, _ed) = setup();
+    let src = "module top;\n  logic clk, rst_ni;\n  logic a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_ne!(bs(&mut i), src, "sanity -- something expanded");
+    delete_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "verilog-delete-auto must return the file to its pre-expansion bytes"
+    );
+}
+
+#[test]
+fn autoreset_delete_auto_with_adjacent_autoreg_marker() {
+    let (mut i, _ed) = setup();
+    let src = "module top(a);\n  output [3:0] a;\n  logic clk, rst_ni;\n  logic a_q;\n  /*AUTOREG*/\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_ne!(bs(&mut i), src, "sanity -- something expanded");
+    delete_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "an AUTORESET site adjacent to an AUTOREG marker must not corrupt either range on delete"
+    );
+}
+
+#[test]
+fn autoreset_takes_no_argument_reports_and_skips() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic a_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET(\"^a\")*/\n    end else begin\n      a_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("a_q <= 1'h0;"),
+        "an argument makes AUTORESET a no-op: {}",
+        text
+    );
+    assert!(
+        msg.contains("malformed/unsupported AUTO marker argument"),
+        "must be reported: {}",
+        msg
+    );
+}
+
+#[test]
+fn autoreset_always_ff_logic_style_works_like_always_reg() {
+    // `always_ff' + `logic' + `_i'/`_o'/`_q' naming -- demo/rtl's own
+    // style -- works identically to `always' + `reg' (spec section 1).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk_i, rst_ni;\n  logic [7:0] cnt_q;\n  always_ff @(posedge clk_i or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/\n    end else begin\n      cnt_q <= cnt_q + 1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("cnt_q <= 8'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_marker_last_with_no_conditional_expands_to_nothing_case_only() {
+    // M134 fix round 2 item 1 (GNU-measured, scratchpad/gnu/r6.v): the
+    // marker sits at the tail of an always block whose only branching
+    // is a `case', no `if' anywhere -- GNU leaves the file byte-
+    // unchanged. This must now pass for the POSITIONAL reason, not
+    // because of a "must be inside a conditional branch" gate (that
+    // gate was itself wrong -- see
+    // `autoreset_marker_first_with_no_conditional_resets_everything_after_it'):
+    // with no enclosing conditional, OWN SCOPE falls back to the whole
+    // always body, and both `a'/`b' are assigned BEFORE the marker
+    // there, so both are excluded and nothing is left to reset.
+    let (mut i, _ed) = setup();
+    let src = "module top;\n  logic clk;\n  logic [1:0] s;\n  logic a, b;\n  always @(posedge clk) begin\n    case (s)\n      2'd0: a <= 1'b1;\n      default: b <= 1'b0;\n    endcase\n    /*AUTORESET*/\n  end\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "everything is assigned BEFORE the marker in its own (fallback) scope -- byte-unchanged"
+    );
+}
+
+#[test]
+fn autoreset_marker_last_with_no_conditional_expands_to_nothing_after_if_else() {
+    // M134 fix round 2 item 1 (GNU-measured, scratchpad/gnu/r16.v): the
+    // marker sits after a complete `if'/`else' pair, at always-block
+    // level, not inside either branch -- same positional reason as the
+    // `case'-only fixture above.
+    let (mut i, _ed) = setup();
+    let src = "module top;\n  logic clk, rst_n;\n  logic a, b;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) b <= 1'b0;\n    else        a <= 1'b1;\n    /*AUTORESET*/\n  end\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "everything is assigned BEFORE the marker in its own (fallback) scope -- byte-unchanged"
+    );
+}
+
+#[test]
+fn autoreset_marker_first_with_no_conditional_resets_everything_after_it() {
+    // M134 fix round 2 item 1 (GNU-measured, scratchpad/gnu/q1.v): the
+    // marker is the FIRST statement in a bare `always' body, no `if'
+    // anywhere, followed by two assignments. GNU resets both. The
+    // ORIGINAL "must be inside a conditional branch" gate refused this
+    // entirely (0 resets) -- this is the fixture that proved the gate
+    // wrong: r6.v/r16.v (marker LAST) cannot distinguish "refuse
+    // outright" from "positional, own scope = whole always body",
+    // because nothing follows the marker in either. Marker-FIRST does
+    // distinguish them.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk;\n  logic a, b;\n  always @(posedge clk) begin\n    /*AUTORESET*/\n    a <= 1'b1;\n    b <= 1'b1;\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_marker_inside_a_for_body_no_conditional() {
+    // M134 fix round 2 item 1 (GNU-measured against real GNU Emacs
+    // 30.2, constructed and run through scratchpad/gnu/w.sh during this
+    // fix round -- not a pre-existing fixture file): a marker inside a
+    // `for' loop body, with no `if' anywhere, still resets everything
+    // assigned after it (own scope falls back to the whole always
+    // body, which is unaffected by `for' nesting since `for' is not a
+    // `conditional_statement').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk;\n  logic a, b;\n  integer i;\n  always @(posedge clk) begin\n    for (i = 0; i < 2; i = i + 1) begin\n      /*AUTORESET*/\n      a <= 1'b1;\n      b <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_marker_inside_a_fork_join_no_conditional() {
+    // M134 fix round 2 item 1 (GNU-measured against real GNU Emacs
+    // 30.2, constructed and run through scratchpad/gnu/w.sh during this
+    // fix round): a marker inside one `fork'/`join' branch resets a
+    // signal assigned later in its OWN branch (`a') and a signal
+    // assigned only in a SIBLING fork branch (`b') -- both are still
+    // part of the whole always block's total, and neither is assigned
+    // before the marker in the fallback own-scope (the whole always
+    // body, since neither `fork' nor a `begin'/`end' seq_block is a
+    // `conditional_statement').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk;\n  logic a, b;\n  always @(posedge clk) begin\n    fork\n      begin\n        /*AUTORESET*/\n        a <= 1'b1;\n      end\n      begin\n        b <= 1'b1;\n      end\n    join\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_cross_branch_assignment_before_marker_is_not_excluded() {
+    // M134 fix round 2 item 1 (GNU-measured, scratchpad/gnu/r8.v): `a'
+    // is assigned in an `if (x)' branch that textually PRECEDES the
+    // marker's own `else if' branch -- but it is a SIBLING branch, not
+    // the marker's own. The positional cutoff must apply ONLY within
+    // the marker's own scope; a naive "everything textually before the
+    // marker, anywhere in the always block" cutoff would wrongly
+    // exclude `a' here.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n, x;\n  logic a, b, c;\n  always @(posedge clk or negedge rst_n) begin\n    if (x) begin\n      a <= 1'b1;\n    end else if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      b <= 1'b1;\n      c <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("a <= 1'h0;"),
+        "a is assigned in a SIBLING branch, before the marker only in an unrelated branch -- must not be excluded: {}",
+        text
+    );
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("c <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_symbolic_multidim_range_skipped_not_syntax_error() {
+    // M134 fix round item 3 (GNU-measured, scratchpad/gnu/p4.v): a
+    // symbolic multi-dimensional packed range. GNU emits its own
+    // divergence-5 quirk (`arr <= 8'h0;', using only the last
+    // dimension); this file refuses instead, same policy AUTOTIEOFF
+    // already applies (`verilog-auto--tieoff-constant''s own SKIP-
+    // REASON) -- the bug a cold review caught was discarding that
+    // reason and emitting the syntax error `arr <= ;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n;\n  logic [WIDTH-1:0][7:0] arr;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      arr <= '0;\n    end\n  end\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("arr <= ;"),
+        "must never emit a bare, syntactically broken assignment: {}",
+        text
+    );
+    assert!(
+        !text.contains("// Beginning of autoreset"),
+        "arr is the only candidate signal here, and it must be skipped -- no Beginning/End markers at all: {}",
+        text
+    );
+    assert!(
+        msg.contains("symbolic multi-dimensional range") && msg.contains("arr"),
+        "the skip must be visible in the echo: {}",
+        msg
+    );
+}
+
+#[test]
+fn autoreset_hierarchical_lvalue_resets_the_full_dotted_name() {
+    // M134 fix round item 4 (GNU-measured, scratchpad/gnu/p7.v): a
+    // dotted hierarchical LHS resets by its own FULL dotted name, not
+    // just the outermost path component.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n;\n  logic b;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      top.inner.sig <= 1'b1;\n      b <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("top.inner.sig <= 1'h0;"),
+        "must reset the FULL dotted name, not just `top': {}",
+        text
+    );
+    assert!(
+        !text.contains("\n      top <= 1'h0;"),
+        "must never reset the outermost path component alone: {}",
+        text
+    );
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_escaped_identifier_lvalue_is_not_invisible() {
+    // M134 fix round 2 item 2: an escaped identifier (`\esc+id <=
+    // 1'b1;', SystemVerilog's `\NAME ' escape syntax) has no
+    // `simple_identifier' descendant at all, so it used to be silently
+    // invisible to both the candidate and exclusion scans. Handled
+    // (not just documented) since it was a cheap one-clause fallback.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n;\n  logic b;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      \\esc+id <= 1'b1;\n      b <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("\\esc+id <= 1'h0;"),
+        "an escaped identifier LHS must not be invisible to AUTORESET: {}",
+        text
+    );
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_concatenation_lvalue_drives_every_element() {
+    // Coverage gap the reviewer flagged -- already correct, no bug, but
+    // untested before this round.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n;\n  logic a, b, c;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      {a, b} <= 2'b11;\n      c <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("c <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_always_comb_blocking_assignment() {
+    // Coverage gap the reviewer flagged -- already correct, no bug, but
+    // untested before this round.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic rst_n;\n  logic a, b;\n  always_comb begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      a = 1'b1;\n      b = 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a = 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b = 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_marker_inside_a_case_branch() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n;\n  logic [1:0] s;\n  logic a, b;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      case (s)\n        2'd0: begin\n          /*AUTORESET*/\n        end\n        default: ;\n      endcase\n    end else begin\n      a <= 1'b1;\n      b <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(text.contains("a <= 1'h0;"), "buffer: {}", text);
+    assert!(text.contains("b <= 1'h0;"), "buffer: {}", text);
+}
+
+#[test]
+fn autoreset_two_markers_in_the_same_always_block() {
+    // Only two markers in two DIFFERENT blocks is covered by
+    // `autoreset_two_markers_in_two_always_blocks_both_expand'; this
+    // pins two markers in the SAME block (different branches), each
+    // expanding independently against its own branch.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_n, x;\n  logic a_q, b_q;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else if (x) begin\n      /*AUTORESET*/\n    end else begin\n      a_q <= 1'b1;\n      b_q <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches("// End of automatics").count(),
+        2,
+        "both markers must expand independently: {}",
+        text
+    );
+    assert_eq!(text.matches("a_q <= 1'h0;").count(), 2, "buffer: {}", text);
+    assert_eq!(text.matches("b_q <= 1'h0;").count(), 2, "buffer: {}", text);
 }
 
 // ===================== M127: AUTO_TEMPLATE's substitution language =========
