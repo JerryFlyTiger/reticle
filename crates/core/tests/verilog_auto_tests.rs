@@ -8694,3 +8694,729 @@ fn m129_verilog_auto_final_message_folds_in_the_text_recovered_count() {
         reexpanded
     );
 }
+
+// ===================== M136: AUTOUNUSED (deliberate divergence) ============
+// `/*AUTOUNUSED*/' -- text shape copied from GNU, criterion NOT copied (a
+// port is listed only if its value is never READ anywhere in the module
+// body, not "never AUTOINST-connected"). See verilog-auto.el's own M136
+// header for the full oracle (slang-server's `unused-port'/`unused-but-
+// set-port') and the real GNU output this divergence is measured against.
+
+/// The text strictly between AUTOUNUSED's own Begin/End markers, or `""'
+/// if the buffer has no such block at all -- a naive `text.contains(name)'
+/// on the WHOLE buffer would also match the port's own ANSI header
+/// declaration line (`input logic a_i,'), which is not what any of these
+/// tests mean to check.
+fn unused_block(text: &str) -> &str {
+    let begin = "// Beginning of automatic unused inputs";
+    let end = "// End of automatics";
+    match text.find(begin) {
+        Some(b) => {
+            let after_begin = b + begin.len();
+            match text[after_begin..].find(end) {
+                Some(e) => &text[after_begin..after_begin + e],
+                None => "",
+            }
+        }
+        None => "",
+    }
+}
+
+#[test]
+fn autounused_diverges_from_gnu_only_lists_truly_unread_inputs() {
+    // The M136 header quotes real GNU output for this near-identical
+    // shape: GNU lists `a_i`/`clk`/`spare_i` ALL THREE, even though `a_i`
+    // and `spare_i` are read on the very next line. This file's own
+    // divergent criterion must list only the two ports never read at all.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic rst_n,\n  input  logic [7:0] a_i,\n  input  logic [3:0] spare_i,\n  output logic [7:0] z_o\n);\n  assign z_o = a_i + {4'b0, spare_i};\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("clk,"),
+        "clk is never read, must be listed: {}",
+        text
+    );
+    assert!(
+        block.contains("rst_n,"),
+        "rst_n is never read, must be listed: {}",
+        text
+    );
+    assert!(
+        !block.contains("a_i,"),
+        "a_i is read in the assign -- must NOT be listed (GNU would list it, this file diverges): {}",
+        text
+    );
+    assert!(
+        !block.contains("spare_i,"),
+        "spare_i is read in the assign -- must NOT be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_input_read_only_by_a_handwritten_instance_connection_is_not_listed() {
+    // GNU would list this (only its OWN AUTOINST expansion counts, per
+    // the M136 header); this file's plain read-occurrence scan sees the
+    // hand-written `.a_i(a_i)' connection expression as an ordinary read,
+    // with nothing about AUTOINST in the check at all.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = a_i;\nendmodule\n\nmodule top (\n  input  logic a_i,\n  output logic z_o\n);\n  sub u_sub (.a_i(a_i), .z_o(z_o));\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("Beginning of automatic unused inputs"),
+        "a_i is read via the hand-written instance connection -- nothing to list: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_input_read_only_by_an_autoinst_expanded_connection_is_not_listed() {
+    // Same as the hand-written case, but the connection is the one
+    // AUTOINST itself just expanded -- AUTOUNUSED must run AFTER
+    // `--expand-all-autoinst' for this to be visible at all (M136 item 3).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = a_i;\nendmodule\n\nmodule top (\n  input  logic a_i,\n  output logic z_o\n);\n  sub u_sub (/*AUTOINST*/);\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(".a_i"),
+        "sanity -- AUTOINST must have expanded the connection: {}",
+        text
+    );
+    assert!(
+        !text.contains("Beginning of automatic unused inputs"),
+        "a_i is read via the AUTOINST-expanded connection -- nothing to list: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_inout_never_mentioned_vs_driven_only_vs_read_only() {
+    // spec section 1's three-row `inout' table: never mentioned at all ->
+    // listed (`unused-port'); driven but never read -> listed
+    // (`unused-but-set-port'); read but never driven -> NOT listed
+    // (`undriven-port', a different diagnostic family entirely -- the
+    // criterion here is purely about reads, never about drivenness).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  inout  wire io_a,\n  inout  wire io_b,\n  inout  wire io_c,\n  output logic z_o\n);\n  assign io_b = 1'b0;\n  assign z_o = io_c;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("io_a,"),
+        "io_a is never mentioned at all -- must be listed: {}",
+        text
+    );
+    assert!(
+        block.contains("io_b,"),
+        "io_b is driven but never read -- must be listed (unused-but-set-port): {}",
+        text
+    );
+    assert!(
+        !block.contains("io_c,"),
+        "io_c is read (even though never driven) -- must NOT be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_is_idempotent_with_a_non_empty_list() {
+    // The M136 header's own idempotency hazard: the `_unused_ok' idiom's
+    // `&{...}' reads every name it lists, so without the self-range
+    // exclusion, running `verilog-auto' a second time would see the just-
+    // inserted names as reads and delete them all.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = a_i;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let once = bs(&mut i);
+    assert!(
+        once.contains("clk,"),
+        "sanity -- clk must be listed after the first run: {}",
+        once
+    );
+    verilog_auto(&mut i);
+    let twice = bs(&mut i);
+    assert_eq!(
+        once, twice,
+        "running verilog-auto a second time must leave the buffer byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn autounused_ignore_regexp_suppresses_matching_names() {
+    let src = "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = a_i;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n";
+
+    let (mut i, _ed) = setup();
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    let default_text = bs(&mut i);
+    assert!(
+        unused_block(&default_text).contains("clk,"),
+        "default nil applies no filter, clk must be listed: {}",
+        default_text
+    );
+
+    let (mut i2, _ed2) = setup();
+    insert_src(&mut i2, src);
+    ok(&mut i2, "(setq verilog-auto-unused-ignore-regexp \"clk\")");
+    verilog_auto(&mut i2);
+    let filtered_text = bs(&mut i2);
+    assert!(
+        !unused_block(&filtered_text).contains("clk,"),
+        "verilog-auto-unused-ignore-regexp matching \"clk\" must suppress it: {}",
+        filtered_text
+    );
+}
+
+#[test]
+fn autounused_alphabetical_order_and_exact_marker_text() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic zebra_i,\n  input  logic apple_i,\n  input  logic mango_i,\n  output logic z_o\n);\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("// Beginning of automatic unused inputs"),
+        "buffer: {}",
+        text
+    );
+    assert!(text.contains("// End of automatics"), "buffer: {}", text);
+    let block = unused_block(&text);
+    let apple_pos = block.find("apple_i,").expect("apple_i missing");
+    let mango_pos = block.find("mango_i,").expect("mango_i missing");
+    let zebra_pos = block.find("zebra_i,").expect("zebra_i missing");
+    assert!(
+        apple_pos < mango_pos && mango_pos < zebra_pos,
+        "must be alphabetical (apple_i, mango_i, zebra_i), not declaration order: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_delete_auto_round_trip_returns_to_original_bytes() {
+    let (mut i, _ed) = setup();
+    let src = "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = a_i;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_ne!(bs(&mut i), src, "sanity -- something expanded");
+    delete_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "verilog-delete-auto must return the file to its pre-expansion bytes"
+    );
+}
+
+#[test]
+fn autounused_adjacent_autotieoff_marker_not_corrupted_on_delete() {
+    // The M39 over-deletion shape (spec section 5 item 1): an AUTOUNUSED
+    // marker sitting directly after ANOTHER block-style marker in the
+    // same module must not have its own End line misattributed, in
+    // either direction.
+    let (mut i, _ed) = setup();
+    let src = "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  /*AUTOTIEOFF*/\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    let expanded = bs(&mut i);
+    assert_ne!(expanded, src, "sanity -- something expanded");
+    let block = unused_block(&expanded);
+    assert!(
+        block.contains("clk,") && block.contains("a_i,"),
+        "sanity -- both ports unread and adjacent AUTOTIEOFF expanded: {}",
+        expanded
+    );
+    delete_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "an AUTOUNUSED site adjacent to an AUTOTIEOFF marker must not corrupt either range on delete"
+    );
+}
+
+#[test]
+fn autounused_obscure_read_positions_all_count_as_read() {
+    // Five read positions measured against slang (M136 recon, spec
+    // section 1's table): bit index, `$display' argument, `assert
+    // property', a width expression, and an untaken generate branch.
+    // None of these are special-cased in the implementation -- the
+    // read-occurrence scan walks the WHOLE module body subtree, so all
+    // five just fall out of that as ordinary occurrences.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic [3:0] mem_sel_i,\n  input  logic disp_only_i,\n  input  logic assert_only_i,\n  input  logic [3:0] width_only_i,\n  input  logic gen_only_i,\n  output logic z_o\n);\n  logic [15:0] mem;\n  logic [width_only_i:0] w_dummy;\n  assign mem = 16'hABCD;\n  always_comb begin\n    if (mem[mem_sel_i]) begin\n    end\n  end\n  initial begin\n    $display(\"%b\", disp_only_i);\n  end\n  a1: assert property (@(posedge clk) assert_only_i);\n  if (1'b0) begin : g_off\n    assign z_o = gen_only_i;\n  end else begin : g_on\n    assign z_o = 1'b0;\n  end\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("Beginning of automatic unused inputs"),
+        "all six ports are read via one of the five obscure positions -- nothing to list: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_non_ansi_body_declaration_is_not_itself_a_read() {
+    // spec section 7 test 11: a non-ANSI header's bare port name AND the
+    // body `input clk;'/`input a_i;' redeclaration are both declaration
+    // sites, neither counts as a read.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top(clk, a_i, z_o);\n  input clk;\n  input a_i;\n  output z_o;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("clk,"),
+        "clk is declared but never read -- the declaration itself must not count as a read: {}",
+        text
+    );
+    assert!(
+        block.contains("a_i,"),
+        "a_i is declared but never read: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_takes_no_argument_reports_and_skips() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic a_i,\n  output logic z_o\n);\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED(\"^a\")*/\n                      1'b0};\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("Beginning of automatic unused inputs"),
+        "an argument makes AUTOUNUSED a no-op: {}",
+        text
+    );
+    assert!(
+        msg.contains("malformed/unsupported AUTO marker argument"),
+        "must be reported: {}",
+        msg
+    );
+}
+
+// ===================== M136 fix round: R1-R4 ================================
+
+#[test]
+fn autounused_binary_operator_sibling_read_of_the_sink_is_not_swallowed_by_marker_statement_exclusion(
+) {
+    // R1: the first version of this file excluded the marker's ENTIRE
+    // OWNING STATEMENT from the read-occurrence scan (an idempotency
+    // guard that turned out to be unnecessary -- see verilog-auto.el's
+    // own M136 header for why). That exclusion was wrong in exactly the
+    // way this milestone exists to prevent: a hand-written expression
+    // sharing the same statement (`a_i & &{...}`) has ITS OWN genuine
+    // read of `a_i` silently swallowed, and `a_i` got listed as unused
+    // even though it demonstrably is not.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = a_i & &{1'b0,\n                            /*AUTOUNUSED*/\n                            1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("clk,"),
+        "clk is never read, must still be listed: {}",
+        text
+    );
+    assert!(
+        !block.contains("a_i,"),
+        "a_i IS read (left operand of `&', in the very same statement as the marker) -- must \
+         NOT be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_bare_marker_with_no_legal_host_is_refused_and_reported() {
+    // R2: a bare `/*AUTOUNUSED*/' with no enclosing `&{...}' initializer
+    // used to expand into a comma-terminated list of bare identifiers as
+    // its own module item -- not legal Verilog, with no diagnostic
+    // pointing at the real cause.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  /*AUTOUNUSED*/\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("Beginning of automatic unused inputs"),
+        "a bare marker with no legal host must not expand at all: {}",
+        text
+    );
+    assert!(
+        msg.contains("no legal host"),
+        "must be reported by name: {}",
+        msg
+    );
+}
+
+#[test]
+fn autounused_hierarchical_reference_to_a_submodule_signal_is_not_counted_as_a_read() {
+    // R3.1: `u_sub.a_i' is a dotted reference into `sub''s OWN `a_i'
+    // output -- it must never count as a read of `top''s own `a_i'
+    // input candidate merely because the trailing path component
+    // happens to share that name.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (\n  output logic a_i\n);\n  assign a_i = 1'b1;\nendmodule\n\nmodule top (\n  input  logic a_i,\n  output logic dbg_o\n);\n  sub u_sub ();\n  assign dbg_o = u_sub.a_i;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("a_i,"),
+        "top's own `a_i' is never read (only `u_sub.a_i', a DIFFERENT module's own signal, is) \
+         -- must still be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_named_port_connection_name_field_is_not_a_read_of_a_same_named_candidate() {
+    // R3.2: the LEFT side of `.a_i(other_sig)' is `sub''s own port
+    // NAME, not an expression -- it must never count as a read of
+    // `top''s own `a_i' candidate merely by coincidental text equality.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (\n  input  logic a_i\n);\nendmodule\n\nmodule top (\n  input  logic a_i,\n  input  logic other_sig,\n  output logic z_o\n);\n  sub u_sub (.a_i(other_sig));\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("a_i,"),
+        "top's own `a_i' is never read (`.a_i(other_sig)''s LHS is `sub''s own port name, not \
+         a read) -- must still be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_named_parameter_assignment_name_field_is_not_a_read_of_a_same_named_candidate() {
+    // R3.2 follow-up: the same trap for `.WIDTH(4)' -- `WIDTH' there is
+    // `sub''s own PARAMETER name, not an expression, even when the
+    // enclosing module happens to have an unrelated candidate port
+    // spelled identically.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub #(\n    parameter int WIDTH = 1\n) (\n  input  logic a_i\n);\nendmodule\n\nmodule top (\n  input  logic WIDTH,\n  output logic z_o\n);\n  sub #(.WIDTH(4)) u_sub (.a_i(1'b0));\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("WIDTH,"),
+        "top's own `WIDTH' input is never read (`.WIDTH(4)''s LHS is `sub''s own parameter \
+         name, not a read) -- must still be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_function_local_shadow_is_a_known_limitation_not_fixed() {
+    // R3.3: KNOWN LIMITATION, documented rather than silently wrong (see
+    // verilog-auto--identifier-read-p's own docstring) -- this function
+    // has no lexical-scope resolution at all, so a task/function-local
+    // variable sharing a module-level candidate's own name incorrectly
+    // counts as a read of the OUTER port. Pinning the CURRENT (wrong,
+    // but honestly documented) behavior here means a future scope-aware
+    // fix changes this test on purpose, rather than an accidental
+    // regression changing it silently.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic a_i,\n  output logic z_o\n);\n  function automatic void f();\n    logic a_i;\n    a_i = 1'b0;\n  endfunction\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        !block.contains("a_i,"),
+        "KNOWN LIMITATION pin -- if this assertion starts FAILING, the most likely \
+         reason is that someone fixed the limitation: update the docstring this test \
+         names and re-point the test, do not revert the change that made it fail. \
+         What is pinned: the function-local `a_i' shadows the outer \
+         port with the same name, and this scan has no scope resolution to tell them apart, so \
+         the outer `a_i' is (incorrectly) NOT listed here: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_bare_marker_alone_still_blocks_stale_end_detection() {
+    // Mutation D2 (reviewer, MEDIUM confidence): removing AUTOUNUSED from
+    // `verilog-auto--any-auto-port-block-marker-p' SURVIVED against
+    // `autounused_adjacent_autotieoff_marker_not_corrupted_on_delete',
+    // because that test's own AUTOUNUSED marker sits nested inside a
+    // `wire _unused_ok = &{...}' concatenation (R2's ONLY legal host) --
+    // never a direct SIBLING the forward scan in `verilog-auto--autowire-
+    // stale-end' would ever walk over (that scan only ever inspects
+    // module-level siblings, never descends into a statement's own
+    // initializer expression). A BARE, illegally-hosted `/*AUTOUNUSED*/'
+    // (R2: refused to expand, left exactly as typed) IS a plain
+    // module-level sibling, exactly where this scan looks -- but an
+    // EARLIER version of this test put a real, still-recognized
+    // `/*AUTOREG*/' marker immediately after the bare AUTOUNUSED one,
+    // which masked the effect: `any-auto-port-block-marker-p' still
+    // fires on THAT marker regardless of the mutation, halting the scan
+    // one node later with the SAME safe answer either way (verified by
+    // hand: reverting the mutation produced byte-identical output to
+    // applying it, on that shape). This version removes every OTHER
+    // recognized marker between AUTOWIRE's own corrupted range and a
+    // stray, hand-typed \"// End of automatics\" line -- the bare
+    // AUTOUNUSED marker is the ONLY thing that can stop the scan here.
+    // Verified by hand (file backup + targeted Edit + `touch`, NOT
+    // `dev/mutate.py'): mutating the AUTOUNUSED disjunct to `nil' made
+    // this exact buffer collapse to a bare `/*AUTOWIRE*/' (wrongly
+    // deleting the wire declaration, the AUTOUNUSED marker, AND the
+    // stray End line); reverting restored the correct nothing-deleted
+    // answer.
+    let (mut i, _ed) = setup();
+    let src = "module sub_mod (\n  output logic [3:0] internal_sig\n);\nendmodule\n\nmodule dut (a);\n  output [3:0] a;\n  /*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [3:0] internal_sig;\n  /*AUTOUNUSED*/\n  // End of automatics\n  sub_mod u1 (.internal_sig(internal_sig));\nendmodule\n";
+    insert_src(&mut i, src);
+    let r = delete_auto(&mut i);
+    assert!(!r.starts_with("ERROR"), "delete-auto must not crash: {}", r);
+    let text = bs(&mut i);
+    assert_eq!(
+        text, src,
+        "AUTOWIRE's own Beginning/wire-declaration and the bare AUTOUNUSED marker must be left \
+         completely alone -- the bare AUTOUNUSED marker (the only recognized block marker \
+         between AUTOWIRE's own content and this stray \"// End of automatics\" line) must \
+         block the stale-end scan from ever reaching that line: {}",
+        text
+    );
+}
+
+// ===================== M136 fix round: R7 ====================================
+
+#[test]
+fn autounused_ordinary_bus_pack_assign_without_reduction_is_refused_and_reported() {
+    // R7 (HIGH, found during this milestone's own trailing cold-read): the
+    // legal-host check used to accept ANY concatenation inside one of the
+    // three statement kinds, without ever checking for the reduction
+    // operator (`&'/`|'/etc) its own docstring already claimed was
+    // required. An ORDINARY bus-packing `assign' -- no reduction at all
+    // -- used to expand silently, splicing two unrelated port names
+    // (`c_i'/`d_i') into the middle of a live bit-packing expression:
+    // legal syntax, WRONG semantics (`bus_o' now computes a different
+    // value), with no warning at all.
+    let (mut i, _ed) = setup();
+    let src = "module top (\n  input  logic a_i,\n  input  logic b_i,\n  input  logic c_i,\n  input  logic d_i,\n  output logic [1:0] bus_o\n);\n  assign bus_o = {a_i,\n                  /*AUTOUNUSED*/\n                  b_i};\nendmodule\n";
+    insert_src(&mut i, src);
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text, src,
+        "an ordinary bus-packing concatenation (no reduction operator) must not be treated as \
+         a legal AUTOUNUSED host -- buffer must be byte-for-byte unchanged: {}",
+        text
+    );
+    assert!(
+        msg.contains("no legal host"),
+        "must be reported by name: {}",
+        msg
+    );
+}
+
+#[test]
+fn autounused_ampersand_reduction_wire_and_binary_and_sibling_are_both_still_accepted() {
+    // Both legal shapes must still work after R7 narrows the check: the
+    // ordinary `wire _unused_ok = &{...};' idiom, AND the R1 shape where
+    // a binary `&' sits OUTSIDE the reduction (`a_i & &{...}') -- the
+    // OUTER `&' there is a binary expression (`left:'/`right:' fields,
+    // no single `operator:' field), which must never itself satisfy this
+    // check; only the INNER `&{...}' (the real reduction) does.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        unused_block(&text).contains("clk,"),
+        "plain `&{{...}}' wire host must still be accepted: {}",
+        text
+    );
+
+    let (mut i2, _ed2) = setup();
+    insert_src(
+        &mut i2,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = a_i & &{1'b0,\n                            /*AUTOUNUSED*/\n                            1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i2);
+    let text2 = bs(&mut i2);
+    let block2 = unused_block(&text2);
+    assert!(
+        block2.contains("clk,"),
+        "the R1 shape (binary `&' outside, real reduction `&{{...}}' inside) must still expand: {}",
+        text2
+    );
+    assert!(
+        !block2.contains("a_i,"),
+        "a_i is read (left operand of the OUTER binary `&') -- must still not be listed: {}",
+        text2
+    );
+}
+
+#[test]
+fn autounused_non_ampersand_reduction_or_is_also_accepted() {
+    // Proves the widening past GNU's own `&'-only convention is
+    // deliberate, not an accident: `|{...}' (bitwise-OR reduction) must
+    // be accepted exactly like `&{...}' is.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic a_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = |{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        unused_block(&text).contains("clk,"),
+        "an `|{{...}}' reduction host must be accepted just like `&{{...}}': {}",
+        text
+    );
+}
+
+// ===================== M136 fix round: R8 =====================================
+
+#[test]
+fn autounused_marker_in_nested_inner_concatenation_is_a_known_limitation_not_fixed() {
+    // R8.1: KNOWN LIMITATION, documented rather than silently wrong (see
+    // verilog-auto--autounused-legal-host-p's own docstring) -- a marker
+    // sitting in a NESTED inner concatenation (with the reduction
+    // operator on some OUTER one) fails closed: refused, reported, and
+    // the buffer left byte-for-byte unchanged. This is the SAFE
+    // direction (unlike R7's corruption), so it is pinned as current
+    // behavior, not fixed.
+    let (mut i, _ed) = setup();
+    let src = "module top (\n  input  logic clk,\n  input  logic extra1_i,\n  input  logic extra2_i,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0, {extra1_i,\n                              /*AUTOUNUSED*/\n                              extra2_i}, 1'b0};\nendmodule\n";
+    insert_src(&mut i, src);
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text, src,
+        "KNOWN LIMITATION pin -- if this assertion starts FAILING, the most likely \
+         reason is that someone fixed the limitation: update the docstring this test \
+         names and re-point the test, do not revert the change that made it fail. \
+         What is pinned: a marker in a nested inner concatenation \
+         must fail closed -- buffer byte-for-byte unchanged: {}",
+        text
+    );
+    assert!(
+        msg.contains("no legal host"),
+        "must be reported by name: {}",
+        msg
+    );
+}
+
+#[test]
+fn autounused_extra_parenthesized_reduction_wrapper_is_a_known_limitation_not_fixed() {
+    // R8.1: KNOWN LIMITATION, documented rather than silently wrong --
+    // an extra layer of parentheses around the reduced concatenation
+    // (`&({...})' instead of `&{...}') also fails closed: refused,
+    // reported, buffer unchanged.
+    let (mut i, _ed) = setup();
+    let src = "module top (\n  input  logic clk,\n  output logic z_o\n);\n  assign z_o = 1'b0;\n  wire _unused_ok = &({1'b0,\n                       /*AUTOUNUSED*/\n                       1'b0});\nendmodule\n";
+    insert_src(&mut i, src);
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text, src,
+        "KNOWN LIMITATION pin -- if this assertion starts FAILING, the most likely \
+         reason is that someone fixed the limitation: update the docstring this test \
+         names and re-point the test, do not revert the change that made it fail. \
+         What is pinned: an extra parenthesized wrapper around the \
+         reduction must fail closed -- buffer byte-for-byte unchanged: {}",
+        text
+    );
+    assert!(
+        msg.contains("no legal host"),
+        "must be reported by name: {}",
+        msg
+    );
+}
+
+#[test]
+fn autounused_port_and_instance_name_collision_via_hierarchical_read_is_a_known_limitation_not_fixed(
+) {
+    // R8.2: pins the CURRENT behavior of the R3.1-adjacent known
+    // limitation documented on `verilog-auto--identifier-non-root-
+    // hierarchical-component-p' -- a module-level port and a submodule
+    // instance sharing one name, read only via a hierarchical reference
+    // into the INSTANCE's own port (`that_name.dbg_o'), currently makes
+    // the module-level PORT `that_name' look read (it is NOT listed as
+    // unused here), purely by text equality on the root path component.
+    //
+    // NOTE (M136 fix round R8, this round's own re-verification): a
+    // cold-read claim that real `slang-server' independently confirms
+    // this is the WRONG side (reporting `unused-port' for `that_name')
+    // did NOT reproduce under direct testing this round. The fixture
+    // itself is a genuine LRM namespace collision (a port and an
+    // instance sharing one name in the same module scope) --
+    // `slang-server' reports `redefinition of "that_name"' (an error)
+    // for it, not a clean `unused-port'; measured 3 times (with the
+    // submodule's own output net implicit, explicitly pre-declared, and
+    // with the hierarchical read removed entirely as a baseline) and
+    // `unused-port' for `that_name' only ever appeared in the LAST
+    // variant, the one with NO hierarchical read at all -- i.e. real
+    // slang's own behavior, once the redefinition error is present,
+    // did not visibly disagree with this tool in the way the cold-read
+    // claimed. This test pins CURRENT behavior regardless (the
+    // limitation itself -- text-equality without name resolution -- is
+    // real and undisputed), but does NOT claim slang independently
+    // proves this is the wrong answer; that specific claim is reported
+    // back to the coordinator rather than written into the docstring
+    // as settled.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (\n  output logic dbg_o\n);\n  assign dbg_o = 1'b1;\nendmodule\n\nmodule top (\n  input  logic that_name,\n  output logic z_o\n);\n  sub that_name (.dbg_o(dbg_o));\n  assign z_o = that_name.dbg_o;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !unused_block(&text).contains("that_name,"),
+        "KNOWN LIMITATION pin -- if this assertion starts FAILING, the most likely \
+         reason is that someone fixed the limitation: update the docstring this test \
+         names and re-point the test, do not revert the change that made it fail. \
+         What is pinned: `that_name' is read only via a hierarchical \
+         reference into a SAME-NAMED instance's own port, which this scan cannot tell apart \
+         from a genuine read of the module-level port with the same name -- currently NOT \
+         listed here: {}",
+        text
+    );
+}

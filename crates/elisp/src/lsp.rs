@@ -98,6 +98,18 @@ pub struct LspConnection {
     stdin: Option<ChildStdin>,
     events: Receiver<LspEvent>,
     alive: bool,
+    // M135: a monotonically increasing count of events the reader thread
+    // has handed off to `events` (both `Message` and `Died` count), bumped
+    // AFTER the corresponding `tx.send` returns successfully -- see the
+    // reader-thread loop below for why the ordering is load-bearing.
+    // Exists because `Receiver` has no `len()`, and every existing way to
+    // observe "a message arrived" (`lsp-poll`/`lsp-wait`) CONSUMES it, so
+    // a test that needs to observe "arrived but not yet taken" (M135's
+    // F9/F10 in `lsp_autostart_tests.rs`) has nothing to poll without
+    // itself destroying the state it's trying to catch. Same motivation
+    // as `pid()` above (M65): a side-channel query that doesn't disturb
+    // dispatch order.
+    delivered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl LspConnection {
@@ -183,6 +195,8 @@ impl LspConnection {
         // Only ever moves Strings (Send) across the thread boundary,
         // never a Value -- same safety argument as worker.rs's reader.
         let (tx, rx) = mpsc::channel();
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delivered_reader = delivered.clone();
         std::thread::spawn(move || {
             let mut r = BufReader::new(stdout);
             loop {
@@ -191,9 +205,20 @@ impl LspConnection {
                         if tx.send(LspEvent::Message(s)).is_err() {
                             break;
                         }
+                        // M135: bump the counter ONLY after `send`
+                        // returns Ok -- so "count >= k" implies "k events
+                        // are already sitting in the channel, ready for
+                        // `lsp-poll` to pick up right now". Doing it the
+                        // other way around (add then send) would let a
+                        // waiter see the count go up before the message
+                        // is actually enqueued, and fall through too
+                        // early.
+                        delivered_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     Ok(None) | Err(_) => {
-                        let _ = tx.send(LspEvent::Died);
+                        if tx.send(LspEvent::Died).is_ok() {
+                            delivered_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         break;
                     }
                 }
@@ -216,6 +241,7 @@ impl LspConnection {
             stdin: Some(stdin),
             events: rx,
             alive: true,
+            delivered,
         })
     }
 
@@ -310,6 +336,18 @@ impl LspConnection {
     /// killed.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// M135: how many events (`Message` or `Died`) the reader thread has
+    /// handed off so far -- monotonically increasing, consumes nothing,
+    /// and bumped only after the corresponding channel `send` has
+    /// already returned (see the reader-thread loop in `spawn` for why
+    /// that ordering matters). Exists so a caller can wait for "an event
+    /// has arrived" without touching `lsp-poll`/`lsp-wait`, both of which
+    /// would consume the very thing being waited for and disturb
+    /// dispatch order -- same rationale as `pid()` just above (M65).
+    pub fn events_delivered(&self) -> usize {
+        self.delivered.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -501,5 +539,19 @@ pub fn register(interp: &mut Interp) {
         let conn = conn_arg(i, &a[0])?;
         let pid = conn.borrow().pid();
         Ok(Value::Int(pid as i64))
+    });
+    // M135: how many events (message or death) have been DELIVERED to
+    // CONN so far -- monotonically increasing, and unlike `lsp-poll`/
+    // `lsp-wait`, does NOT consume anything (calling it never makes a
+    // later `lsp-poll` return nil for something this call "already
+    // took"). Includes `Died`. Exists so a test (or, in principle, idle
+    // logic) can wait for "an event has arrived" without disturbing
+    // dispatch order by accidentally consuming it first -- same
+    // rationale as `lsp-connection-pid` (M65) existing instead of asking
+    // the child process to report its own pid.
+    defun(interp, "lsp-events-delivered", 1, Some(1), |i, a| {
+        let conn = conn_arg(i, &a[0])?;
+        let n = conn.borrow().events_delivered();
+        Ok(Value::Int(n as i64))
     });
 }

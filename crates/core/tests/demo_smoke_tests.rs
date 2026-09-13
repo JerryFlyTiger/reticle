@@ -147,7 +147,7 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 37] = [
+    const TABLE: [(&str, &str); 38] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
@@ -173,6 +173,7 @@ fn every_file_under_demo_opens_in_its_expected_major_mode() {
         ("rtl/top/soc_top.sv", "verilog-mode"),
         ("rtl/verible.filelist", "fundamental-mode"),
         ("tools/TimingReport.java", "java-mode"),
+        ("run_editor.sh", "sh-mode"),
         ("tools/bitvec.rs", "rust-mode"),
         ("tools/crc32.c", "c-mode"),
         ("tools/lint_rtl.sh", "sh-mode"),

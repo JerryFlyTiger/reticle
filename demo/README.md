@@ -169,6 +169,29 @@ They share a theme on purpose: these are the small tools that pile up
 around an RTL project, which makes the set cohesive rather than ten
 unrelated "hello, world"s.
 
+## Opening this design in the editor
+
+If you only run one thing here, run this:
+
+```sh
+./run_editor.sh              # GUI window on the SoC top level
+./run_editor.sh --tui        # or in this terminal instead
+./run_editor.sh --unused     # the stub module `/*AUTOUNUSED*/` fills in
+./run_editor.sh --help       # every option, and the keys worth trying
+```
+
+It builds first (`cargo build --workspace`) and then opens the file, so the
+window you get is the code in your working tree. A Rust toolchain is the only
+requirement: Verible and Icarus are needed by the scripts below, not by the
+editor. If `verible-verilog-ls` or `slang-server` happens to be on `PATH` the
+editor attaches to it and the mode line grows an `LSP` indicator; without one,
+everything else still works.
+
+The two keys this design is built to show off are `C-c C-a` (`verilog-auto` —
+expand every `/*AUTO...*/` marker) and `C-c C-k` (`verilog-delete-auto` —
+remove what it generated). Pressing `C-c C-k` then `C-c C-a` returns the file
+byte-for-byte; that round trip is the point. `C-x C-c` quits.
+
 ## Checking the claims
 
 ```sh
@@ -201,6 +224,15 @@ perl -c tools/simlog_report.pl
 
 Verified on macOS (arm64) when this directory was written:
 
+- `./run_editor.sh` — `--help`, both error paths (unknown option, missing
+  file) and `--dry-run` (which does perform the build) were run and behave as
+  documented. The interactive launch itself cannot be exercised from a script,
+  so it was verified the way this project verifies every GUI claim — by
+  screenshot: `dev/gui-shot.sh demo/rtl/core/status_regs_stub.sv` opens the
+  same binary on the same file and shows the file, the expanded
+  `/*AUTOUNUSED*/` block and `LSP: autostarted slang-server`. **What has not
+  been exercised: pressing the keys.** The `C-c C-a` / `C-c C-k` round trip is
+  covered by the test suite, not by this script.
 - `./tools/lint_rtl.sh` — **all three checks pass** across all 20 Verilog
   and SystemVerilog files (`verible-verilog-syntax`, `-lint`, `-format
   --verify`).
@@ -232,7 +264,7 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 37 files open in the correct major mode** — 31 in a
+- **All 38 files open in the correct major mode** — 32 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
   `emacs-lisp-mode`, `org-mode`) and 6 in `fundamental-mode`

@@ -54,11 +54,16 @@
 //! back) can trigger. The consequence: this file does NOT end-to-end
 //! exercise the production drain-and-re-poll path (`lsp-process-
 //! pending-all') completing an autostart handshake and sending its
-//! `didOpen' in the same call -- `idle_tick_completes_a_near_deadline_
-//! handshake_before_reaping_it' (the only test here that drives
-//! `core::idle_tick' directly) DOES go through the real `lsp-process-
-//! pending-all' end to end, but does not itself assert on `didOpen'
-//! framing -- only on which of "attached" vs "reaped" won.
+//! `didOpen' in the same call -- the tests here that drive
+//! `core::idle_tick' directly (grep for it) DO go through the real
+//! `lsp-process-pending-all' end to end, but none of them asserts on
+//! `didOpen' framing: they assert on which of "attached" vs "reaped"
+//! won. (M135: this named one specific test and called it "the only"
+//! one, which F10 had already falsified. The trailing cold read then
+//! pointed out that replacing "one" with "two" repeats the same
+//! mistake one test later -- and that this file's own note below
+//! already says not to restate call-site counts here. So the count is
+//! gone rather than corrected.)
 
 use elisp::printer::prin1_to_string;
 use elisp::Interp;
@@ -285,6 +290,46 @@ while True:
     os.write(fd_out, chunk)
 ";
 
+/// M135: reads exactly one full Content-Length-framed message (the
+/// `initialize` request) and then exits with no reply -- for
+/// `dead_process_before_deadline_is_reaped_via_liveness_not_deadline`
+/// (F10), which needs the spawn itself to unconditionally succeed
+/// (`lsp-send` must never hit EPIPE) and the process to die only
+/// AFTERWARD.
+///
+/// This is NOT the same shape as `sh -c "read line; exit 1"`, which was
+/// tried first and rejected: `sh`'s `read` builtin stops at the first
+/// `\n`, and `write_message` (`crates/elisp/src/lsp.rs`) issues the
+/// header and the body as TWO SEPARATE `write` calls -- a shell `read
+/// line` only consumes the header line, so the child can still exit
+/// (closing its stdin) in the gap between those two writes, leaving the
+/// BODY write to hit EPIPE exactly as before, just less often. Reading
+/// the full framed message the same way `ECHO_INIT_SCRIPT` does --
+/// blocking on `sys.stdin.buffer.read(length)` for the whole body, not
+/// just a line -- means this script's own `read_message` call cannot
+/// return (and therefore the process cannot exit) until every byte of
+/// both writes has actually arrived, closing the race by construction
+/// rather than narrowing its window.
+const DIES_AFTER_READING_INITIALIZE_SCRIPT: &str = "#!/usr/bin/env python3
+import sys
+
+def read_message():
+    header = b''
+    while not header.endswith(b'\\r\\n\\r\\n'):
+        ch = sys.stdin.buffer.read(1)
+        if not ch:
+            return None
+        header += ch
+    length = 0
+    for line in header.decode('latin-1').split('\\r\\n'):
+        if line.lower().startswith('content-length:'):
+            length = int(line.split(':', 1)[1])
+    return sys.stdin.buffer.read(length)
+
+read_message()  # consume the whole `initialize` request, then just die
+sys.exit(1)
+";
+
 /// Returns the fake server's own script path -- most callers ignore it
 /// (the pre-M123 `register_cat` returned nothing, since `"cat"` was a
 /// fixed, known literal every assertion could just spell out), but a
@@ -331,10 +376,25 @@ fn set_frontend_started(i: &mut Interp) {
 /// real message actually shows up, never gives up before it does,
 /// short of the ceiling) and typically much faster than the fixed
 /// sleep it replaces (the common case answers within a few
-/// milliseconds, not 1.5 real seconds). Every call site's own
-/// preceding `std::thread::sleep' is gone -- this function is now the
-/// only place in this file that waits for a reply to physically
-/// arrive before dispatching it.
+/// milliseconds, not 1.5 real seconds).
+///
+/// M135 fix round (F3, trailing cold review): the previous paragraph's
+/// last sentence -- that this function was "the only place in this file
+/// that waits for a reply to physically arrive before dispatching it" --
+/// went stale the moment M135 added `pump_until` (this file, above), and
+/// was never updated; a cold reviewer caught the resulting lie. The
+/// actual division of labor as of M135: this function (`dispatch_one_
+/// pending`) polls and dispatches EXACTLY ONE message, which is what
+/// makes it safe against self-consumption (see this doc comment's first
+/// paragraph) -- callers use it when they need to catch one specific
+/// completion without risking `lsp-process-pending-all`'s drain-until-
+/// empty loop swallowing a frame the completion callback sends
+/// synchronously. `pump_until` instead calls `(lsp-process-pending-all)`
+/// -- the real, unbounded drain -- on every iteration and only checks an
+/// elisp predicate afterward; callers use it when they're waiting on a
+/// STATE (e.g. `lsp--buffer-client` becoming non-nil) rather than
+/// catching one specific frame, where the self-consumption risk this
+/// function exists to avoid doesn't apply.
 fn dispatch_one_pending(i: &mut Interp) {
     ok(
         i,
@@ -361,6 +421,115 @@ fn dispatch_one_pending(i: &mut Interp) {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// M135: polls `(lsp-process-pending-all)` (which drives the whole
+/// pending queue, unlike `dispatch_one_pending`'s single-message-at-a-
+/// time care) followed by evaluating PRED_ELISP, until PRED_ELISP
+/// evaluates to non-nil -- 5ms between retries, up to a 30-second
+/// ceiling. Exists to replace the "sleep a fixed 1500ms, then check
+/// once" shape that made this file's tests flaky under load (see PLAN.md
+/// M135): a fixed sleep is not a synchronisation primitive, and this
+/// project's own fake `python3` echo server was measured taking anywhere
+/// from 404ms (idle machine) to 942ms (26 tests under load), leaving as
+/// little as ~1.6x headroom over a fixed 1500ms wait.
+///
+/// Panics (never `return`s -- see this file's other helpers for why a
+/// `return` here would be indistinguishable from a real pass under this
+/// project's own gate) naming WHAT it was waiting for if the ceiling is
+/// reached, so a genuine regression in the code under test still reads
+/// as a clear failure rather than an indefinite hang.
+fn pump_until(i: &mut Interp, pred_elisp: &str, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        ok(i, "(lsp-process-pending-all)");
+        let r = run(i, pred_elisp);
+        if r != "nil" {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "pump_until: condition {:?} never became true within 30s while \
+                 waiting for: {} -- either the fake server never answered, or \
+                 this is a real bug",
+                pred_elisp, what
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// M135: like `drain_frames`, but repeatedly re-runs the drain and
+/// ACCUMULATES the count across calls (rather than trusting a single
+/// pass to have caught everything) until the running total reaches
+/// WANT, or the 30-second ceiling elapses. `drain_frames` itself does a
+/// single pass that stops the moment `lsp-poll` returns nil -- which is
+/// exactly wrong when the fake server hasn't finished echoing everything
+/// back yet: a single pass can legitimately see fewer than WANT frames
+/// and then simply stop, because at that instant nothing more had
+/// arrived. This helper keeps calling `drain_frames` until enough have
+/// shown up in total.
+///
+/// M135 fix round (F2, trailing cold review): reaching `total >= want`
+/// used to return immediately -- which only proves "at least WANT
+/// arrived", not "exactly WANT arrived", the moment there's any risk of
+/// MORE than WANT showing up. The original fixed `sleep(1500)` this
+/// milestone replaced did a single FULL drain after its wait, so it
+/// would have caught a bug that sends one extra frame right after the
+/// wanted ones (e.g. a completion callback that double-sends `didOpen`)
+/// -- this accumulating loop, as first written, would NOT have: it
+/// stops checking the instant it has counted enough, so a later, unasked
+/// -for frame simply never gets looked at. That's a coverage regression
+/// this milestone must not introduce. Fixed by settling briefly (50ms,
+/// under the guard's own 500ms threshold) once WANT is reached, then
+/// doing one more full drain pass and folding it into the total before
+/// returning -- if extra frames were queued right behind the wanted
+/// ones, this pass catches them and the caller's `== want` assertion
+/// goes red. The 50ms is a SETTLE, not a synchronization primitive: by
+/// this point the wanted frame has already physically arrived, so any
+/// extra frame from the SAME synchronous callback that sent it is
+/// already in flight over the same pipe, not waiting on some future
+/// decision by the other side -- this is just giving those bytes time to
+/// finish traversing the pipe and land in this process's own read
+/// buffer, not waiting on an event that might not happen yet.
+///
+/// M135 trailing cold review raised the obvious objection: this same
+/// file measures the fake server's reply latency at 404-942ms under
+/// load, so how can 50ms be enough? Because those are two different
+/// latencies. The 942ms figure is a `python3' interpreter start plus the
+/// first request/response round trip -- it is the cost of the OTHER SIDE
+/// producing a first answer. What this settle waits for is the gap
+/// between two frames the other side already wrote back-to-back, before
+/// either of them had been read: once the first has traversed the pipe
+/// and been picked up by the reader thread, the second is sitting in the
+/// same buffer behind it, and what remains is a reader-thread hop, not a
+/// round trip. Raising 50ms toward a second would re-introduce exactly
+/// the cost this milestone removed, and would still not be a bound -- so
+/// the honest statement is that this is a generous window for the
+/// mechanism actually in play, not a proof. Nothing in the tree can turn
+/// it red today (`dev/mutations/m135.py' D8 measures that), which is why
+/// it is labelled defensive coverage rather than a tested guarantee.
+fn drain_frames_until(i: &mut Interp, conn_expr: &str, method: &str, want: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut total = 0usize;
+    loop {
+        total += drain_frames(i, conn_expr, method);
+        if total >= want {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "drain_frames_until: only accumulated {} of {} wanted {:?} frames \
+                 within 30s -- either the fake server never sent the rest, or this \
+                 is a real bug",
+                total, want, method
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    total += drain_frames(i, conn_expr, method);
+    total
 }
 
 /// Same message-capturing shape used by `lsp_action_tests.rs`,
@@ -434,9 +603,12 @@ fn happy_path_spawns_attaches_and_backfills() {
     );
     assert_eq!(run(&mut i, "(eq lsp--buffer-client test--client)"), "t");
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // M135: was a fixed 1500ms sleep then a single-pass drain -- replaced
+    // with an accumulating drain (see `drain_frames_until`'s own doc
+    // comment) so this doesn't depend on both didOpens having already
+    // arrived within an arbitrary fixed window.
     assert_eq!(
-        drain_frames(&mut i, "test--conn", "textDocument/didOpen"),
+        drain_frames_until(&mut i, "test--conn", "textDocument/didOpen", 2),
         2,
         "both a.rs and b.rs should have been didOpen'd"
     );
@@ -497,7 +669,14 @@ fn deaf_server_is_reaped_after_the_deadline_with_no_retry() {
         "(add-to-list 'lsp-server-alist
              (cons 'rust-mode (list \"sh\" \"-c\" \"cat > /dev/null\")))",
     );
-    ok(&mut i, "(setq lsp-autostart-timeout 1)");
+    // M135: was `1` -- under load, the 5x100ms "stays responsive" pacing
+    // loop below can itself take over 1s wall-clock, which would let the
+    // entry get reaped EARLY, mid-loop, turning "still pending after the
+    // loop" red for reasons that have nothing to do with deadline
+    // handling. `30` makes early reaping structurally impossible during
+    // the loop; see below for how a real deadline still gets exercised
+    // afterward without depending on how long the loop above took.
+    ok(&mut i, "(setq lsp-autostart-timeout 30)");
     capture_messages(&mut i);
 
     ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
@@ -539,14 +718,61 @@ fn deaf_server_is_reaped_after_the_deadline_with_no_retry() {
     assert_eq!(run(&mut i, "(length lsp--autostart-pending)"), "1");
     assert_eq!(run(&mut i, "lsp--autostart-tried"), "nil");
 
-    // Push well past the 1s deadline, then tick again -- this is the
-    // call that reaps the entry, i.e. the one that reaches `lsp-kill`'s
-    // blocking `child.wait()` (documented at this file's own M88
-    // section header as the one honest exception to "nothing on this
-    // path blocks"). Bounded generously: `sh -c "cat > /dev/null"` is a
-    // real, well-behaved child that responds to SIGKILL immediately, so
-    // this reap should be on the order of milliseconds, not seconds.
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // M135: was `sleep(1200)` against a deadline `lsp-autostart-timeout`
+    // set at the top of this test -- with the timeout now `30` (so the
+    // pacing loop above can never reap early, see that assignment's own
+    // comment), that deadline is no longer something a short fixed sleep
+    // could reach at all. Instead: reset THIS ONE pending entry's own
+    // deadline to a fresh, real, short one, then poll the REAL clock
+    // (`float-time`) until it has genuinely elapsed. This still proves
+    // "reaping only happens once a real deadline has passed" against an
+    // actual wall-clock deadline -- it's just a freshly-set one, not the
+    // original `30`-second one, so the test's own runtime doesn't depend
+    // on how much load happened to exist during the preceding loop.
+    //
+    // Two alternatives considered and rejected:
+    //   - Setting the deadline into the PAST (e.g. `(- (float-time) 1)`)
+    //     would make the reap-timing assertions below vacuous: nothing in
+    //     this file would then ever observe "reaping waits for a REAL
+    //     deadline to actually pass" (every past-deadline reap fires
+    //     immediately regardless of whether deadline handling works at
+    //     all).
+    //   - Just raising the fixed sleep from 1s to 3s (matching the
+    //     spec's suggestion) only moves the safety margin from 2x to
+    //     6x -- still a fixed sleep racing an external process's
+    //     scheduling latency under load, the exact shape this whole
+    //     milestone exists to remove.
+    ok(
+        &mut i,
+        "(setf (nth 2 (cdr (car lsp--autostart-pending))) (+ (float-time) 0.2))",
+    );
+    ok(
+        &mut i,
+        "(setq test--reap-deadline (nth 2 (cdr (car lsp--autostart-pending))))",
+    );
+    let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let past = ok(&mut i, "(> (float-time) test--reap-deadline)");
+        if past == "t" {
+            break;
+        }
+        if std::time::Instant::now() >= poll_deadline {
+            panic!(
+                "deaf_server_is_reaped_after_the_deadline_with_no_retry: the real \
+                 clock never passed test--reap-deadline within 30s -- this is a \
+                 real bug, not a timing fluke"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // This is the call that reaps the entry, i.e. the one that reaches
+    // `lsp-kill`'s blocking `child.wait()` (documented at this file's
+    // own M88 section header as the one honest exception to "nothing on
+    // this path blocks"). Bounded generously: `sh -c "cat > /dev/null"`
+    // is a real, well-behaved child that responds to SIGKILL
+    // immediately, so this reap should be on the order of milliseconds,
+    // not seconds.
     let reap_start = std::time::Instant::now();
     ok(&mut i, "(lsp-process-pending-all)");
     ok(&mut i, "(lsp--autostart-tick)");
@@ -658,8 +884,11 @@ fn two_buffers_in_one_project_produce_exactly_one_spawn() {
     assert_eq!(run(&mut i, "(length lsp--clients)"), "1");
 
     // Let it complete; both buffers must end up on the SAME client.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    ok(&mut i, "(lsp-process-pending-all)");
+    pump_until(
+        &mut i,
+        "lsp--buffer-client",
+        "b.rs's lsp--buffer-client to become non-nil",
+    );
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil"); // b.rs
     ok(&mut i, "(setq test--client-b lsp--buffer-client)");
     ok(
@@ -818,21 +1047,63 @@ fn did_change_cannot_precede_did_open() {
         "(setq test--conn (lsp--client-conn lsp--buffer-client))",
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    // One pass over the connection's whole queue, classifying every
-    // frame by method, so nothing is lost to a second (empty) drain.
-    let src = "(let ((opens nil) (changes nil) (msg t))
-                 (while msg
-                   (setq msg (lsp-poll test--conn))
-                   (when msg
-                     (let ((m (gethash \"method\" msg nil)))
-                       (cond
-                        ((equal m \"textDocument/didOpen\") (push msg opens))
-                        ((equal m \"textDocument/didChange\") (push msg changes))))))
-                 (setq test--opens (nreverse opens))
-                 (setq test--changes (nreverse changes))
-                 (list (length test--opens) (length test--changes)))";
-    let counts = ok(&mut i, src);
+    // M135: was a fixed 1500ms sleep then a single pass over the queue.
+    // Replaced with a loop that APPENDS every pass's classified frames
+    // onto `test--opens'/`test--changes' (never overwrites), stopping
+    // once at least one didOpen has shown up. Correctness argument for
+    // why stopping at exactly one didOpen is still enough to prove "no
+    // didChange snuck out early" (must go in a comment, not just here --
+    // the next reader will otherwise mistake this for a hole): the edit
+    // above happened BEFORE the handshake completed, so if there were a
+    // bug that sent a didChange early, it would have entered this same
+    // pipe EARLIER than the didOpen -- and the fake server's echo
+    // preserves order, so seeing the didOpen already proves anything
+    // that could have preceded it has arrived too.
+    //
+    // M135 fix round (F2, trailing cold review): that argument only
+    // covers a didChange sent BEFORE the didOpen. It does NOT cover a bug
+    // that sends a didChange RIGHT AFTER the didOpen (e.g. the same
+    // completion callback that sends the didOpen also mistakenly fires
+    // an immediate didChange) -- FIFO guarantees that arrives LATER, and
+    // the loop above breaks the instant it sees the didOpen, so it would
+    // never even look for it. The original fixed `sleep(1500)` this
+    // milestone replaced DID cover that case (a single full drain after
+    // a generous wait would have picked up any such trailing frame), so
+    // leaving this loop as "stop at the first didOpen" would have been a
+    // coverage regression. Closed the same way as `drain_frames_until`'s
+    // own fix for the identical hole (see that function's own comment
+    // for why 50ms here is a settle, not a synchronization primitive):
+    // settle briefly once the didOpen has been seen, then run one more
+    // full classification pass before trusting the counts.
+    ok(&mut i, "(setq test--opens nil) (setq test--changes nil)");
+    let classify_one_pass = "(let ((msg t))
+           (while msg
+             (setq msg (lsp-poll test--conn))
+             (when msg
+               (let ((m (gethash \"method\" msg nil)))
+                 (cond
+                  ((equal m \"textDocument/didOpen\")
+                   (setq test--opens (append test--opens (list msg))))
+                  ((equal m \"textDocument/didChange\")
+                   (setq test--changes (append test--changes (list msg))))))))
+           (length test--opens))";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let n: usize = ok(&mut i, classify_one_pass).parse().unwrap_or(0);
+        if n >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "did_change_cannot_precede_did_open: no didOpen arrived within 30s \
+                 -- either the fake server never answered, or this is a real bug"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    ok(&mut i, classify_one_pass);
+    let counts = ok(&mut i, "(list (length test--opens) (length test--changes))");
     assert_eq!(
         counts, "(1 0)",
         "expected exactly one didOpen and no didChange"
@@ -901,8 +1172,11 @@ fn publish_diagnostics_before_initialize_response_does_not_panic() {
     );
 
     // The rest of the handshake must still complete normally afterward.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    ok(&mut i, "(lsp-process-pending-all)");
+    pump_until(
+        &mut i,
+        "lsp--buffer-client",
+        "lsp--buffer-client to become non-nil once the handshake finishes",
+    );
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     ok(&mut i, "(lsp-kill (lsp--client-conn lsp--buffer-client))");
 }
@@ -944,8 +1218,11 @@ fn mode_line_signal_goes_pending_then_attached() {
         pending_here
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    ok(&mut i, "(lsp-process-pending-all)");
+    pump_until(
+        &mut i,
+        "lsp--buffer-client",
+        "lsp--buffer-client to become non-nil once attached",
+    );
 
     assert_ne!(run(&mut i, "lsp--buffer-client"), "nil");
     assert_eq!(run(&mut i, "lsp--autostart-pending-here"), "nil");
@@ -1285,9 +1562,40 @@ fn idle_tick_completes_a_near_deadline_handshake_before_reaping_it() {
     core::idle_tick(&mut i, std::time::Duration::ZERO);
     assert_eq!(run(&mut i, "(length lsp--autostart-pending)"), "1");
 
-    // Let cat actually echo the initialize request back into the
-    // connection's channel.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // M135: was `sleep(1500)`. This test's whole point is that a reply
+    // sitting in the connection's channel but NOT YET DISPATCHED still
+    // gets dispatched (not reaped) inside the same `idle_tick`; ANY call
+    // to `lsp-poll`/`lsp-process-pending-all` here (the ordinary way
+    // this file waits, in `pump_until`) would itself consume that reply,
+    // deleting the very state this test exists to observe -- the
+    // `(setf (nth 2 ...) ...)` immediately below would then be mutating
+    // a `nil` pending entry, and the whole test would silently prove
+    // nothing. So this waits on the reader thread's own delivery count
+    // (`lsp-events-delivered`, M135 Part A) instead, which observes
+    // "an event has arrived" without taking it. Do NOT "clean this up"
+    // into `pump_until` -- that would remove exactly what this test is
+    // for.
+    ok(
+        &mut i,
+        "(setq test--f9-conn (nth 0 (cdr (car lsp--autostart-pending))))",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let n: i64 = ok(&mut i, "(lsp-events-delivered test--f9-conn)")
+            .parse()
+            .unwrap_or(-1);
+        if n >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "idle_tick_completes_a_near_deadline_handshake_before_reaping_it: \
+                 lsp-events-delivered never reached 1 within 30s -- the fake \
+                 server never replied, or this is a real bug"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
     // Force the deadline into the past -- "just barely made its
     // deadline" without depending on real-time scheduling to land the
@@ -1343,9 +1651,40 @@ fn dead_process_before_deadline_is_reaped_via_liveness_not_deadline() {
     // missing binary (test 3, lsp-start itself fails) and distinct from
     // a deaf server that stays alive (test 2, only the deadline reaps
     // it).
+    //
+    // M135 fix round: was `"sh" "-c" "exit 1"` alone. Reproduced under
+    // 4x parallel load (see PLAN.md M135): `lsp--autostart-begin` writes
+    // the `initialize` request to the child's stdin BEFORE any pending
+    // entry is recorded, and under load `sh -c "exit 1"` can exit --
+    // closing its read end -- before that write happens, so the write
+    // hits EPIPE, `lsp--autostart-begin`'s own `condition-case` (`lsp.el`)
+    // catches it as a spawn failure, and the site goes straight into
+    // `lsp--autostart-tried` with NO pending entry ever created --
+    // `(length lsp--autostart-pending)` reads 0, not 1, at the assertion
+    // right below. Observed directly: `test--messages` held `"LSP
+    // autostart: failed to start sh: lsp-send: Broken pipe (os error
+    // 32)"` on reproduction.
+    //
+    // `DIES_AFTER_READING_INITIALIZE_SCRIPT` (this file, above)
+    // eliminates the race by construction: it blocks on reading the
+    // WHOLE framed `initialize` message before exiting, so both of
+    // `write_message`'s writes (header, then body) are guaranteed to
+    // have already landed by the time the child can die. See that
+    // const's own doc comment for why a plain `sh -c "read line; exit
+    // 1"` was tried first and is NOT enough (it only narrows the race,
+    // since a shell `read line` consumes just the header line, not the
+    // body that arrives in a second, separate `write` call).
+    let script = write_script(
+        &dir,
+        "dies_after_reading.py",
+        DIES_AFTER_READING_INITIALIZE_SCRIPT,
+    );
     ok(
         &mut i,
-        "(add-to-list 'lsp-server-alist (cons 'rust-mode (list \"sh\" \"-c\" \"exit 1\")))",
+        &format!(
+            "(add-to-list 'lsp-server-alist (cons 'rust-mode (list {:?})))",
+            script
+        ),
     );
     // Deliberately huge: if this test passes, the deadline branch is
     // structurally incapable of having fired -- only liveness could
@@ -1372,8 +1711,44 @@ fn dead_process_before_deadline_is_reaped_via_liveness_not_deadline() {
     core::idle_tick(&mut i, std::time::Duration::ZERO);
     assert_eq!(run(&mut i, "(length lsp--autostart-pending)"), "1");
 
-    // Give the child a moment to actually exit.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // M135: was `sleep(1500)`. Waits for `lsp-events-delivered` (Part A)
+    // instead of `lsp-live-p`, and this distinction is load-bearing, not
+    // a style choice: `LspConnection::is_alive` is a cached flag that
+    // only flips when something has actually CONSUMED the `Died` event
+    // via `try_recv`/`recv_timeout` (i.e. `lsp-poll`/`lsp-wait`) -- so
+    // polling `lsp-live-p` in a bare loop here would never see it change
+    // (nothing in this loop ever polls the connection) and would spin
+    // until the 30s ceiling and panic even though the child is long
+    // dead. Worse, a poll loop that DID call `lsp-poll` to make
+    // `lsp-live-p` become observable would itself consume the `Died`
+    // event ahead of schedule -- pulling forward the very thing this
+    // test's own comment above documents as happening on the SECOND
+    // `idle_tick` (`lsp-process-pending-all` inside it is what first
+    // observes the death, at production-realistic timing). `lsp-events-
+    // delivered` sidesteps both problems: it counts `Died` too, without
+    // consuming it, so waiting for it to reach 1 proves the child has
+    // actually exited without touching when `is_alive` itself flips.
+    ok(
+        &mut i,
+        "(setq test--f10-conn (nth 0 (cdr (car lsp--autostart-pending))))",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let n: i64 = ok(&mut i, "(lsp-events-delivered test--f10-conn)")
+            .parse()
+            .unwrap_or(-1);
+        if n >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "dead_process_before_deadline_is_reaped_via_liveness_not_deadline: \
+                 lsp-events-delivered never reached 1 within 30s -- the child \
+                 never died, or this is a real bug"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
     let before = std::time::Instant::now();
     core::idle_tick(&mut i, std::time::Duration::ZERO);
@@ -2248,5 +2623,141 @@ fn autostart_warns_about_duplicate_declarations_under_a_widened_root() {
     ok(
         &mut i,
         "(dolist (c lsp--buffer-clients) (lsp-kill (lsp--client-conn c)))",
+    );
+}
+
+// ============================================================
+// M135 Part E: a guard against the fixed-`sleep` family (F9/F10 in
+// PLAN.md) creeping back into this file. Reads THIS FILE'S OWN SOURCE
+// and fails loudly if any thread-sleep call site's argument is >= 500ms
+// -- the pacing sleeps this file legitimately keeps (5/20/50/100ms) are
+// all well under that, and the fake `python3` echo server's own 1-second
+// delay (`DELAYED_ECHO_INIT_SCRIPT`) is a Python string constant, not a
+// Rust sleep call, so it is untouched by (and irrelevant to) this guard,
+// and it is deliberate (see that const's own doc comment).
+//
+// This is the deletion-question answer for Part B/C/D as a whole: revert
+// any one of those fixes back to a fixed long sleep, and THIS test goes
+// red and names the line -- without it, a regression back to `sleep
+// (1500)` anywhere in this file would pass silently on an idle machine
+// (only failing under load, which is exactly the false-negative shape
+// this whole milestone exists to close).
+#[test]
+fn guard_no_long_thread_sleeps_in_this_file() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/lsp_autostart_tests.rs");
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "guard_no_long_thread_sleeps_in_this_file: could not read its own \
+             source at {:?}: {}",
+            path, e
+        )
+    });
+
+    // M114 self-check floor: a mechanism that decides what to check must
+    // fail loudly if it ends up checking nothing. Built by concatenating
+    // parts at runtime (not spelled as one literal) so this floor check
+    // itself doesn't shadow-satisfy the very thing it's guarding against.
+    assert!(
+        !content.is_empty(),
+        "guard lost its target: read an empty file"
+    );
+    let line_count = content.lines().count();
+    assert!(
+        line_count > 1500,
+        "guard lost its target: only {} lines read, expected > 1500 -- \
+         wrong path, or this file got drastically smaller",
+        line_count
+    );
+    let sentinel: String = ["fn ", "dispatch_one_pending"].concat();
+    assert!(
+        content.contains(&sentinel),
+        "guard lost its target: sentinel {:?} not found in the file it read",
+        sentinel
+    );
+
+    // Built from parts, not one literal -- see this test's own doc
+    // comment above for why (a literal copy here would make every line
+    // of THIS function itself look like a hit).
+    //
+    // M135 fix round (F4, trailing cold review): the marker used to be
+    // built ONLY from the fully-qualified path's own two segments (the
+    // module path, then the function name plus its open paren). A cold
+    // reviewer pointed out that importing the module first and calling
+    // the function unqualified afterward -- valid Rust, and arguably
+    // the more idiomatic spelling once the module is already imported
+    // -- would silently sail past that marker entirely, since the
+    // fully-qualified prefix wouldn't appear at the call site at all.
+    // Narrowed the first segment down to just the module name's own
+    // trailing `::`, which is a substring of both spellings, so it
+    // still catches every existing call site in this file (all fully-
+    // qualified) as well as the shorter, unqualified-call spelling.
+    //
+    // Known remaining bypasses, written down honestly rather than
+    // implied to be closed: this is a textual scan, not a parse, so (a)
+    // importing the function itself under a different local name and
+    // calling it under THAT name never contains this guard's marker
+    // text at the call site at all, and is invisible to it, and (b)
+    // wrapping the real call inside a locally-defined helper function
+    // (so only the helper's own definition contains the marker, and
+    // every call site just names the helper with its own duration
+    // argument) is likewise invisible once the helper's own definition
+    // line no longer spells the marker out verbatim, or if the helper
+    // lives in a different file this guard doesn't read. Closing those
+    // would need an actual AST-level check, which is out of proportion
+    // to what this guard is for -- a slow leak, not a promise that
+    // regressions here are structurally impossible.
+    let sleep_marker: String = ["thread::", "sleep("].concat();
+    let millis_marker = "from_millis(";
+    let secs_marker = "from_secs(";
+
+    let mut violations: Vec<(usize, String)> = Vec::new();
+    let mut unparseable: Vec<(usize, String)> = Vec::new();
+    for (lineno, line) in content.lines().enumerate() {
+        let Some(sleep_idx) = line.find(&sleep_marker) else {
+            continue;
+        };
+        // Only look for the duration marker AFTER the sleep call itself
+        // starts on this line -- found the hard way (F4 fix round,
+        // self-check while verifying this guard): an earlier, unrelated
+        // `Duration::from_millis(N)` on the SAME line (e.g. a `let`
+        // binding for some other duration, immediately followed on the
+        // same line by a bare-variable sleep call using a DIFFERENT
+        // variable) would otherwise get picked up as if it were the
+        // sleep's own argument, silently treating a genuinely
+        // unparseable call (a bare variable, whose real value this
+        // guard cannot see) as a harmless, already-small duration
+        // instead of failing loudly.
+        let after_sleep = &line[sleep_idx..];
+        let ms: Option<u64> = if let Some(idx) = after_sleep.find(millis_marker) {
+            let rest = &after_sleep[idx + millis_marker.len()..];
+            rest.find(')')
+                .and_then(|end| rest[..end].trim().parse::<u64>().ok())
+        } else if let Some(idx) = after_sleep.find(secs_marker) {
+            let rest = &after_sleep[idx + secs_marker.len()..];
+            rest.find(')')
+                .and_then(|end| rest[..end].trim().parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+        } else {
+            None
+        };
+        match ms {
+            Some(ms) if ms >= 500 => violations.push((lineno + 1, line.to_string())),
+            Some(_) => {}
+            None => unparseable.push((lineno + 1, line.to_string())),
+        }
+    }
+
+    assert!(
+        unparseable.is_empty(),
+        "guard could not determine the duration of a thread-sleep call, \
+         so it cannot be sure it's under 500ms -- inspect and fix by hand: {:?}",
+        unparseable
+    );
+    assert!(
+        violations.is_empty(),
+        "found thread-sleep call(s) with an argument >= 500ms, which this \
+         milestone (M135) exists to remove -- replace with a bounded poll \
+         (pump_until / drain_frames_until / lsp-events-delivered) instead: {:?}",
+        violations
     );
 }

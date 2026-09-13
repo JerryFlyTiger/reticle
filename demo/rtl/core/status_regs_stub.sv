@@ -26,4 +26,11 @@ module status_regs_stub #(
   assign status_o = {DataWidth{1'b0}};
   // End of automatics
 
+  wire _unused_ok = &{1'b0,
+  /*AUTOUNUSED*/
+  // Beginning of automatic unused inputs
+  clk_i, rst_ni,
+  // End of automatics
+  1'b0};
+
 endmodule

@@ -1049,3 +1049,135 @@ fn lsp_autostart_begin_passes_its_root_argument_through_as_the_servers_cwd() {
          the spawned server's own cwd"
     );
 }
+
+// M135 Part A: tests for `lsp-events-delivered`, the new primitive that
+// lets a caller observe "an event has arrived" without consuming it the
+// way `lsp-poll`/`lsp-wait` do. See `crates/elisp/src/lsp.rs`'s
+// `LspConnection::events_delivered` doc comment for the full rationale.
+
+/// A server that dies the instant it starts, without ever touching
+/// stdin -- unlike `DEAF_SCRIPT` (which stays alive reading stdin to
+/// EOF), this one produces exactly one event (`Died`) and nothing else,
+/// which is what the "Died counts as an event" test needs.
+const DIES_IMMEDIATELY_SCRIPT: &str = "#!/bin/sh
+exit 1
+";
+
+fn write_dies_immediately_script(dir: &std::path::Path) -> String {
+    write_script(dir, "dies_immediately.sh", DIES_IMMEDIATELY_SCRIPT)
+}
+
+/// Polls `(lsp-events-delivered EXPR)` until it's `>= want`, up to
+/// TIMEOUT. Panics (not `return`s -- a `return` here would be
+/// indistinguishable from success under this project's own gate, see
+/// M114) naming EXPR and the count actually observed, if TIMEOUT elapses
+/// first.
+///
+/// M135 fix round: every call site below passes 30s, not 10s. 10s was
+/// measured to be too tight under real load a cold reviewer actually hit
+/// while cold-reading this milestone's diff: `events_delivered_starts_
+/// at_zero_and_increments_when_a_message_arrives` and `events_delivered_
+/// counts_died_as_an_event` BOTH timed out at once with "(lsp-events-
+/// delivered conn) never reached 1 within 10s (last seen: 0)", and `ps
+/// aux`/`uptime` at the time showed three concurrent `cargo test
+/// --workspace` runs and a load average of 4.19-6.65 -- squarely inside
+/// the range this project's own records (`wall-clock-test-budgets-flake-
+/// under-full-gate`) already document as producing false reds. Three
+/// immediate reruns were all green, confirming it was load, not a real
+/// defect. This whole milestone exists to remove exactly this shape of
+/// fixed-budget flakiness, so introducing a new one (even at a smaller
+/// timeout than the `1500ms` sleeps it replaces) would be the same
+/// mistake in a different spot. 30s matches every other poll ceiling in
+/// `lsp_autostart_tests.rs`.
+/// M135 trailing cold review, round 2: the ceiling used to be a
+/// parameter, and all three call sites passed the same
+/// `from_secs(30)` literal. That made the one policy three editable
+/// places, and `dev/mutations/m135.py`'s entry for it reached exactly
+/// one of them -- the same "covered some sites, claimed the effect"
+/// shape the round before had just caught elsewhere in this milestone.
+/// Owning the ceiling here makes the inconsistency unwritable and
+/// gives that entry the whole effect to mutate.
+const EVENTS_DELIVERED_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn wait_for_events_delivered(i: &mut Interp, expr: &str, want: i64) {
+    let timeout = EVENTS_DELIVERED_CEILING;
+    let start = std::time::Instant::now();
+    loop {
+        let n: i64 = run(i, &format!("(lsp-events-delivered {})", expr))
+            .parse()
+            .unwrap_or(-1);
+        if n >= want {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "(lsp-events-delivered {}) never reached {} within {:?} (last seen: {})",
+                expr, want, timeout, n
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn events_delivered_starts_at_zero_and_increments_when_a_message_arrives() {
+    let dir = Scratch::new("lsp_events_delivered_basic");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let script = write_script(&dir, "echo_one.sh", ECHO_ONE_SCRIPT);
+
+    let mut i = setup();
+    let r = run(&mut i, &format!("(setq conn (lsp-start {:?}))", script));
+    assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
+    assert_eq!(
+        run(&mut i, "(lsp-events-delivered conn)"),
+        "0",
+        "no message has been sent yet, so the count must start at 0"
+    );
+    wait_for_events_delivered(&mut i, "conn", 1);
+    run(&mut i, "(lsp-kill conn)");
+}
+
+#[test]
+fn lsp_poll_does_not_consume_the_events_delivered_count() {
+    let dir = Scratch::new("lsp_events_delivered_no_consume");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let script = write_script(&dir, "echo_one.sh", ECHO_ONE_SCRIPT);
+
+    let mut i = setup();
+    let r = run(&mut i, &format!("(setq conn (lsp-start {:?}))", script));
+    assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
+    wait_for_events_delivered(&mut i, "conn", 1);
+    // The message is still sitting in the channel, untouched -- taking
+    // it with `lsp-poll` must not make `lsp-events-delivered` go
+    // backwards (it's a monotonically increasing count of what the
+    // reader thread has delivered, not "how many are still queued").
+    assert_eq!(
+        run(&mut i, "(gethash \"id\" (lsp-poll conn))"),
+        "1",
+        "lsp-poll should still be able to take the message"
+    );
+    assert_eq!(
+        run(&mut i, "(lsp-events-delivered conn)"),
+        "1",
+        "consuming the message via lsp-poll must not decrement the count"
+    );
+    run(&mut i, "(lsp-kill conn)");
+}
+
+#[test]
+fn events_delivered_counts_died_as_an_event() {
+    let dir = Scratch::new("lsp_events_delivered_died");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let script = write_dies_immediately_script(&dir);
+
+    let mut i = setup();
+    let r = run(&mut i, &format!("(setq conn (lsp-start {:?}))", script));
+    assert!(!r.starts_with("ERROR"), "lsp-start failed: {}", r);
+    wait_for_events_delivered(&mut i, "conn", 1);
+    assert_eq!(
+        run(&mut i, "(lsp-poll conn)"),
+        "(error . \"lsp server process died\")",
+        "the one event this dead server can produce is Died"
+    );
+    assert_eq!(run(&mut i, "(lsp-live-p conn)"), "nil");
+}

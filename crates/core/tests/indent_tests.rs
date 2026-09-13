@@ -3944,6 +3944,100 @@ fn verilog_nested_class_header_line_compounds_the_documented_quirk_against_real_
     );
 }
 
+/// M136 fix round: the `_unused_ok' lint idiom's own concatenation --
+/// pinned directly rather than only via the whole-file sweep, so
+/// deleting `indent--verilog-net-decl-concatenation-comment-depth-
+/// adjust' (or its wiring into `indent--verilog-depth-adjust') is
+/// caught by name, not merely by the sweep going red with no pointer to
+/// why. Real material: `demo/rtl/core/status_regs_stub.sv''s own
+/// `wire _unused_ok = &{1'b0,\n  /*AUTOUNUSED*/\n  ...\n  1'b0};' --
+/// every one of its five lines, including the closing `1'b0};' line
+/// (which the ordinary `("}" . "concatenation")' contextual closer
+/// never reaches, see indent.el's own M136 fix-round header comment),
+/// must compute column 2 (the enclosing statement's own column), NOT
+/// column 4 (module_declaration + concatenation, two ordinary
+/// block-depth levels) -- verified against real
+/// `verible-verilog-format --indentation_spaces=2' output on this
+/// exact file (M136 fix round).
+#[test]
+fn verilog_status_regs_stub_sv_autounused_idiom_concatenation_lines_compute_column_2() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../demo/rtl/core/status_regs_stub.sv"
+    );
+    let src = std::fs::read_to_string(path).expect("demo/rtl/core/status_regs_stub.sv must exist");
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(&mut i, &format!("(insert {:?})", src));
+
+    for needle in [
+        "/*AUTOUNUSED*/",
+        "// Beginning of automatic unused inputs",
+        "clk_i, rst_ni,",
+        "// End of automatics",
+        "1'b0};",
+    ] {
+        run(&mut i, "(goto-char (point-min))");
+        run(&mut i, &format!("(search-forward {:?})", needle));
+        run(&mut i, "(beginning-of-line)");
+        assert_eq!(
+            run(&mut i, "(verilog-indent-line)"),
+            "2",
+            "line starting {:?} must compute column 2 (the enclosing `wire _unused_ok = \
+             &{{...}};' statement's own column) -- deleting indent--verilog-net-decl-\
+             concatenation-comment-depth-adjust's -1 correction (or its wiring into \
+             indent--verilog-depth-adjust) makes this go red (computes 4, one ordinary \
+             concatenation block-depth level too deep)",
+            needle
+        );
+    }
+}
+
+/// M136 fix round R4: the `logic' host (`variable_decl_assignment')
+/// gets the identical column-2 treatment from real verible that the
+/// `wire' host (`net_decl_assignment', pinned above) does --
+/// `verilog-auto--autounused-self-range' [since removed, see verilog-
+/// auto.el's own M136 header] originally listed BOTH as legal hosts,
+/// but `indent--verilog-net-decl-comment-concatenation-p' only ever
+/// recognized the `wire' one, a real gap this test pins by name.
+/// Measured directly (M136 fix round; corrected again in a later fix
+/// round after a cold read caught the first correction still
+/// overclaiming): real `verible-verilog-format --indentation_spaces=2'
+/// on `module top;\n  logic _unused_ok = &{1\'b0,\n
+/// /*AUTOUNUSED*/\n  clk_i,\n  1\'b0};\nendmodule\n' actually collapses
+/// `clk_i,' and `1\'b0};' onto ONE line (`clk_i, 1\'b0};'), producing
+/// THREE continuation lines, not four -- `/*AUTOUNUSED*/' and that
+/// merged line both sit at column 2. This test does not depend on
+/// verible's own line-merging at all: it builds its own four-line
+/// buffer by hand and checks each of those four lines computes column
+/// 2, which is a different (and still correct) claim than "verible
+/// keeps four lines."
+#[test]
+fn verilog_logic_host_autounused_idiom_concatenation_lines_compute_column_2() {
+    let (mut i, _ed) = setup();
+    run(&mut i, "(verilog-mode)");
+    run(&mut i, "(set-indent-width 2)");
+    run(
+        &mut i,
+        "(insert \"module top;\\n  logic _unused_ok = &{1'b0,\\n  /*AUTOUNUSED*/\\n  clk_i,\\n  1'b0};\\nendmodule\\n\")",
+    );
+
+    for needle in ["/*AUTOUNUSED*/", "clk_i,", "1'b0};"] {
+        run(&mut i, "(goto-char (point-min))");
+        run(&mut i, &format!("(search-forward {:?})", needle));
+        run(&mut i, "(beginning-of-line)");
+        assert_eq!(
+            run(&mut i, "(verilog-indent-line)"),
+            "2",
+            "line starting {:?} (inside a `logic _unused_ok = &{{...}};' host) must compute \
+             column 2 -- deleting the `variable_decl_assignment' branch from \
+             indent--verilog-net-decl-comment-concatenation-p makes this go red (computes 4)",
+            needle
+        );
+    }
+}
+
 /// M122 review fix: `conditional_compilation_directive' always computes
 /// column 0, however deeply nested -- deleting the special case in
 /// `indent--query-pos-and-depth' makes this go red (both assertions:

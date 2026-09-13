@@ -1705,6 +1705,180 @@ the closing `);' back at column 10."
       (unless stop (setq n (treesit-node-parent n))))
     (if bare 1 0)))
 
+;; --- M136 fix round: the `_unused_ok' lint idiom's own concatenation ------
+;;
+;; `indent--block-node-types' (M122) gives EVERY `concatenation' node one
+;; ordinary block-depth level when verible wraps it onto multiple lines --
+;; measured, at the time, against a `case' selector and a `coverpoint'
+;; member list, both wrapped because of MEMBER COUNT/verible's own style
+;; choice, never because of an embedded comment. M136 added
+;; `/*AUTOUNUSED*/' support, whose own real-world host is a DIFFERENT
+;; shape: `wire _unused_ok = &{1'b0,\n  /*AUTOUNUSED*/\n  ...\n  1'b0};',
+;; a module-level `net_decl_assignment' whose initializer wraps because an
+;; independent block comment sits inside the concatenation, not because of
+;; member count. `crates/core/tests/indent_tests.rs''s own full-file
+;; sweep against `demo/rtl/core/status_regs_stub.sv' (M136 fix round)
+;; caught the mismatch: this engine computed column 4 for all five lines
+;; inside that idiom (module_declaration + concatenation, two ordinary
+;; block-depth levels), but real `verible-verilog-format
+;; --indentation_spaces=2' puts every one of those five lines -- including
+;; the closing `1'b0};' line -- at column 2, the ENCLOSING STATEMENT's own
+;; column, one level less.
+;;
+;; The closing `1'b0};' line needs its OWN correction here too, not just
+;; the ordinary `(\"}\" . \"concatenation\")' contextual closer already in
+;; `indent--verilog-closers' (added for the case/coverpoint shape, where
+;; the closing brace sits ALONE at the start of its own line, `})' or `}
+;; {'): `indent--closer-token-at-p' only fires when the current line's
+;; OWN first non-blank character resolves to the closer token itself, and
+;; this idiom's closing line is `1'b0};' -- `1'b0' is first, `}' is not
+;; the query position's own node -- so that pre-existing dedent never
+;; triggers for it at all. A DEPTH-ADJUST-FN correction (below), which
+;; applies uniformly to every line whose query node sits inside the
+;; matching concatenation (comment lines, name lines, AND the closing
+;; line alike, since all four are descendants of the same node), is what
+;; reaches all five lines with one rule instead of two.
+;;
+;; Measured matrix of SIBLING hosts this fix round does NOT cover (M134's
+;; own lesson applies here: a rule that gives the same answer as a
+;; simpler, wrong rule on every fixture at hand has only measured their
+;; intersection -- so the boundary below is written down, not left to be
+;; over-generalized by the next reader). `verible-verilog-format
+;; --indentation_spaces=2':
+;;
+;;   HOST                                                | continuation column
+;;   module-level net_decl_assignment, `/* */' first     | 2 (statement's own --
+;;     (the `_unused_ok' shape, THIS fix)                |   what this section fixes)
+;;   module-level net_decl_assignment, `//' first         | verible MOVES the
+;;                                                        |   comment to become
+;;                                                        |   TRAILING instead,
+;;                                                        |   then gives 1
+;;   module-level continuous_assign (`assign w2 = &{...}')| NOT a single fixed
+;;                                                        |   number -- see below,
+;;                                                        |   this row is an
+;;                                                        |   HONEST correction of
+;;                                                        |   an earlier version
+;;                                                        |   of this comment
+;;   procedural blocking assignment inside always_comb    | 4 (statement's own
+;;   (statement itself at column 4)                       |   column, already
+;;                                                        |   correct before
+;;                                                        |   this fix round --
+;;                                                        |   no adjustment
+;;                                                        |   needed or made)
+;;   a concatenation wrapped only because of width, no    | +2 (one ordinary
+;;   comment inside it at all                             |   block-depth
+;;                                                        |   level, UNCHANGED,
+;;                                                        |   the M122 case/
+;;                                                        |   coverpoint shape)
+;;
+;; M136 fix round R6 correction: an earlier version of this table claimed
+;; the `continuous_assign' row was "6 (statement (2) + the fixed wrap
+;; step, 4)", labeled "raw measured output, not an inference" -- that
+;; label was not earned. A cold review re-measured with a fixture wide
+;; enough to force a comment-interrupted concatenation across THREE
+;; continuation lines, not two, and got an INCONSISTENT answer, not a
+;; single number:
+;;
+;;   assign w2 = &{a_very_long_signal_name_number_one_extra_padding_to_force_wrap,
+;;                 /*MARKER*/
+;;                 a_very_long_signal_name_number_two_extra_padding_to_force_wrap,
+;;                 a_very_long_signal_name_number_three_extra_padding_to_force_wrap};
+;;
+;; real `verible-verilog-format --indentation_spaces=2' on this puts the
+;; `/*MARKER*/' line and the NEXT identifier line at column 6 (matching
+;; the "2 + wrap step 4" theory), but leaves the THIRD line -- the last
+;; one, immediately before `};' -- at column 16, exactly where the
+;; SOURCE happened to have typed it (the opening `&{' column), untouched.
+;; So this specific verible version does not apply one uniform rule to
+;; every continuation line of a wrapped `continuous_assign' concatenation
+;; at all: the first wrap point gets a computed column, and at least one
+;; later line is left at whatever column the INPUT already had -- a
+;; passthrough, not a fixed-width answer this engine could reproduce
+;; without literally copying verible's own line-fitting algorithm. No
+;; real material in this tree exercises this shape, so this row has no
+;; implementation and no pinning test; the honest state of knowledge is
+;; "the first continuation line computes 6, later lines are unpredictable
+;; without also modeling verible's own text-width fitting", not a single
+;; clean number, and the corrected label above is deliberately hedged
+;; rather than repeating the earlier overclaim.
+;;
+;; Only the first row is implemented below. The second row's "verible
+;; moves the comment" behaviour is a different SOURCE SHAPE entirely (this
+;; engine never rewrites a `//' comment into a trailing position, and
+;; nothing in this codebase generates that shape), the third and fourth
+;; rows are different HOST node types (`continuous_assign' is not
+;; `net_decl_assignment', and the fix below is gated on that specific type
+;; check), and the fifth row is the ORIGINAL M122 shape this fix round
+;; must not disturb (gated on requiring a `block_comment' CHILD, which an
+;; uncommented wrap never has). No real material in this tree exercises
+;; rows two, three, four, or five with a wrapped concatenation, so none of
+;; them has a pinning test; this comment exists so the boundary is written
+;; down rather than left to whoever reads this code next to guess at.
+
+(defun indent--verilog-net-decl-comment-concatenation-p (node)
+  "Non-nil if NODE's nearest `concatenation' ancestor (inclusive of NODE
+itself, `indent--nearest-ancestor-of-types') is (a) the initializer of a
+module-level `net_decl_assignment' (`wire _unused_ok = &{...};') OR
+`variable_decl_assignment' (`logic _unused_ok = &{...};' -- M136 fix
+round R4: `verilog-auto--autounused-self-range' [now removed, see this
+file's own M136 header] originally listed BOTH shapes as legal hosts,
+but this predicate only ever recognized the `wire' one; measured
+directly, real `verible-verilog-format --indentation_spaces=2' gives
+the `logic' shape the identical column-2 treatment, so the omission was
+a real gap, not a deliberate narrowing) -- walking up from the
+concatenation, skipping only the transparent `primary'/`expression'
+operand-wrapper node types every operand sits inside, the next real
+ancestor must be one of those two with nothing else in between (dump-
+verified, M136 fix round: `wire _unused_ok = &{1'b0, ...};' parses as
+`net_decl_assignment (simple_identifier) (expression operator:
+(unary_operator) argument: (primary (concatenation ...))))' -- no
+`seq_block'/`case_item'/`covergroup_declaration'/`continuous_assign' in
+that particular chain), and (b) has a `block_comment' among its own
+DIRECT children (dump-verified: the `_unused_ok' idiom's
+`/*AUTOUNUSED*/' parses as a direct child of `concatenation' itself, a
+SIBLING of the surrounding `expression' elements, not nested inside
+one) -- distinguishing a COMMENTED wrap from an ordinary member-count-
+wrapped concatenation (M122's case/coverpoint shape), which never has a
+comment child at all. This does NOT check the comment's own TEXT (M136
+fix round R5, a docstring correction: an earlier version of this
+comment overclaimed \"exactly, and only, the `_unused_ok' idiom's own
+shape\" -- any `block_comment' at all, hand-written or otherwise,
+triggers this the same way, and that is not a bug: real `verible-
+verilog-format' gives an UNRELATED hand-written block comment inside a
+module-level concatenation initializer the identical column-2
+treatment, verified directly) -- see this section's own header comment
+for the measured matrix of sibling HOST-STRUCTURE shapes (different
+enclosing statement types, not different comment text) this
+deliberately does NOT match."
+  (let ((concat (indent--nearest-ancestor-of-types node '("concatenation"))))
+    (and concat
+         (let ((n (treesit-node-parent concat)))
+           (while (and n (member (treesit-node-type n) '("primary" "expression")))
+             (setq n (treesit-node-parent n)))
+           (and n (member (treesit-node-type n)
+                          '("net_decl_assignment" "variable_decl_assignment"))))
+         (let ((i 0) (count (treesit-node-child-count concat)) (found nil))
+           (while (< i count)
+             (when (equal (treesit-node-type (treesit-node-child concat i)) "block_comment")
+               (setq found t))
+             (setq i (1+ i)))
+           found))))
+
+(defun indent--verilog-net-decl-concatenation-comment-depth-adjust (node)
+  "M136 fix round: -1 for any line whose query NODE matches
+`indent--verilog-net-decl-comment-concatenation-p' -- cancelling the
+ordinary +1 `concatenation' contributes via `indent--block-node-types'
+(M122, for an UNCOMMENTED coverpoint/case-selector wrap) for exactly
+this one shape. Applies uniformly to every descendant of the matching
+concatenation, including the closing `1'b0};' line -- which the
+ordinary `(\"}\" . \"concatenation\")' contextual closer in
+`indent--verilog-closers' never reaches for this idiom, since that
+line's own first non-blank character is `1', not `}' (see this
+section's own header comment for why). See that same header comment
+for the measured matrix of sibling hosts NOT covered by this
+adjustment."
+  (if (indent--verilog-net-decl-comment-concatenation-p node) -1 0))
+
 (defvar indent--verilog-comment-wrap-sibling-types
   '("list_of_port_connections" "list_of_parameter_value_assignments"
     "list_of_arguments")
@@ -1845,11 +2019,12 @@ milestone was not built for can accidentally satisfy it."
     0))
 
 (defun indent--verilog-depth-adjust (node)
-  "M119/M122: sum of `indent--verilog-generate-depth-adjust' (D2),
+  "M119/M122/M136: sum of `indent--verilog-generate-depth-adjust' (D2),
 `indent--verilog-header-wrap-depth-adjust' (D1),
-`indent--verilog-modport-item-closer-adjust' (M122), and
-`indent--verilog-bare-action-block-adjust' (M122 review fix) -- the
-single DEPTH-ADJUST-FN `verilog-indent-line' passes to
+`indent--verilog-modport-item-closer-adjust' (M122),
+`indent--verilog-bare-action-block-adjust' (M122 review fix), and
+`indent--verilog-net-decl-concatenation-comment-depth-adjust' (M136 fix
+round) -- the single DEPTH-ADJUST-FN `verilog-indent-line' passes to
 `indent--treesit-depth-column'/`indent--query-pos-and-depth', which
 only accept one.
 
@@ -1879,7 +2054,8 @@ THEN applies the closer's -1 on top) rather than competing for one slot."
   (+ (indent--verilog-generate-depth-adjust node)
      (indent--verilog-header-wrap-depth-adjust node)
      (indent--verilog-modport-item-closer-adjust node)
-     (indent--verilog-bare-action-block-adjust node)))
+     (indent--verilog-bare-action-block-adjust node)
+     (indent--verilog-net-decl-concatenation-comment-depth-adjust node)))
 
 (defun indent--query-pos-and-depth (lang-sym block-types closers &optional wrap-types depth-adjust-fn wrap-depth-adjust-fn)
   "(QUERY-POS DEPTH WRAP-DEPTH) for the current line under LANG-SYM, or

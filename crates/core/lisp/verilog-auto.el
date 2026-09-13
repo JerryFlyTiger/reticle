@@ -10,12 +10,15 @@
 ;; v1 scope is deliberately narrow. EXCLUDED, matching this repo's own
 ;; disclosure convention (see e.g. treesit.rs's module doc): AUTOSENSE
 ;; (`always @*' sensitivity lists -- SystemVerilog's `always_ff'/
-;; `always_comb'/`@*' mostly obsolete it anyway), AUTORESET/AUTOUNUSED
-;; (the rest of the register/tie-off inference bracket -- M125 shipped
-;; AUTOINPUT/AUTOOUTPUT/AUTOINOUT, M126 shipped AUTOREG/AUTOTIEOFF; this
-;; list is STALE the moment it names something already shipped, so it
-;; is corrected here rather than left to imply the whole bracket is
-;; still open). Instance arrays (`u1[3:0] (...)' multi-instance syntax)
+;; `always_comb'/`@*' mostly obsolete it anyway). The rest of the
+;; register/tie-off/unused-input inference bracket is NOT excluded any
+;; more -- M125 shipped AUTOINPUT/AUTOOUTPUT/AUTOINOUT, M126 shipped
+;; AUTOREG/AUTOTIEOFF, M134 shipped AUTORESET, M136 shipped AUTOUNUSED
+;; (with a criterion that deliberately diverges from GNU's own -- see
+;; that section's own header below for why); this list is STALE the
+;; moment it names something already shipped, so it is corrected here
+;; rather than left to imply the whole bracket is still open. Instance
+;; arrays (`u1[3:0] (...)' multi-instance syntax)
 ;; used to be listed here too -- M127 reconnaissance MEASURED this
 ;; against real GNU Emacs 30.2 and found it needs NO handling anywhere
 ;; in this file: GNU treats an array instance structurally like a
@@ -391,7 +394,10 @@
 ;; `/*AUTOREG*/' declares a module-level `reg' for every undeclared
 ;; `output' the enclosing module doesn't already drive some other way;
 ;; `/*AUTOTIEOFF*/' ties an unconnected `output' to a constant zero.
-;; AUTOSENSE/AUTORESET/AUTOUNUSED remain out of scope. Ground truth
+;; AUTOSENSE remains out of scope; AUTORESET (M134) and AUTOUNUSED (M136,
+;; with a deliberately divergent criterion) shipped later, see their own
+;; sections below -- this stale sentence is corrected here rather than
+;; left to imply the whole bracket is still open. Ground truth
 ;; measured against real GNU Emacs 30.2 -- see the M126 spec's own
 ;; section 1 for the exact commands run and their exact output; every
 ;; divergence below is deliberate, not an oversight, cross-referenced to
@@ -536,6 +542,14 @@ effect at the same site.")
 (defvar verilog-auto--predeclared-port-names nil)
 (defvar verilog-auto--port-range-conflicts nil)
 (defvar verilog-auto--port-marker-arg-warnings nil)
+(defvar verilog-auto--autounused-bad-host-notices nil
+  "M136 fix round R2: position-ordered notice list (same (POSITION .
+TEXT) convention as `verilog-auto--port-marker-arg-warnings' and its
+neighbors, see the \"Position-ordered notice lists\" section) of every
+`/*AUTOUNUSED*/' marker found with no legal host
+(`verilog-auto--autounused-legal-host-p') -- expansion is refused
+rather than guessed at, and this is the record folded into
+`verilog-auto''s own final message.")
 (defvar verilog-auto--ansi-autoreg-modules nil
   "M126: module names where `/*AUTOREG*/' sat in an ANSI header and
 expanded to nothing (same shape as `verilog-auto--ansi-autoarg-modules'
@@ -3410,20 +3424,23 @@ or without a regexp argument (spec section 2.10)."
                        (string-match-p pat (treesit-node-text n)))))))
 
 (defun verilog-auto--any-auto-port-block-marker-p (node)
-  "Non-nil if NODE is any of the SEVEN block-style AUTO markers this
+  "Non-nil if NODE is any of the EIGHT block-style AUTO markers this
 file recognizes -- `/*AUTOWIRE*/', an AUTOOUTPUT/AUTOINPUT/AUTOINOUT
-marker, an AUTOREG/AUTOTIEOFF marker, or an AUTORESET marker (M126:
-widened from four to six; M134: widened from six to seven; with or
-without its own regexp argument -- AUTOREG/AUTOTIEOFF/AUTORESET never
+marker, an AUTOREG/AUTOTIEOFF marker, an AUTORESET marker, or an
+AUTOUNUSED marker (M126: widened from four to six; M134: widened from
+six to seven; M136: widened from seven to eight; with or without its
+own regexp argument -- AUTOREG/AUTOTIEOFF/AUTORESET/AUTOUNUSED never
 actually accept one, but the marker-recognition SHAPE is identical, and
 a malformed-argument marker still needs to be recognized here). Used by
 `verilog-auto--autowire-stale-end' (M125: generalized) to recognize
-ANY of the seven as proof that ITS OWN \"// End of automatics\" is
+ANY of the eight as proof that ITS OWN \"// End of automatics\" is
 missing, not just another `/*AUTOWIRE*/' -- see this file's M125 header
 for why that generalization matters now that several DIFFERENT marker
 kinds sitting immediately adjacent (AUTOTIEOFF directly followed by
 AUTOREG, per the M126 execution order) is the NORMAL shape, not a
-corrupted one."
+corrupted one. M136: omitting AUTOUNUSED here would reproduce the M39
+over-deletion defect for a module with an AUTOUNUSED marker adjacent to
+another block marker -- see the M136 header's own item 1."
   (and (string= (treesit-node-type node) "block_comment")
        (let ((text (treesit-node-text node)))
          (or (string= text "/*AUTOWIRE*/")
@@ -3432,7 +3449,8 @@ corrupted one."
              (string-match-p "\\`/\\*AUTOINOUT\\(?:\\*/\\|(\\)" text)
              (string-match-p "\\`/\\*AUTOREG\\(?:\\*/\\|(\\)" text)
              (string-match-p "\\`/\\*AUTOTIEOFF\\(?:\\*/\\|(\\)" text)
-             (string-match-p "\\`/\\*AUTORESET\\(?:\\*/\\|(\\)" text)))))
+             (string-match-p "\\`/\\*AUTORESET\\(?:\\*/\\|(\\)" text)
+             (string-match-p "\\`/\\*AUTOUNUSED\\(?:\\*/\\|(\\)" text)))))
 
 (defun verilog-auto--port-marker-arg (comment keyword)
   "COMMENT's own optional regexp argument (spec section 2.10), as a
@@ -4604,6 +4622,609 @@ site."
       (dolist (c sorted total)
         (setq total (+ total (verilog-auto--expand-autoreset-site c)))))))
 
+;; --- M136: AUTOUNUSED (deliberate divergence from GNU) -------------------
+;;
+;; GNU verilog-mode's `/*AUTOUNUSED*/' lists every input this module never
+;; connects through an AUTOINST-expanded instantiation -- MEASURED against
+;; real GNU Emacs 30.2 (`dev/gnu-auto/run.sh
+;; fixtures/autounused-leaf-module-inputs-used-in-assign.v`):
+;;
+;;   module u5 (input clk, input [7:0] a_i, input [3:0] spare_i, output [7:0] z_o);
+;;      assign z_o = a_i + {4'b0, spare_i};
+;;      wire _unused_ok = &{1'b0,
+;;                          /*AUTOUNUSED*/
+;;                          // Beginning of automatic unused inputs
+;;                          a_i,
+;;                          clk,
+;;                          spare_i,
+;;                          // End of automatics
+;;                          1'b0};
+;;   endmodule
+;;
+;; `a_i' and `spare_i' are read on the very next line, inside the
+;; `assign', and `clk' would be read by anything sensitive to it -- GNU's
+;; criterion is "connected via AUTOINST", full stop, and this repo's own
+;; `demo/rtl/' is ten leaf modules out of eleven (M134 record), so copying
+;; that criterion verbatim would write "I know these are unused" onto
+;; signals this project's own code actually uses on nine tenths of its own
+;; showcase. So the text SHAPE is copied from GNU (the Begin/End comment
+;; wording and layout above), but the criterion is NOT: this file lists a
+;; port only if the port's value is never read ANYWHERE in the module
+;; body -- not "never AUTOINST-connected".
+;;
+;; That divergent criterion has a runnable oracle: `slang-server''s own
+;; `unused-port'/`unused-but-set-port' diagnostics (M136 recon, three
+;; probe files, `python3 dev/lsp-probe.py --server slang-server --file
+;; <F> --diagnostics --wait 4`). Measured, and every row below is a
+;; deliberate divergence FROM GNU, matched TO slang:
+;;
+;; - Read only via a HAND-WRITTEN instance connection (`.a_i(sig)') --
+;;   slang does not flag it; GNU WOULD list it (GNU only credits its own
+;;   AUTOINST expansion). Not listed here either: the read-occurrence scan
+;;   below is a plain identifier walk over the whole module body, and a
+;;   hand-written connection's actual-name expression is exactly such an
+;;   occurrence, with nothing about AUTOINST anywhere in the check.
+;; - Read only via an AUTOINST-EXPANDED connection -- not listed, same
+;;   reasoning; this also means AUTOUNUSED must run AFTER
+;;   `--expand-all-autoinst' (M136 item 3 below), or those connections
+;;   would not exist yet for this scan to see.
+;; - Read only inside a generate branch whose own guard condition is never
+;;   taken (`ENABLE=0'/an explicit `generate'/`endgenerate' wrapper, M136
+;;   recon probes 4/5, both re-confirming the original probe 2 finding) --
+;;   not listed either way: this grammar keeps BOTH generate branches in
+;;   the parse tree regardless of the guard's value (elaboration-time
+;;   evaluation is out of scope, same as everywhere else in this file),
+;;   so a plain identifier walk sees the occurrence and treats it as read,
+;;   matching slang's own measured behaviour on both the untaken AND the
+;;   explicitly-wrapped shape -- this is a syntactic "appears in a read
+;;   position" test, not a reachability analysis, by construction, not by
+;;   oversight.
+;; - Read only as a bit index (`mem[sig]'), only in a `$display' argument,
+;;   only in an `assert property', only in a width/localparam expression --
+;;   none of these are special-cased; the identifier walk below covers the
+;;   WHOLE module body subtree (every node type), not a fixed list of
+;;   statement kinds, precisely so all four of these keep counting as
+;;   reads with no extra code.
+;; - An `inout' that is driven but never read (`unused-but-set-port') is
+;;   listed; one that is read but never driven (`undriven-port', NOT part
+;;   of the unused family) is not -- the criterion here is purely about
+;;   reads, never about drivenness, so an `inout' read anywhere is never
+;;   listed regardless of whether it is also driven.
+;;
+;; The one place this criterion LOOKS genuinely self-referential, but
+;; ISN'T: the `_unused_ok' idiom's own `&{1'b0, ..., 1'b0}' expression
+;; READS every name it lists (slang-confirmed, M136 recon probe 2's
+;; `only_in_unused_idiom_i' case), so the first version of this file
+;; excluded the marker's own enclosing statement from the read-occurrence
+;; scan, reasoning that otherwise a run's own just-inserted names would
+;; read as "read" on the very next run and get deleted, breaking
+;; `verilog-auto''s own byte-for-byte-idempotent guarantee (see its own
+;; docstring). M136 fix round R1 found that reasoning WRONG, by actually
+;; checking rather than assuming it: `verilog-auto' always runs
+;; `verilog-delete-auto' FIRST, on every invocation (its own docstring:
+;; "always starts by deleting every existing machine-generated region ...
+;; and re-expanding from scratch") -- so by the time `--expand-all-
+;; autounused''s own read-scan ever runs, ANY previously-inserted Begin/
+;; End block, on THIS run or the run before it, has ALREADY been deleted
+;; and no longer exists in the buffer to be misread as a "read" in the
+;; first place. Verified directly: deleting the exclusion entirely still
+;; leaves `autounused_is_idempotent_with_a_non_empty_list' green.
+;;
+;; The exclusion was not just unnecessary -- it was actively WRONG, and
+;; in exactly the way this whole milestone exists to prevent: it excluded
+;; the marker's ENTIRE OWNING STATEMENT, not just the auto-generated
+;; Begin/End span, so a hand-written expression sharing that statement
+;; (`wire _unused_ok = a_i & &{1'b0, /*AUTOUNUSED*/ 1'b0};', `a_i' read
+;; on the left of `&') had its OWN genuine read silently swallowed by the
+;; same exclusion, and `a_i' was listed as unused even though it demonstrably
+;; is not -- the false-positive-into-the-user's-RTL failure mode section 0
+;; quotes GNU for, reproduced by this file's own first version instead of
+;; GNU's. There is accordingly no self-range exclusion in this file at
+;; all any more; do not reintroduce one without re-verifying the delete-
+;; first ordering above still holds (a change to `verilog-auto''s own
+;; delete-then-expand pipeline would be the one thing that could revive
+;; the need for it).
+;;
+;; This idiom does NOT make every unused-input diagnostic disappear -- it
+;; TRADES N `unused-port'/`unused-but-set-port' warnings for exactly ONE
+;; different warning, `unused-net', on the `_unused_ok' sink signal
+;; itself (its own reduced value is never consumed by anything, which is
+;; the whole point of it -- the sink exists to be read, not to be USED).
+;; Measured (M136 fix round) with `python3 dev/lsp-probe.py --server
+;; slang-server --file demo/rtl/core/status_regs_stub.sv --diagnostics
+;; --wait 4' on this file's own `demo/rtl/core/status_regs_stub.sv',
+;; before and after adding the idiom:
+;;   BEFORE: 2 diagnostics -- `unused-port: unused port signal
+;;     "clk_i"'', `unused-port: unused port signal "rst_ni"''.
+;;   AFTER:  1 diagnostic  -- `unused-net: unused net "_unused_ok"''
+;;     (`clk_i'/`rst_ni' no longer appear at all).
+;; Two `unused-port' warnings became one `unused-net' warning, not zero
+;; warnings -- do not describe this idiom as making diagnostics vanish.
+
+(defcustom verilog-auto-unused-ignore-regexp nil
+  "A regexp (or nil, the default) `/*AUTOUNUSED*/' tests each candidate
+signal NAME against (`string-match-p') before listing it -- a match
+means the signal is suppressed from the list even though it is
+genuinely never read. nil (the default) applies no filter at all: every
+never-read `input'/`inout' is listed. Named after GNU's own convention
+of a per-command ignore knob; GNU's own AUTOUNUSED has no such option,
+this file adds one because a real design commonly has a handful of
+port names (a JTAG bus, a scan-chain signal) that are ALWAYS
+legitimately unread on ordinary builds and would otherwise clutter the
+list on every module that declares them."
+  :type '(choice (const :tag "No filter" nil) regexp)
+  :group 'verilog-auto)
+
+(defun verilog-auto--net-lvalue-driven-nodes (lvalue)
+  "Node-returning mirror of `verilog-auto--net-lvalue-driven-names':
+same recursion over a `net_lvalue''s own nested elements, but returns
+the driven `simple_identifier' NODE itself rather than its text. M136
+needs the exact occurrence NODE, not just the name, so it can exclude
+that one occurrence from its own read-occurrence scan without
+suppressing some OTHER occurrence of the same name elsewhere in the
+module (the `unused-but-set-port' row above: a signal driven here and
+read somewhere else entirely must still count as read)."
+  (let ((nested (verilog-auto--find-all-of-type lvalue "net_lvalue")))
+    (if nested
+        (apply #'append (mapcar #'verilog-auto--net-lvalue-driven-nodes nested))
+      (let ((id (verilog-auto--find-first-of-type lvalue "simple_identifier")))
+        (and id (list id))))))
+
+(defun verilog-auto--variable-lvalue-driven-nodes (lvalue)
+  "Node-returning mirror of `verilog-auto--variable-lvalue-driven-names',
+same reasoning as `verilog-auto--net-lvalue-driven-nodes' above. Unlike
+that function's mirror, the dotted-hierarchical-path and escaped-
+identifier shapes return nil here rather than a stand-in node: an
+AUTOUNUSED candidate is always a bare port name, which can only ever
+show up as a plain `simple_identifier' occurrence, never as one
+component of a dotted path or as an escaped identifier -- those two
+shapes could never MATCH a candidate occurrence in the first place, so
+returning nil for them costs nothing (there is no occurrence of that
+shape for a plain port name to collide with)."
+  (let ((nested (verilog-auto--find-all-of-type lvalue "variable_lvalue")))
+    (if nested
+        (apply #'append (mapcar #'verilog-auto--variable-lvalue-driven-nodes nested))
+      (let ((hier (verilog-auto--find-first-of-type lvalue "hierarchical_identifier")))
+        (if hier
+            (let ((ids (verilog-auto--find-all-of-type hier "simple_identifier")))
+              (and (= (length ids) 1) (list (car ids))))
+          (let ((id (verilog-auto--find-first-of-type lvalue "simple_identifier")))
+            (and id (list id))))))))
+
+(defun verilog-auto--all-lvalue-driven-id-nodes (module-decl)
+  "Every `simple_identifier' node anywhere in MODULE-DECL that is
+itself the base identifier of some lvalue -- a `continuous_assign''s
+own `net_lvalue', or a procedural blocking/nonblocking assignment's own
+`variable_lvalue'. `verilog-auto--identifier-read-p' excludes exactly
+these positions from counting as a read (an `inout' driven here and
+never read anywhere else must still be listed, spec section 1's
+`unused-but-set-port' row)."
+  (let (acc)
+    (dolist (ca (verilog-auto--find-all-of-type module-decl "continuous_assign"))
+      (dolist (na (verilog-auto--find-all-of-type ca "net_assignment"))
+        (dolist (id (verilog-auto--net-lvalue-driven-nodes (treesit-node-child na 0)))
+          (push id acc))))
+    (dolist (n (verilog-auto--find-all-of-types module-decl '("nonblocking_assignment" "blocking_assignment")))
+      (let ((lvalue (verilog-auto--find-first-of-type n "variable_lvalue")))
+        (when lvalue
+          (dolist (id (verilog-auto--variable-lvalue-driven-nodes lvalue))
+            (push id acc)))))
+    acc))
+
+(defun verilog-auto--unused-port-candidates (module-decl header)
+  "Every (NAME DIRECTION EXCLUDE-RANGES) for MODULE-DECL's own `input'/
+`inout' ports, ANSI or non-ANSI -- the other two directions
+(`verilog-auto--output-port-candidate-decls', M126) narrowed to these,
+and returning EXCLUDE-RANGES (a list of (START . END) conses covering
+the port's own declaration-site name occurrence(s)) instead of a DECL
+node, since AUTOUNUSED prints no declaration text of its own, only a
+name; what it needs from the declaration is where NOT to look when
+scanning for a read (a declaration is not a use). An ANSI port
+contributes exactly one range (its own `port_name' field); a non-ANSI
+port contributes TWO -- the bare name in the header's own port list AND
+the separate body `input_declaration'/`inout_declaration' identifier
+that actually carries the direction -- both are declaration sites, not
+reads, spec section 7 test 11."
+  (if (verilog-auto--ansi-header-with-ports-p header)
+      (let (acc)
+        (dolist (decl (verilog-auto--find-all-of-type header "ansi_port_declaration"))
+          (let ((dir (verilog-auto--port-direction-of decl)))
+            (when (memq dir '(input inout))
+              (let ((namenode (treesit-node-child-by-field-name decl "port_name")))
+                (push (list (treesit-node-text namenode) dir
+                            (list (cons (treesit-node-start namenode) (treesit-node-end namenode))))
+                      acc)))))
+        (nreverse acc))
+    (let (header-ranges)
+      (dolist (pn (verilog-auto--find-all-of-type header "port"))
+        (push (cons (treesit-node-text pn)
+                     (cons (treesit-node-start pn) (treesit-node-end pn)))
+              header-ranges))
+      (let (acc)
+        (dolist (kind '(("input_declaration" . input) ("inout_declaration" . inout)))
+          (dolist (decl (verilog-auto--find-all-of-type module-decl (car kind)))
+            (let ((idlist (or (verilog-auto--find-first-of-type decl "list_of_port_identifiers")
+                               (verilog-auto--find-first-of-type decl "list_of_variable_port_identifiers"))))
+              (dolist (id (and idlist (verilog-auto--find-all-of-type idlist "simple_identifier")))
+                (let* ((nm (treesit-node-text id))
+                       (hr (cdr (assoc nm header-ranges)))
+                       (ranges (append (list (cons (treesit-node-start id) (treesit-node-end id)))
+                                        (and hr (list hr)))))
+                  (push (list nm (cdr kind) ranges) acc))))))
+        (nreverse acc)))))
+
+(defconst verilog-auto--autounused-reduction-operators
+  '("&" "|" "^" "~&" "~|" "~^" "^~")
+  "Unary REDUCTION operators `verilog-auto--autounused-legal-host-p'
+accepts as the `_unused_ok' idiom's own sink -- GNU's own convention is
+`&' alone (`&{1'b0, ...}'), but every operator here reduces a
+concatenation to a single bit the exact same way `&' does: none of them
+can be optimized away, none of them changes what the packed bits are
+FOR (they're a THROWAWAY value in every case, read once and discarded),
+and folding any one of them still genuinely READS every operand --
+exactly the property this whole idiom depends on. Deliberately wider
+than GNU's own single-operator convention, on purpose, and still safe
+for the same reason GNU's own choice is safe. `^~' is included
+alongside `~^' because SystemVerilog defines them as the same XNOR
+reduction operator with two spellings -- dump-verified (M136 fix round
+R7 recon) that this grammar's own `unary_operator' node accepts and
+spells both back out unchanged, not assumed.")
+
+(defun verilog-auto--autounused-legal-host-p (comment)
+  "Non-nil if COMMENT (the `/*AUTOUNUSED*/' marker) sits inside a
+`concatenation' node that is ITSELF the sole ARGUMENT of a unary
+REDUCTION operator (`verilog-auto--autounused-reduction-operators') --
+`&{...}'/`|{...}'/etc -- whose own enclosing `expression' is somewhere
+inside a `continuous_assign'/`net_decl_assignment'/`variable_decl_
+assignment'. That is: inside a `&{1'b0, ...}'-shaped REDUCED
+initializer expression, the ONLY legal host this idiom has (`assign
+_unused_ok = &{1'b0, ...};'/`wire _unused_ok = &{1'b0, ...};'/`logic
+_unused_ok = &{1'b0, ...};').
+
+M136 fix round R7 (severity: HIGH, found during THIS milestone's own
+trailing cold-read, not carried over from an earlier round): the FIRST
+version of this predicate checked only \"a `concatenation' somewhere
+inside one of those three statement kinds\" -- it never looked for the
+reduction operator its OWN docstring already claimed was required.
+Reproduced directly: an ORDINARY bus-packing `assign' with no reduction
+at all --
+
+  assign bus_o = {a_i,
+                  /*AUTOUNUSED*/
+                  b_i};
+
+-- silently expanded to
+
+  assign bus_o = {a_i,
+                  /*AUTOUNUSED*/
+                  // Beginning of automatic unused inputs
+                  c_i,
+                  d_i,
+                  // End of automatics
+                  b_i};
+
+splicing two UNRELATED port names into the middle of a live bit-packing
+expression -- syntactically legal Verilog, semantically WRONG (`bus_o'
+now computes a completely different value), and with no warning of any
+kind: the run's own final message reports a plain success count. This
+is WORSE than the bare-marker case R2 already guards (illegal syntax at
+least gets caught by a compiler); a silently wrong VALUE does not. Why
+checking for \"inside one of the three statement kinds\" is not enough
+by itself: NEITHER a bus-packing `assign'/`wire'/`logic' NOR the
+`_unused_ok' idiom constrains which STATEMENT TYPE wraps a
+concatenation -- both are `wire NAME = {...};'/`assign NAME = {...};'
+shaped at that level. The one structural difference is the reduction
+operator: the idiom always has one (folding the packed bits away to a
+throwaway single bit is the entire point), an ordinary bus-pack never
+does (the packed bits are the whole point). So the check now walks from
+the concatenation up through its own `primary' wrapper (dump-verified,
+M136 fix round R7 recon: `&{...}' parses as `expression operator:
+(unary_operator) argument: (primary (concatenation ...)))', a SINGLE
+`primary' layer between the two) to the enclosing `expression', and
+requires that `expression''s own `operator' field to be a
+`unary_operator' node whose text is one of
+`verilog-auto--autounused-reduction-operators' -- distinguishing this
+UNARY reduction `&' from a BINARY `a & b' (dump-verified, M136 fix
+round R7 recon, the R1 test's own `a_i & &{1'b0, ...}' shape: the OUTER
+`&' there is a binary expression with `left:'/`right:' fields and no
+single `operator:' field at all, so it can never satisfy this check on
+its own -- only the INNER `&{...}' does, which is exactly the legal
+host, unaffected by this fix).
+
+`--expand-autounused-site' below refuses to expand at all when this
+predicate is nil, reporting a named notice instead of guessing what
+the user meant.
+
+KNOWN LIMITATIONS, not fixed (M136 fix round R8, reviewer-found and
+reproduced; both FAIL CLOSED -- refused and reported, the OPPOSITE of
+R7's silent-corruption direction, so getting these two shapes to expand
+needs a smarter check, not a more permissive one, and is left as future
+work rather than attempted here):
+
+- A marker in a NESTED inner concatenation, with the reduction operator
+  on some OUTER one: `wire _unused_ok = &{1'b0, {extra1_i,
+  /*AUTOUNUSED*/ extra2_i}, 1'b0};' -- `verilog-auto--enclosing-of-
+  types' finds the NEAREST (innermost) `concatenation' ancestor of
+  COMMENT, which is the `{extra1_i, ...}' one, not the outer `&{...}'
+  one; that inner concatenation's own parent chain never reaches a
+  `unary_operator', so this predicate correctly refuses (fail closed),
+  but a marker legitimately meant to list unused signals nested one
+  concatenation level down currently can't. (A marker in the OUTER
+  concatenation, with an unrelated inner one merely sitting alongside
+  it as a sibling operand, is unaffected and still works normally.)
+- An EXTRA layer of parentheses around the reduced concatenation:
+  `wire _unused_ok = &({1'b0, /*AUTOUNUSED*/ 1'b0});' -- the climb from
+  `concatenation' to its enclosing `expression' only ever skips a
+  `primary' wrapper (the shape `&{...}' itself dump-verifies as); an
+  extra parenthesization layer is some OTHER node type in between (not
+  probed further, since fixing this needs understanding exactly how
+  this grammar represents a parenthesized sub-expression, which this
+  fix round did not need to determine to correctly REFUSE the case),
+  so the climb lands on the wrong node and the operator-field check
+  fails there too -- refused, not corrupted.
+
+Two other known, unrelated limitations already documented elsewhere:
+`verilog-auto--identifier-read-p''s own docstring (R3.3, function-local
+shadowing) and `verilog-auto--identifier-non-root-hierarchical-
+component-p''s own docstring (a port/instance name collision) -- unlike
+those two (which can silently list a signal that IS read, or silently
+skip one that ISN'T), both limitations here only ever make this idiom
+LESS convenient, never wrong."
+  (let ((concat (verilog-auto--enclosing-of-types comment '("concatenation"))))
+    (and concat
+         (let ((n (treesit-node-parent concat)))
+           (while (and n (equal (treesit-node-type n) "primary"))
+             (setq n (treesit-node-parent n)))
+           (and n (equal (treesit-node-type n) "expression")
+                (let ((op (treesit-node-child-by-field-name n "operator")))
+                  (and op
+                       (equal (treesit-node-type op) "unary_operator")
+                       (member (treesit-node-text op)
+                               verilog-auto--autounused-reduction-operators)))
+                (verilog-auto--enclosing-of-types
+                 n '("continuous_assign" "net_decl_assignment" "variable_decl_assignment"))
+                t)))))
+
+(defun verilog-auto--pos-in-ranges-p (start end ranges)
+  "Non-nil if the (START . END) span is wholly contained in some one
+range in RANGES (a list of (START . END) conses)."
+  (catch 'found
+    (dolist (r ranges)
+      (when (and (>= start (car r)) (<= end (cdr r)))
+        (throw 'found t)))
+    nil))
+
+(defun verilog-auto--identifier-non-root-hierarchical-component-p (id)
+  "Non-nil if ID (a `simple_identifier') is a NON-FIRST path component
+of its own enclosing `hierarchical_identifier' -- i.e. it names
+something in some OTHER scope, not a signal of the CURRENT module. M136
+fix round R3.1 (dump-verified: `u_sub.z_o' parses as
+`hierarchical_identifier (simple_identifier) (simple_identifier)', two
+FLAT children in document order, `u_sub' then `z_o' -- the same shape
+`verilog-auto--variable-lvalue-driven-names' already relies on for a
+dotted LHS): only the leftmost component could possibly refer to
+something declared in the enclosing module itself (a submodule instance
+name, most commonly); every later component is a member access on
+WHATEVER the first component named, a different scope's own signal.
+Without this check, `u_sub.z_o' silently counted as a read of THIS
+module's own `z_o' candidate (if it happened to share that name with
+one of `u_sub''s own ports) purely by text equality -- exactly the
+false-negative (missing a genuinely dead port) this fix round exists to
+close. nil (not excluded) if ID has no `hierarchical_identifier' parent
+at all -- an ordinary bare identifier is never part of a dotted path
+and this check doesn't apply to it.
+
+KNOWN LIMITATION, not fixed (predates R3.1, still present after it):
+this function treats the ROOT (leftmost) component as \"usually a
+submodule instance name\" and lets its plain text-equality match count
+as a read of a same-named candidate -- so when a module has BOTH a port
+and a submodule instance under one name, `that_name.something' makes
+the PORT `that_name' look read, when what is actually referenced is the
+INSTANCE, an entirely different thing that only happens to share its
+text.
+
+How reachable that is, is the part worth stating carefully, because two
+reviews disagreed about it and the second measurement won. The shape is
+NOT legal SystemVerilog: instance names and signal names occupy ONE
+module-scope namespace, so declaring both is a redefinition. Measured
+against real slang-server (M136 fix round R8, `dev/lsp-probe.py
+--server slang-server --diagnostics') on `sub that_name
+(.dbg_o(that_name)); assign z_o = that_name.dbg_o;' with `that_name'
+also a port -- slang answers with two severity-1 errors,
+`redefinition of 'that_name'' and `invalid member access for type
+'logic'', and never reaches the point of judging the port used or
+unused. An earlier review had reported that slang calls `that_name'
+`unused-port' here and therefore disagrees with this tool; it does not,
+and that reading came from a variant fixture without the hierarchical
+read. So this limitation is real in the identifier matching but has no
+demonstrated reach in code that compiles: no legal shape has yet been
+found that triggers it. It stays documented, and pinned, because
+\"cannot construct a legal example today\" is not the same as
+\"cannot exist\". Both that fixture and the very
+slightly different one the pinning test uses (its instance connects
+`.dbg_o(dbg_o)', an implicit net, rather than `.dbg_o(that_name)')
+answer the same way, checked separately -- the redefinition is what
+decides it, not what the port connects to. The current behaviour on the
+illegal fixture is pinned by a named test
+(`autounused_port_and_instance_name_collision_via_hierarchical_read_is_a_known_limitation_not_fixed'
+in verilog_auto_tests.rs). Fixing this needs real name resolution
+(distinguishing \"is this identifier's target an instance or a port\"
+is not answerable from text alone, the same scope-resolution gap
+`verilog-auto--identifier-read-p''s own docstring already documents for
+R3.3's function-local shadowing) -- left as a second, adjacent instance
+of that same documented gap rather than a new one.
+
+An EARLIER version of this paragraph additionally claimed real
+`slang-server' independently confirms this tool is on the WRONG side
+(reporting `unused-port' for `that_name' on the same fixture). That
+claim did NOT reproduce this round (three separate `dev/lsp-probe.py'
+runs against `slang-server', the module's own output net implicit,
+explicitly declared, and with the hierarchical read removed entirely
+as a baseline): the fixture is itself a genuine LRM namespace
+collision (a port and an instance sharing one name in one module
+scope), and real `slang-server' reports a `redefinition' ERROR for
+`that_name' there, not a clean `unused-port' -- `unused-port' for
+`that_name' only appeared in the baseline variant with NO hierarchical
+read at all, i.e. slang's own behaviour, once past the redefinition
+error, did not visibly disagree with this tool's own answer on this
+exact shape. The limitation itself (text-equality without name
+resolution) is real and undisputed; the specific \"slang proves us
+wrong\" claim is corrected here rather than repeated, since this
+round's own measurement contradicts it."
+  (let ((parent (treesit-node-parent id)))
+    (and parent
+         (equal (treesit-node-type parent) "hierarchical_identifier")
+         (let ((ids (verilog-auto--find-all-of-type parent "simple_identifier")))
+           (not (and ids (treesit-node-eq id (car ids))))))))
+
+(defun verilog-auto--identifier-is-connection-name-field-p (id)
+  "Non-nil if ID (a `simple_identifier') is a NAME being assigned TO,
+not a signal being read -- specifically the `port_name' field of an
+enclosing `named_port_connection' (`.z_o(other_i)': `z_o' here is the
+SUBMODULE's own port name, dump-verified as a genuine treesit FIELD,
+`named_port_connection port_name: (simple_identifier) connection:
+(...)' -- never a signal of the enclosing module at all, even when it
+happens to share a name with one of this module's own candidates), or
+the leading NAME child of an enclosing `named_parameter_assignment'
+(`.WIDTH(4)': `WIDTH' is the SUBMODULE's own parameter name --
+structurally the identical trap, but NOT plain child index 0: dump-
+verified (M136 fix round, a real probe against `sub #(.WIDTH(4))
+u_sub (...)') that `named_parameter_assignment' has a leading anonymous
+`.' TOKEN as its own child index 0 (raw `treesit-node-child' indexing
+includes anonymous tokens, unlike a purely-named-child view), so the
+name identifier is actually at index 1 -- found here by NODE TYPE via
+`verilog-auto--find-first-of-type' instead, the same \"no fixed child
+index, no dedicated field name for this one\" approach `verilog-auto--
+instance-param-overrides' already uses for the identical node type,
+rather than hard-coding an index the grammar doesn't actually give a
+dedicated field for). An earlier version of this docstring claimed
+\"plain child index 0\" without having probed it -- WRONG, caught by
+this fix round's own named test going red before this correction, not
+by inspection. M136 fix round R3.2 (port-name case) / R3.2 follow-up
+(parameter-name case): without this check, `.a_i(x)' in an
+instantiation silently counted as a read of THIS module's own `a_i'
+candidate whenever the SUBMODULE happened to have a port or parameter
+also spelled `a_i' -- another false negative in the same family as
+R3.1."
+  (let ((parent (treesit-node-parent id)))
+    (cond
+     ((and parent (equal (treesit-node-type parent) "named_port_connection"))
+      (let ((pn (treesit-node-child-by-field-name parent "port_name")))
+        (and pn (treesit-node-eq id pn))))
+     ((and parent (equal (treesit-node-type parent) "named_parameter_assignment"))
+      (let ((first (verilog-auto--find-first-of-type parent "simple_identifier")))
+        (and first (treesit-node-eq id first))))
+     (t nil))))
+
+(defun verilog-auto--identifier-read-p (name exclude-ranges lvalue-starts all-ids)
+  "Non-nil if some occurrence of NAME among ALL-IDS (every
+`simple_identifier' node anywhere in the enclosing module) counts as a
+read: its own (START . END) span is not wholly inside EXCLUDE-RANGES
+(the port's own declaration site(s)), its own START is not a member of
+LVALUE-STARTS (a hash table of every lvalue-driven identifier's own
+START position, `verilog-auto--all-lvalue-driven-id-nodes' -- an
+occurrence that is ONLY ever driven, never read, must not count), it
+is not a non-root component of a dotted hierarchical reference
+(`verilog-auto--identifier-non-root-hierarchical-component-p', M136 fix
+round R3.1), and it is not a connection/parameter NAME field
+(`verilog-auto--identifier-is-connection-name-field-p', R3.2).
+
+KNOWN LIMITATION, not fixed (M136 fix round R3.3, documented rather
+than silently wrong): this function has no notion of LEXICAL SCOPE at
+all -- a `task'/`function' body that happens to declare its OWN local
+variable with the SAME NAME as a module-level candidate (`function
+automatic void f(); logic a_i; a_i = 1\\='b0; endfunction', shadowing a
+module-level `input logic a_i;') has that local variable's own read
+counted as a read of the OUTER port, because nothing here ever checks
+which declaration a given occurrence's name actually resolves to. A
+correct fix needs real lexical scope resolution, which this file has
+never had (every other AUTO command's own \"already declared\" checks
+are name-based lookups over declaration LISTS, never a scope walk).
+Pinned, not silently wrong: see
+`autounused_function_local_shadow_is_a_known_limitation_not_fixed' in
+verilog_auto_tests.rs."
+  (catch 'found
+    (dolist (id all-ids)
+      (when (and (equal (treesit-node-text id) name)
+                 (not (verilog-auto--identifier-non-root-hierarchical-component-p id))
+                 (not (verilog-auto--identifier-is-connection-name-field-p id)))
+        (let ((start (treesit-node-start id)) (end (treesit-node-end id)))
+          (unless (or (verilog-auto--pos-in-ranges-p start end exclude-ranges)
+                      (gethash start lvalue-starts))
+            (throw 'found t)))))
+    nil))
+
+(defun verilog-auto--expand-autounused-site (comment)
+  "Expand one /*AUTOUNUSED*/ site. Returns the number of names listed
+(0 if nothing qualifies -- no Beginning/End markers inserted in that
+case either, GNU-measured, this file's M136 header \"empty-list\"
+finding: `dev/gnu-auto/run.sh' on a module where every input is
+AUTOINST-connected inserts nothing at all after the bare marker, the
+same convention every other block-style command in this file already
+follows -- ALSO 0 when COMMENT has no legal host at all,
+`verilog-auto--autounused-legal-host-p', M136 fix round R2)."
+  (let* ((module-decl (verilog-auto--enclosing-of-types
+                       comment '("module_declaration" "interface_declaration")))
+         (header (verilog-auto--header-node module-decl))
+         (text (treesit-node-text comment)))
+    (cond
+     ((not (string= text "/*AUTOUNUSED*/"))
+      (push (cons (treesit-node-start comment)
+                  (format "AUTOUNUSED(...) in module %s: takes no argument, expansion skipped"
+                          (verilog-auto--module-name module-decl)))
+            verilog-auto--port-marker-arg-warnings)
+      0)
+     ((not (verilog-auto--autounused-legal-host-p comment))
+      (push (cons (treesit-node-start comment)
+                  (format "AUTOUNUSED in module %s: not inside a `&{...}' concatenation \
+initializer (`assign x = &{1'b0, /*AUTOUNUSED*/ 1'b0};'/`wire x = &{...};'), expansion skipped"
+                          (verilog-auto--module-name module-decl)))
+            verilog-auto--autounused-bad-host-notices)
+      0)
+     (t
+      (let* ((candidates (verilog-auto--unused-port-candidates module-decl header))
+             (lvalue-starts (let ((tbl (make-hash-table :test 'eql)))
+                              (dolist (id (verilog-auto--all-lvalue-driven-id-nodes module-decl))
+                                (puthash (treesit-node-start id) t tbl))
+                              tbl))
+             (all-ids (verilog-auto--find-all-of-type module-decl "simple_identifier"))
+             (unread nil))
+        (dolist (c candidates)
+          (let* ((nm (car c))
+                 (ranges (nth 2 c)))
+            (when (and (not (verilog-auto--identifier-read-p nm ranges lvalue-starts all-ids))
+                       (or (null verilog-auto-unused-ignore-regexp)
+                           (not (string-match-p verilog-auto-unused-ignore-regexp nm))))
+              (push nm unread))))
+        (setq unread (sort unread #'string<))
+        (when unread
+          (let ((indent (verilog-auto--line-indent (treesit-node-start comment))))
+            (goto-char (treesit-node-end comment))
+            (insert
+             "\n" indent "// Beginning of automatic unused inputs"
+             (mapconcat (lambda (nm) (concat "\n" indent nm ",")) unread "")
+             "\n" indent "// End of automatics")))
+        (length unread))))))
+
+(defun verilog-auto--expand-all-autounused ()
+  "Expand the FIRST /*AUTOUNUSED*/ site in each module -- AUTOUNUSED is
+a MODULE-level scan (the whole module body's own read occurrences), not
+scoped to some smaller enclosing construct the way AUTORESET is scoped
+to its own always block (this file's M134 header); so, like AUTOWIRE/
+AUTOOUTPUT/AUTOINPUT/AUTOINOUT/AUTOREG/AUTOTIEOFF,
+`verilog-auto--first-autowire-per-module' applies here, and a second
+marker in the same module is left as a bare, unexpanded comment (same
+deliberate scope decision under ambiguity as those six, M125 header)."
+  (let* ((root (verilog-auto--parse-current-buffer))
+         (comments (verilog-auto--find-port-marker-comments root "AUTOUNUSED"))
+         (split (verilog-auto--first-autowire-per-module comments))
+         (firsts (car split))
+         (sorted (sort (copy-sequence firsts)
+                       (lambda (a b) (> (treesit-node-start a) (treesit-node-start b))))))
+    (let ((total 0))
+      (dolist (c sorted total)
+        (setq total (+ total (verilog-auto--expand-autounused-site c)))))))
+
 ;; --- AUTOARG ----------------------------------------------------------------
 
 (defun verilog-auto--arg-lines (groups indent)
@@ -5425,16 +6046,17 @@ clobbered by the phases that run afterward)."
             (when close
               (push (cons (treesit-node-end c) (treesit-node-start close)) ranges))))))
     ;; M125/M126/M134: all seven block-style markers (AUTOWIRE plus the
-    ;; six other ones) share this one path -- `verilog-auto--autowire-
+    ;; seven other ones) share this one path -- `verilog-auto--autowire-
     ;; stale-end' doesn't care which marker COMMENT itself is, only what
-    ;; follows it (see this file's M125/M126/M134 headers).
+    ;; follows it (see this file's M125/M126/M134/M136 headers).
     (dolist (c (append (verilog-auto--find-comments root "/*AUTOWIRE*/")
                         (verilog-auto--find-port-marker-comments root "AUTOOUTPUT")
                         (verilog-auto--find-port-marker-comments root "AUTOINPUT")
                         (verilog-auto--find-port-marker-comments root "AUTOINOUT")
                         (verilog-auto--find-port-marker-comments root "AUTOTIEOFF")
                         (verilog-auto--find-port-marker-comments root "AUTOREG")
-                        (verilog-auto--find-port-marker-comments root "AUTORESET")))
+                        (verilog-auto--find-port-marker-comments root "AUTORESET")
+                        (verilog-auto--find-port-marker-comments root "AUTOUNUSED")))
       (let ((end (verilog-auto--autowire-stale-end c)))
         (when end
           (push (cons (treesit-node-end c) end) ranges))))
@@ -5469,12 +6091,17 @@ clobbered by the phases that run afterward)."
 (defun verilog-auto ()
   "Expand every /*AUTOINST*/, /*AUTOOUTPUT*/, /*AUTOINPUT*/,
 /*AUTOINOUT*/, /*AUTOTIEOFF*/, /*AUTOWIRE*/, /*AUTOREG*/, /*AUTORESET*/,
-and /*AUTOARG*/ construct in the current buffer, in that order (M125:
-GNU's own ordering restricted to what this file implements; M126
-inserts AUTOTIEOFF after AUTOINOUT and AUTOREG after AUTOWIRE -- see
-this file's M126 header for why AUTOTIEOFF must run BEFORE AUTOREG;
-M134 inserts AUTORESET after AUTOREG and before AUTOARG, GNU's own
-ordering).
+/*AUTOARG*/, and /*AUTOUNUSED*/ construct in the current buffer, in
+that order (M125: GNU's own ordering restricted to what this file
+implements; M126 inserts AUTOTIEOFF after AUTOINOUT and AUTOREG after
+AUTOWIRE -- see this file's M126 header for why AUTOTIEOFF must run
+BEFORE AUTOREG; M134 inserts AUTORESET after AUTOREG and before
+AUTOARG, GNU's own ordering; M136 inserts AUTOUNUSED LAST, after
+AUTOARG -- GNU's own ordering too, and this file's own divergent
+criterion (its M136 header) needs every OTHER command's own expanded
+text to already exist, since a connection AUTOINST just expanded, or a
+port AUTOARG just placed into the header's own arg list, counts as a
+read the same as anything hand-written does).
 Idempotent: always starts by deleting every existing machine-generated
 region (`verilog-delete-auto') and re-expanding from scratch, so
 running it twice in a row leaves the buffer byte-for-byte unchanged the
@@ -5496,6 +6123,7 @@ second time. The whole command is one undo group."
           (verilog-auto--predeclared-port-names nil)
           (verilog-auto--port-range-conflicts nil)
           (verilog-auto--port-marker-arg-warnings nil)
+          (verilog-auto--autounused-bad-host-notices nil)
           (verilog-auto--ansi-autoreg-modules nil)
           (verilog-auto--ansi-tieoff-assign-modules nil)
           (verilog-auto--tieoff-port-reg-skips nil)
@@ -5506,7 +6134,7 @@ second time. The whole command is one undo group."
           (verilog-auto--template-instance-number-notices nil)
           (verilog-auto--template-forward-fallback-notices nil)
           (verilog-auto--template-lisp-eval-failures nil)
-          (n-inst 0) (n-wire 0) (n-arg 0) (n-port 0) (n-tieoff 0) (n-reg 0) (n-reset 0))
+          (n-inst 0) (n-wire 0) (n-arg 0) (n-port 0) (n-tieoff 0) (n-reg 0) (n-reset 0) (n-unused 0))
       (setq n-inst (verilog-auto--expand-all-autoinst))
       (setq n-port (+ (verilog-auto--expand-all-port-propagation 'output)
                        (verilog-auto--expand-all-port-propagation 'input)
@@ -5516,6 +6144,7 @@ second time. The whole command is one undo group."
       (setq n-reg (verilog-auto--expand-all-autoreg))
       (setq n-reset (verilog-auto--expand-all-autoreset))
       (setq n-arg (verilog-auto--expand-all-autoarg))
+      (setq n-unused (verilog-auto--expand-all-autounused))
       (undo-amalgamate-boundary)
       (setq verilog-auto--missing-modules (nreverse verilog-auto--missing-modules))
       (setq verilog-auto--ansi-autoarg-modules (nreverse verilog-auto--ansi-autoarg-modules))
@@ -5622,6 +6251,15 @@ second time. The whole command is one undo group."
                           (length verilog-auto--port-marker-arg-warnings)
                           (verilog-auto--notice-first verilog-auto--port-marker-arg-warnings))
                 "")
+              ;; M136 fix round R2: a bare `/*AUTOUNUSED*/' with no
+              ;; legal `&{...}' host -- refused rather than expanded
+              ;; into illegal Verilog with no diagnostic at all (this
+              ;; file's own M136 header).
+              (if verilog-auto--autounused-bad-host-notices
+                  (format "; %d AUTOUNUSED marker(s) with no legal host, expansion skipped (first: %s)"
+                          (length verilog-auto--autounused-bad-host-notices)
+                          (verilog-auto--notice-first verilog-auto--autounused-bad-host-notices))
+                "")
               ;; M92 fix round S1: a template rule line that matched
               ;; neither the exact nor the wildcard shape used to vanish
               ;; with no trace at all; recorded and folded in here now,
@@ -5716,22 +6354,22 @@ second time. The whole command is one undo group."
                 ""))))
         (cond
          (verilog-auto--missing-modules
-          (message "verilog-auto: module %s not found%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
+          (message "verilog-auto: module %s not found%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets, %d unused%s"
                     (car verilog-auto--missing-modules)
                     (if (> (length verilog-auto--missing-modules) 1)
                         (format " (%d total)" (length verilog-auto--missing-modules))
                       "")
-                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix))
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset n-unused suffix))
          (verilog-auto--ansi-autoarg-modules
-          (message "verilog-auto: AUTOARG in ANSI header (module %s)%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
+          (message "verilog-auto: AUTOARG in ANSI header (module %s)%s; %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets, %d unused%s"
                     (car verilog-auto--ansi-autoarg-modules)
                     (if (> (length verilog-auto--ansi-autoarg-modules) 1)
                         (format " (%d total)" (length verilog-auto--ansi-autoarg-modules))
                       "")
-                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix))
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset n-unused suffix))
          (t
-          (message "verilog-auto: %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets%s"
-                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset suffix)))))))
+          (message "verilog-auto: %d inst, %d wires, %d args, %d ports, %d tieoffs, %d regs, %d resets, %d unused%s"
+                    n-inst n-wire n-arg n-port n-tieoff n-reg n-reset n-unused suffix)))))))
 
 ;; --- Keybindings -------------------------------------------------------------
 ;; Buffer-local, added via `verilog-mode-hook' -- the same pattern
