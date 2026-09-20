@@ -1,0 +1,18 @@
+w0 60                  w0= 60 cur= 60 w$= 82 scroll=11
+  C-f from 60          w0= 81 cur= 81 w$=100 scroll=11
+w0 70                  w0= 70 cur= 70 w$= 92 scroll=11
+  C-f from 70          w0= 91 cur= 91 w$=100 scroll=11
+w0 78                  w0= 78 cur= 78 w$=100 scroll=11
+  C-f from 78          w0=100 cur=100 w$=100 scroll=11
+w0 79                  w0= 79 cur= 79 w$=100 scroll=11
+  C-f from 79          w0=100 cur=100 w$=100 scroll=11
+w0 80                  w0= 80 cur= 80 w$=100 scroll=11
+  C-f from 80          w0=100 cur=100 w$=100 scroll=11
+cur 70                 w0= 59 cur= 70 w$= 81 scroll=11
+  C-d from 70          w0= 70 cur= 81 w$= 92 scroll=11
+cur 80                 w0= 69 cur= 80 w$= 91 scroll=11
+  C-d from 80          w0= 78 cur= 91 w$=100 scroll=11
+cur 85                 w0= 74 cur= 85 w$= 96 scroll=11
+  C-d from 85          w0= 78 cur= 96 w$=100 scroll=11
+cur 90                 w0= 78 cur= 90 w$=100 scroll=11
+  C-d from 90          w0= 78 cur=100 w$=100 scroll=11

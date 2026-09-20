@@ -1,0 +1,15 @@
+ws 82                          ws= 82 pt= 82 wend=101 h=22
+C-v from 82 (->101?)           SIGNAL: (end-of-buffer)
+ws 81                          ws= 81 pt= 81 wend=101 h=21
+C-v from 81 (->100)            ws=100 pt=100 wend=101 h=21
+ws 83                          ws= 83 pt= 83 wend=101 h=21
+C-v from 83 (->102?)           SIGNAL: (end-of-buffer)
+ws 80                          ws= 80 pt= 80 wend=101 h=21
+C-v from 80 (->99)             ws= 99 pt= 99 wend=101 h=21
+M-v arg 30 from 30             ws=  1 pt= 21 wend= 22 h=21
+M-v arg 30 from 31             ws=  1 pt= 21 wend= 22 h=21
+M-v from 2                     ws=  1 pt=  2 wend= 22 h=21
+ws 20 pt 31                    ws= 20 pt= 31 wend= 41 h=21
+recenter nil pt31              ws= 21 pt= 31 wend= 42 h=21
+recenter 25 (>h)               ws= 30 pt= 50 wend= 51 h=21
+recenter -25 (<-h)             ws= 40 pt= 50 wend= 61 h=21

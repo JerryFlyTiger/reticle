@@ -4,7 +4,7 @@
 #
 # reticle reads the same file for its own local module lookup, so
 # the editor and the language server agree on one list instead of each
-# guessing (see PLAN.md, M56).
+# guessing.
 
 pkg/soc_pkg.sv
 core/alu.sv
@@ -13,6 +13,7 @@ core/clk_gate.sv
 core/status_regs_stub.sv
 mem/sram_wrapper.sv
 mem/sram_bank.sv
+mem/sram_bank_4k.sv
 mem/sram_dual_channel.sv
 bus/axi4_lite_arbiter.sv
 bus/axi4_lite_if.sv

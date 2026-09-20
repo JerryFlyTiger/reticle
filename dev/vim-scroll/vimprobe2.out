@@ -1,0 +1,23 @@
+23G (last visible)         w0=  1 cur= 23 col= 5 w$= 23
+C-f cur on last            w0= 22 cur= 22 col= 1 w$= 44
+22G (top of page 2)        w0= 22 cur= 22 col= 1 w$= 44
+C-b cur on top             w0=  1 cur= 23 col= 5 w$= 23
+2G                         w0=  1 cur=  2 col= 1 w$= 23
+C-b cur 2 w0 1             w0=  1 cur=  2 col= 1 w$= 23
+40G                        w0= 29 cur= 40 col= 1 w$= 51
+C-e cur mid                w0= 30 cur= 40 col= 1 w$= 52
+50G col 1                  w0= 30 cur= 50 col= 1 w$= 52
+z<CR> indented             w0= 50 cur= 50 col= 1 w$= 72
+z. unindented              w0= 40 cur= 51 col= 5 w$= 62
+zt indented (col?)         w0= 50 cur= 50 col= 1 w$= 72
+z- from $                  w0= 28 cur= 50 col= 1 w$= 50
+3 C-d (scroll=3)           w0= 31 cur= 53 col= 5 w$= 53
+C-y after (cur?)           w0= 30 cur= 52 col= 5 w$= 52
+j after 3C-d               w0= 31 cur= 53 col= 5 w$= 53
+C-f at 99                  w0=100 cur=100 col= 1 w$=100
+C-f at 90 (w0?)            w0=100 cur=100 col= 1 w$=100
+80G                        w0= 69 cur= 80 col= 1 w$= 91
+C-f at 80                  w0= 90 cur= 90 col= 1 w$=100
+10G w0?                    w0=  1 cur= 10 col= 1 w$= 23
+C-e x5                     w0=  6 cur= 10 col= 1 w$= 28
+C-e cur leaves             w0= 11 cur= 11 col= 1 w$= 33

@@ -122,6 +122,17 @@ fn window_shows_exactly_one_fewer_line_of_text_and_grid_rows_is_unchanged() {
     // uses that letter and would collide with a naive substring search).
     let lines: Vec<String> = (1..=tr).map(|n| format!("ZZ{n}")).collect();
     run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    // M137: point must be at the TOP of the buffer for this test to
+    // measure what its name says. `insert` leaves point at the end (on
+    // the last line); with point there, point-follow itself would force
+    // the window to scroll to keep point visible regardless of whether
+    // block rows are counted -- covered separately by
+    // `point_at_end_of_buffer_stays_visible_below_a_diagnostic_block` and
+    // the smooth-scroll/recenter tests below. Only with point pinned at
+    // the top does "the last line scrolls off" isolate the thing this
+    // test is actually checking: that the block row's budget comes out
+    // of text_rows, not out of nowhere.
+    run(&mut i, "(goto-char (point-min))");
     let plain = render(&i, &ed);
     assert_eq!(plain.rows, 10);
     assert!(
@@ -633,5 +644,203 @@ fn a_wide_character_straddling_the_truncation_point_is_dropped_whole() {
         1,
         "expected exactly one run carrying the truncated text, got {:#?}",
         msg_runs
+    );
+}
+
+// M137 --------------------------------------------------------------
+// `ensure_point_visible`/`scan_forward_for_point`/`recenter` must count
+// M87 stage 3's diagnostic block rows the same way the draw loop
+// (`emit_block_rows`, via the shared `block_row_lines`) does, or the
+// window can decide point fits when the draw loop actually runs out of
+// rows first -- the field repro (M-> on `demo/rtl/top/soc_top.sv`) left
+// point clamped on the last drawn row instead of on point's own line.
+
+#[test]
+fn point_at_end_of_buffer_stays_visible_below_a_diagnostic_block() {
+    // 60 lines, diagnostics placed close enough to point-max that the
+    // point-to-window_start char distance stays under `ensure_point_
+    // visible`'s far-jump threshold (`3 * text_rows * cols`), and the
+    // number of row-advances scan_forward_for_point needs stays under
+    // its own step budget -- so this exercises the smooth-scroll path
+    // (`scan_forward_for_point`) directly, the same path the field repro
+    // (M-> on `demo/rtl/top/soc_top.sv`) went through, rather than
+    // falling back to `recenter`. (Confirmed empirically: with a diag
+    // line far from point, as in an earlier draft of this test, the
+    // budget is exceeded and `recenter`'s half-based backward jump lands
+    // past the diagnostic's line entirely, making this test insensitive
+    // to block-row counting -- verified against the real draw output,
+    // not assumed.)
+    let (mut i, ed) = setup(60, 22);
+    let tr = text_rows(22);
+    assert_eq!(tr, 20);
+    let lines: Vec<String> = (1..=60).map(|n| format!("ZZ{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    set_diags(
+        &mut i,
+        &[
+            (50, 1, "port a has no connection"),
+            (50, 1, "port b has no connection"),
+            (50, 1, "port c has no connection"),
+            (50, 1, "port d has no connection"),
+        ],
+    );
+    run(&mut i, "(goto-char (point-max))");
+    let grid = render(&i, &ed);
+
+    let r = find_row(&grid, "ZZ60").expect("ZZ60 (point's own line) must be visible");
+    assert!(r < tr, "point's row {r} must be within text_rows {tr}");
+    assert_eq!(grid.cursor.0, r, "hardware cursor must sit on point's row");
+
+    let r51 = find_row(&grid, "ZZ51").expect("ZZ51 must be visible");
+    for msg in [
+        "port a has no connection",
+        "port b has no connection",
+        "port c has no connection",
+        "port d has no connection",
+    ] {
+        assert!(
+            find_row(&grid, msg).is_some(),
+            "diagnostic message {:?} must be visible",
+            msg
+        );
+    }
+    assert_eq!(
+        find_row(&grid, "port d has no connection"),
+        Some(r51 + 4),
+        "the 4th (last) block row must be exactly 4 rows below ZZ51"
+    );
+    // 60 - 51 = 9 lines below ZZ51, plus 4 block rows under it.
+    assert_eq!(r, r51 + 4 + 9);
+}
+
+#[test]
+fn stepping_point_one_line_past_the_bottom_scrolls_by_the_block_rows_too() {
+    let (mut i, ed) = setup(40, 10);
+    let tr = text_rows(10);
+    assert_eq!(tr, 8);
+    let lines: Vec<String> = (1..=20).map(|n| format!("ZZ{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    set_diags(&mut i, &[(0, 1, "boom one"), (0, 1, "boom two")]);
+    run(&mut i, "(goto-char (point-min))");
+    let grid0 = render(&i, &ed);
+    assert_eq!(find_row(&grid0, "ZZ1"), Some(0));
+
+    // ZZ1 r0, block r1-r2, ZZ2 r3, ZZ3 r4, ZZ4 r5, ZZ5 r6, ZZ6 r7: fits
+    // exactly on the last row.
+    run(&mut i, "(forward-line 5)");
+    let grid1 = render(&i, &ed);
+    assert_eq!(find_row(&grid1, "ZZ6"), Some(7));
+    assert_eq!(grid1.cursor.0, 7);
+    assert_eq!(find_row(&grid1, "ZZ1"), Some(0));
+
+    run(&mut i, "(forward-line 1)");
+    let grid2 = render(&i, &ed);
+    let r = find_row(&grid2, "ZZ7").expect("ZZ7 (point's own line) must be visible");
+    assert_eq!(grid2.cursor.0, r);
+    assert!(r < tr, "point's row {r} must be within text_rows {tr}");
+    assert!(
+        find_row(&grid2, "ZZ1").is_none(),
+        "the window must have scrolled -- ZZ1 should no longer be visible"
+    );
+}
+
+#[test]
+fn far_jump_recenter_accounts_for_block_rows() {
+    let (mut i, ed) = setup(40, 10);
+    let tr = text_rows(10);
+    assert_eq!(tr, 8);
+    let lines: Vec<String> = (1..=400).map(|n| format!("ZZ{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    set_diags(
+        &mut i,
+        &[
+            (396, 1, "port a has no connection"),
+            (396, 1, "port b has no connection"),
+            (396, 1, "port c has no connection"),
+            (396, 1, "port d has no connection"),
+        ],
+    );
+    run(&mut i, "(goto-char (point-min))");
+    let _ = render(&i, &ed);
+    run(&mut i, "(goto-char (point-max))");
+    let grid = render(&i, &ed);
+
+    let r = find_row(&grid, "ZZ400").expect("ZZ400 (point's own line) must be visible");
+    assert_eq!(grid.cursor.0, r);
+    assert!(r < tr, "point's row {r} must be within text_rows {tr}");
+
+    assert_eq!(find_row(&grid, "ZZ397"), Some(0));
+    for msg in [
+        "port a has no connection",
+        "port b has no connection",
+        "port c has no connection",
+        "port d has no connection",
+    ] {
+        assert!(
+            find_row(&grid, msg).is_some(),
+            "diagnostic message {:?} must be visible",
+            msg
+        );
+    }
+    assert_eq!(find_row(&grid, "ZZ398"), Some(5));
+    assert_eq!(find_row(&grid, "ZZ399"), Some(6));
+    assert_eq!(find_row(&grid, "ZZ400"), Some(7));
+}
+
+#[test]
+fn inline_diagnostics_nil_ignores_block_rows_in_point_follow() {
+    let (mut i, ed) = setup(40, 10);
+    let lines: Vec<String> = (1..=20).map(|n| format!("ZZ{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    set_diags(&mut i, &[(0, 1, "boom one"), (0, 1, "boom two")]);
+    run(&mut i, "(setq inline-diagnostics nil)");
+    run(&mut i, "(goto-char (point-min))");
+    run(&mut i, "(forward-line 7)");
+    let grid = render(&i, &ed);
+    assert_eq!(
+        find_row(&grid, "ZZ1"),
+        Some(0),
+        "with inline-diagnostics off there are no block rows, so no phantom scroll"
+    );
+    assert_eq!(find_row(&grid, "ZZ8"), Some(7));
+}
+
+/// M137 review finding 2: every other point-follow test above uses
+/// single-line, non-blank messages, for which "number of diagnostics" and
+/// "number of block rows drawn" coincide -- so a count that read
+/// `diags.len()` instead of `block_row_lines(diags).len()` would have
+/// passed all of them. Here the two differ: one message has a blank
+/// interior line (2 rows drawn, F6), the other has four lines (capped to
+/// 3, with the ellipsis), so 2 diagnostics draw 5 rows.
+#[test]
+fn point_follow_counts_drawn_block_rows_not_diagnostics() {
+    let (mut i, ed) = setup(40, 10);
+    let tr = text_rows(10);
+    assert_eq!(tr, 8);
+    let lines: Vec<String> = (1..=20).map(|n| format!("ZZ{n}")).collect();
+    run(&mut i, &format!("(insert {:?})", lines.join("\n")));
+    set_diags(
+        &mut i,
+        &[(0, 1, "boom one\n   \nboom two"), (0, 1, "m1\nm2\nm3\nm4")],
+    );
+    run(&mut i, "(goto-char (point-min))");
+    let grid0 = render(&i, &ed);
+    // ZZ1 r0, block r1-r5 (2 + 3), ZZ2 r6, ZZ3 r7.
+    assert_eq!(find_row(&grid0, "ZZ1"), Some(0));
+    assert_eq!(find_row(&grid0, "boom two"), Some(2));
+    assert_eq!(find_row(&grid0, "m3"), Some(5));
+    assert_eq!(find_row(&grid0, "ZZ3"), Some(7));
+
+    // ZZ3 is the last row that fits; stepping onto ZZ4 must scroll. A
+    // count of 2 (one per diagnostic) would place ZZ4 on row 5 and skip
+    // the scroll, leaving it on row 8 -- off-screen.
+    run(&mut i, "(forward-line 3)");
+    let grid1 = render(&i, &ed);
+    let r = find_row(&grid1, "ZZ4").expect("ZZ4 (point's own line) must be visible");
+    assert_eq!(grid1.cursor.0, r);
+    assert!(r < tr, "point's row {r} must be within text_rows {tr}");
+    assert!(
+        find_row(&grid1, "ZZ1").is_none(),
+        "the window must have scrolled -- ZZ1 should no longer be visible"
     );
 }

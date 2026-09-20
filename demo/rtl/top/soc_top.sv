@@ -3,7 +3,7 @@
 // Every submodule instantiated here lives in a DIFFERENT subdirectory
 // (`core/', `mem/', `bus/'), which is the ordinary shape of an RTL tree
 // and the reason reticle learned to search library files
-// recursively (see PLAN.md, M56). With this file open:
+// recursively. With this file open:
 //
 //   * put the cursor on `alu' below and press `M-.'  -> jumps straight
 //     to core/alu.sv, no language server needed.

@@ -706,16 +706,19 @@ fn duplicate_module_name_across_library_files_picks_the_first_one() {
     goto_mid(&mut i, "fifo");
     let r = run(&mut i, "(verilog-goto-module-at-point)");
     assert_eq!(r, "t", "{}", r);
-    // Whichever it lands in must match `verilog-auto--library-files''s
-    // own `directory-files' order -- this test's own contract is only
-    // "predictable and one of the two", not which literal one; the
-    // library-files ordering itself is already pinned elsewhere.
+    // M147: pinned to the ACTUAL winner (checked by running this exact
+    // scenario, not by reading the code) -- `a_fifo.sv', because both
+    // files sit in the SAME directory and `verilog-auto--library-files'
+    // walks a single directory's files in `directory-files' order
+    // (alphabetical), which puts `a_fifo.sv' before `b_fifo.sv'. The
+    // old version of this test asserted only "one of the two", which
+    // left first-match-wins completely unpinned on the nav path despite
+    // the test's own name claiming the opposite.
     let landed = run(&mut i, "(buffer-file-name)");
     let a = format!("{:?}", a_path.to_str().unwrap());
-    let b = format!("{:?}", b_path.to_str().unwrap());
-    assert!(
-        landed == a || landed == b,
-        "must land in one of the two candidates: {}",
+    assert_eq!(
+        landed, a,
+        "must land in `a_fifo.sv', the first file in `verilog-auto--library-files' order: {}",
         landed
     );
 }

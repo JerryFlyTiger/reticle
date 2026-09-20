@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -1244,6 +1245,20 @@ fn next_row_start(
     cols: usize,
     inv: &[(usize, usize)],
 ) -> Option<usize> {
+    next_row_start_ex(buffer, pos, cols, inv).map(|(p, _)| p)
+}
+
+/// Same as `next_row_start`, plus whether the row just walked ended at a
+/// real `'\n'` (`true`) rather than a wrap point (`false`) -- M137's
+/// point-follow row counting needs this distinction because M87 stage 3's
+/// diagnostic block rows are drawn only after a buffer line actually
+/// ends, never after a mid-line wrap.
+fn next_row_start_ex(
+    buffer: &Buffer,
+    pos: usize,
+    cols: usize,
+    inv: &[(usize, usize)],
+) -> Option<(usize, bool)> {
     let len = buffer.text.len();
     if pos >= len {
         return None;
@@ -1260,11 +1275,11 @@ fn next_row_start(
         }
         let c = chars.next().unwrap();
         if c == '\n' {
-            return Some(p + 1);
+            return Some((p + 1, true));
         }
         let w = char_width(c, col);
         if wraps_before(col, w, cols) {
-            return Some(p);
+            return Some((p, false));
         }
         col += w;
         p += 1;
@@ -1289,6 +1304,20 @@ fn next_row_start(
 /// char distance made of many short/blank lines, where row distance
 /// could still be large — is caught by `scan_forward_for_point`'s own
 /// bounded guard, which falls back to recenter if it runs out of budget.
+///
+/// M137: `block_rows` (0-based buffer line -> number of M87 stage 3
+/// diagnostic block rows drawn under it) is threaded through to
+/// `scan_forward_for_point` and `recenter` so their row counts account for
+/// those rows the same way the draw loop does. This makes the
+/// `char_distance / cols <= row_distance` bound in the paragraph above no
+/// longer exact -- a block row adds a row without adding any characters
+/// to `point - *window_start`, so the true row distance can now exceed
+/// `char_distance / cols`. That's still safe for the far/near proxy above:
+/// block rows only ever make the true row distance *larger* than the
+/// char-based estimate, i.e. push cases further toward "far," which is
+/// exactly the direction `scan_forward_for_point`'s own bounded guard
+/// already handles by falling back to `recenter` when it runs out of
+/// budget.
 fn ensure_point_visible(
     buffer: &Buffer,
     point: usize,
@@ -1296,20 +1325,37 @@ fn ensure_point_visible(
     cols: usize,
     text_rows: usize,
     inv: &[(usize, usize)],
+    block_rows: &std::collections::HashMap<usize, usize>,
 ) {
     const NEAR_PAGES: usize = 3;
     let far_chars = (NEAR_PAGES * text_rows).saturating_mul(cols.max(1)).max(1);
 
     if point < *window_start {
         if *window_start - point > far_chars {
-            recenter(buffer, point, window_start, cols, text_rows, inv);
+            recenter(
+                buffer,
+                point,
+                window_start,
+                cols,
+                text_rows,
+                inv,
+                block_rows,
+            );
         } else {
             *window_start = buffer.text.line_start(point);
         }
         return;
     }
     if point - *window_start > far_chars {
-        recenter(buffer, point, window_start, cols, text_rows, inv);
+        recenter(
+            buffer,
+            point,
+            window_start,
+            cols,
+            text_rows,
+            inv,
+            block_rows,
+        );
         return;
     }
     let near_guard = NEAR_PAGES * text_rows + 4;
@@ -1321,8 +1367,17 @@ fn ensure_point_visible(
         text_rows,
         inv,
         near_guard,
+        block_rows,
     ) {
-        recenter(buffer, point, window_start, cols, text_rows, inv);
+        recenter(
+            buffer,
+            point,
+            window_start,
+            cols,
+            text_rows,
+            inv,
+            block_rows,
+        );
     }
 }
 
@@ -1331,6 +1386,14 @@ fn ensure_point_visible(
 /// most `max_steps` advances. Returns false — leaving `window_start`
 /// wherever it got to — when the budget runs out, so the caller can fall
 /// back to a cheaper strategy instead of scanning indefinitely.
+// M137 added `block_rows`, tripping clippy's `too_many_arguments`
+// threshold (8) -- every argument here is a distinct scalar/reference
+// this function's two callers (`ensure_point_visible`, `recenter`)
+// already hold locally, so bundling them into a struct would just move
+// the same eight fields one level out without making any call site
+// clearer; same tradeoff as `frontend-gui/src/shaping.rs`'s two uses of
+// this allow.
+#[allow(clippy::too_many_arguments)]
 fn scan_forward_for_point(
     buffer: &Buffer,
     point: usize,
@@ -1339,23 +1402,32 @@ fn scan_forward_for_point(
     text_rows: usize,
     inv: &[(usize, usize)],
     max_steps: usize,
+    block_rows: &std::collections::HashMap<usize, usize>,
 ) -> bool {
     let mut guard = 0usize;
     loop {
         let mut row = 0usize;
         let mut p = *window_start;
         let mut fits = false;
+        // 0-based buffer line containing the current row start. Recomputed
+        // once per outer iteration (not once per inner step) from
+        // `window_start`; `line_number` is 1-based and O(distance from its
+        // own internal anchor), so this single call per outer iteration is
+        // cheap -- it is not repeated per inner-loop step below, which
+        // instead just increments it by 1 each time a row ends at a real
+        // newline (M137).
+        let mut line0 = buffer.text.line_number(*window_start) - 1;
         while row < text_rows {
-            let next = next_row_start(buffer, p, cols, inv);
-            let row_end = next.unwrap_or(buffer.text.len() + 1);
+            let next = next_row_start_ex(buffer, p, cols, inv);
+            let row_end = next.map(|(p, _)| p).unwrap_or(buffer.text.len() + 1);
             if point < row_end || (next.is_none() && point <= buffer.text.len()) {
                 fits = true;
                 break;
             }
-            match next {
-                Some(n) => {
+            match apply_row_advance(next, &mut line0, block_rows) {
+                Some((n, rows)) => {
                     p = n;
-                    row += 1;
+                    row += rows;
                 }
                 None => break,
             }
@@ -1401,11 +1473,21 @@ fn recenter(
     cols: usize,
     text_rows: usize,
     inv: &[(usize, usize)],
+    block_rows: &std::collections::HashMap<usize, usize>,
 ) {
     let half = (text_rows / 2).max(1);
     *window_start = backward_n_lines(buffer, point, half);
     let guard = 2 * text_rows + 4;
-    if scan_forward_for_point(buffer, point, window_start, cols, text_rows, inv, guard) {
+    if scan_forward_for_point(
+        buffer,
+        point,
+        window_start,
+        cols,
+        text_rows,
+        inv,
+        guard,
+        block_rows,
+    ) {
         return;
     }
     let line_start = buffer.text.line_start(point);
@@ -1442,6 +1524,16 @@ fn backward_n_lines(buffer: &Buffer, pos: usize, n: usize) -> usize {
 /// all: correct in every case, including point sitting deep inside one
 /// giant wrapped logical line, and its cost scales with how far into
 /// that line point is — not with the size of the rest of the buffer.
+///
+/// M137: this function needs no `block_rows` parameter, unlike
+/// `scan_forward_for_point`/`recenter`. Its only caller passes
+/// `start == line_start(point)` (see `recenter`'s fallback above), so
+/// every row this walks lies strictly inside point's own logical line —
+/// and M87 stage 3's block rows are drawn only *after* a line ends
+/// (`emit_block_rows` fires on the `'\n'` branch and the buffer-end
+/// branch of the draw loop, never mid-line), so none of the rows counted
+/// here can be a block row. Do not "fix" this by threading block_rows
+/// through anyway.
 fn exact_rows_before_point(
     buffer: &Buffer,
     start: usize,
@@ -1475,6 +1567,612 @@ fn exact_rows_before_point(
     // The oldest entry still in the ring is exactly `keep` rows before
     // point's row, or `start` itself if point's row is closer than that.
     *ring.front().unwrap_or(&start)
+}
+
+/// M138: the `display-line-numbers` gutter-width rule, pulled out of
+/// `render_window` so `window_text_geometry` below can compute the exact
+/// same text-column count a paging command needs without duplicating it.
+/// `buffer_var_on` (not `var_on`) because the variable is commonly
+/// buffer-local (M24).
+pub(crate) fn gutter_width(
+    interp: &Interp,
+    editor: &Editor,
+    buf: &Rc<RefCell<Buffer>>,
+    rect_width: usize,
+) -> usize {
+    let mut gutter_w = if buffer_var_on(interp, editor, buf, "display-line-numbers") {
+        // total_lines() is O(1) (M24: incrementally maintained newline
+        // count), so this is cheap even on a huge buffer — but it's still
+        // only computed when the gutter is actually shown.
+        let total_lines = buf.borrow().text.total_lines();
+        let digits = total_lines.to_string().len().max(2);
+        digits + 2 // number, diagnostic-dot column, space
+    } else {
+        0
+    };
+    if rect_width < gutter_w + 8 {
+        gutter_w = 0; // degenerate pane: give the text every column
+    }
+    gutter_w
+}
+
+/// M138: `(text columns, text rows, gutter width)` for `win_id`, the same
+/// geometry `render_window` paints with -- factored out so
+/// `window-text-height` and the viewport ops below can never disagree
+/// with what's actually on screen. `None` when `win_id` names no live
+/// window or the pane is too small to paint at all (mirrors
+/// `render_window`'s own early return).
+pub(crate) fn window_text_geometry(
+    interp: &Interp,
+    editor: &Editor,
+    win_id: usize,
+) -> Option<(usize, usize, usize)> {
+    let rects = window_rects(editor);
+    let (_, rect) = rects.into_iter().find(|(id, _)| *id == win_id)?;
+    if rect.height < 2 || rect.width == 0 {
+        return None;
+    }
+    let text_rows = rect.height - 1;
+    let buf = editor.windows.get(&win_id)?.buffer.clone();
+    let gutter_w = gutter_width(interp, editor, &buf, rect.width);
+    let cols = rect.width - gutter_w;
+    Some((cols, text_rows, gutter_w))
+}
+
+/// M138: group `diag_msgs` (M87 stage 3's per-line inline-diagnostic
+/// messages) into a count of M87 stage 3 block rows per 0-based buffer
+/// line, using the SAME `block_row_lines` the draw loop iterates --
+/// shared by `render_window` and `diag_block_rows` below so the row-
+/// counting scan used by paging and the actual draw loop can never
+/// disagree about how many rows a line's diagnostics consume.
+fn block_rows_from_diag_msgs(
+    diag_msgs: &HashMap<usize, Vec<(u8, String)>>,
+) -> HashMap<usize, usize> {
+    diag_msgs
+        .iter()
+        .filter_map(|(line, diags)| {
+            let n = block_row_lines(diags).len();
+            (n > 0).then_some((*line, n))
+        })
+        .collect()
+}
+
+/// M138: `render_window`'s `block_rows_per_line` computation, rebuilt from
+/// `editor.diagnostics` for a caller (a viewport op) that doesn't already
+/// have `diag_msgs` lying around. Empty (and cheap) when
+/// `inline-diagnostics` is off, matching `render_window`'s own gate.
+pub(crate) fn diag_block_rows(
+    interp: &Interp,
+    editor: &Editor,
+    buf: &Rc<RefCell<Buffer>>,
+) -> HashMap<usize, usize> {
+    if !var_on(interp, "inline-diagnostics") {
+        return HashMap::new();
+    }
+    let raw_diags: Vec<(usize, u8, String)> = editor
+        .diagnostics
+        .get(&(Rc::as_ptr(buf) as usize))
+        .cloned()
+        .unwrap_or_default();
+    let mut diag_msgs: HashMap<usize, Vec<(u8, String)>> = HashMap::new();
+    for (line, sev, msg) in raw_diags {
+        diag_msgs.entry(line).or_default().push((sev, msg));
+    }
+    block_rows_from_diag_msgs(&diag_msgs)
+}
+
+/// M138: advance one visual row from a row start, given the `next_row_start_ex`
+/// result already computed for it, returning `(next row start, visual rows
+/// this step consumed)` and bumping `*line0` when the row ended at a real
+/// newline. `None` at end of buffer. This is the ONE place that turns "a row
+/// ended" into "how many visual rows that was" (1, or 1 + that line's block
+/// rows) -- `scan_forward_for_point` and `RowCtx::rows_forward`/
+/// `rows_between` all call this so M137's point-follow row counting and
+/// M138's paging row counting cannot drift apart (the mutation-testing focus
+/// point of this milestone).
+fn apply_row_advance(
+    next: Option<(usize, bool)>,
+    line0: &mut usize,
+    block_rows: &HashMap<usize, usize>,
+) -> Option<(usize, usize)> {
+    let (p, at_newline) = next?;
+    if at_newline {
+        let rows = 1 + block_rows.get(line0).copied().unwrap_or(0);
+        *line0 += 1;
+        Some((p, rows))
+    } else {
+        Some((p, 1))
+    }
+}
+
+/// M138: the read-only context a viewport operation needs to walk visual
+/// rows -- the same three inputs `render_window` threads through
+/// `ensure_point_visible`/`scan_forward_for_point`/`recenter`
+/// (`cols`, `invisible_ranges`, and M137's per-line block-row counts),
+/// bundled so `window-start`/`scroll-up-command`/`recenter` etc. can share
+/// one row-walking implementation with the draw loop instead of a second
+/// copy.
+pub(crate) struct RowCtx {
+    cols: usize,
+    inv: Vec<(usize, usize)>,
+    block_rows: HashMap<usize, usize>,
+}
+
+impl RowCtx {
+    pub(crate) fn for_window(
+        interp: &Interp,
+        editor: &Editor,
+        win_id: usize,
+        buf: &Rc<RefCell<Buffer>>,
+    ) -> RowCtx {
+        // `window_text_geometry` was already resolved by the caller (via
+        // `window_snapshot`) to even get this far, so falling back to
+        // `usize::MAX` (effectively "never wrap") on a re-lookup failure
+        // here is purely defensive -- it should not be reachable in
+        // practice.
+        let cols = window_text_geometry(interp, editor, win_id)
+            .map(|g| g.0)
+            .unwrap_or(usize::MAX);
+        let inv = invisible_ranges(interp, &buf.borrow());
+        let block_rows = diag_block_rows(interp, editor, buf);
+        RowCtx {
+            cols,
+            inv,
+            block_rows,
+        }
+    }
+
+    /// Start of the visual row containing `pos`.
+    pub(crate) fn row_start(&self, b: &Buffer, pos: usize) -> usize {
+        let mut p = b.text.line_start(pos);
+        loop {
+            match next_row_start_ex(b, p, self.cols, &self.inv) {
+                Some((next, _)) => {
+                    if pos < next {
+                        return p;
+                    }
+                    p = next;
+                }
+                None => return p,
+            }
+        }
+    }
+
+    /// The start of the row `n` visual rows after the row starting at
+    /// `start`, counting M137 block rows exactly as `scan_forward_for_point`
+    /// does -- see `apply_row_advance`. `None` if the walk runs off the end
+    /// of the buffer before reaching `n`. `n == 0` returns `start`.
+    pub(crate) fn rows_forward(&self, b: &Buffer, start: usize, n: usize) -> Option<usize> {
+        if n == 0 {
+            return Some(start);
+        }
+        let mut p = start;
+        let mut consumed = 0usize;
+        let mut line0 = b.text.line_number(start).saturating_sub(1);
+        loop {
+            let next = next_row_start_ex(b, p, self.cols, &self.inv);
+            let (np, rows) = apply_row_advance(next, &mut line0, &self.block_rows)?;
+            p = np;
+            consumed += rows;
+            if consumed >= n {
+                return Some(p);
+            }
+        }
+    }
+
+    /// The start of the row `n` visual rows before `start`, clamped to 0.
+    /// Steps back one *logical* line at a time (block rows belong to the
+    /// line above them, so a line's row count includes its own block
+    /// rows), then walks forward from the found line start by the
+    /// surplus once enough rows have been accumulated.
+    pub(crate) fn rows_backward(&self, b: &Buffer, start: usize, n: usize) -> usize {
+        if n == 0 {
+            return start;
+        }
+        // `start` may itself be a wrap-continuation row, not its logical
+        // line's own start (fix round 1, M138): count how many rows of
+        // THIS line lie between the line start and `start` first, so
+        // those rows aren't silently skipped. Only once `n` reaches past
+        // them does the previous-lines loop below kick in.
+        let line_start = b.text.line_start(start);
+        let within = self.rows_between(b, line_start, start);
+        if n <= within {
+            return self
+                .rows_forward(b, line_start, within - n)
+                .unwrap_or(line_start);
+        }
+        let mut remaining = n - within;
+        let mut cur_line_start = line_start;
+        loop {
+            if cur_line_start == 0 {
+                return 0;
+            }
+            let prev_line_start = b.text.line_start(cur_line_start - 1);
+            let prev_line0 = b.text.line_number(prev_line_start).saturating_sub(1);
+            let wrap_rows = self.line_wrap_rows(b, prev_line_start);
+            let block = self.block_rows.get(&prev_line0).copied().unwrap_or(0);
+            let total = wrap_rows + block;
+            if total >= remaining {
+                let surplus = total - remaining;
+                return self
+                    .rows_forward(b, prev_line_start, surplus)
+                    .unwrap_or(prev_line_start);
+            }
+            remaining -= total;
+            cur_line_start = prev_line_start;
+        }
+    }
+
+    /// Number of visual rows this logical line (starting at `line_start`)
+    /// occupies from wrapping alone -- NOT counting its block rows (the
+    /// caller adds those separately, since they're keyed by 0-based line
+    /// number, not by position).
+    fn line_wrap_rows(&self, b: &Buffer, line_start: usize) -> usize {
+        let mut p = line_start;
+        let mut rows = 0usize;
+        loop {
+            match next_row_start_ex(b, p, self.cols, &self.inv) {
+                Some((_, true)) => return rows + 1,
+                Some((np, false)) => {
+                    rows += 1;
+                    p = np;
+                }
+                None => return rows + 1,
+            }
+        }
+    }
+
+    /// Number of visual rows from the row starting at `start` to the row
+    /// containing `pos` (0 when `pos` is on that same row), counting block
+    /// rows in between -- shares `apply_row_advance`'s "does this row
+    /// contain `pos`" test with `scan_forward_for_point`.
+    pub(crate) fn rows_between(&self, b: &Buffer, start: usize, pos: usize) -> usize {
+        let mut p = start;
+        let mut count = 0usize;
+        let mut line0 = b.text.line_number(start).saturating_sub(1);
+        loop {
+            let next = next_row_start_ex(b, p, self.cols, &self.inv);
+            let row_end = next.map(|(n, _)| n).unwrap_or(b.text.len() + 1);
+            if pos < row_end || (next.is_none() && pos <= b.text.len()) {
+                return count;
+            }
+            match apply_row_advance(next, &mut line0, &self.block_rows) {
+                Some((np, rows)) => {
+                    p = np;
+                    count += rows;
+                }
+                None => return count,
+            }
+        }
+    }
+
+    /// The start of the visual row containing `point-max`.
+    pub(crate) fn eob_row_start(&self, b: &Buffer) -> usize {
+        self.row_start(b, b.text.len())
+    }
+}
+
+/// M138: `(window_start, point, is_selected, buffer, text_rows)` for
+/// `win_id` -- every viewport op below needs the same handful of facts
+/// about a window before it can walk rows, mirroring the split
+/// `render_window` already makes between the selected window's live
+/// buffer point and a background window's saved `win.point`
+/// (`render_window`'s `is_selected` branch). `None` when `win_id` names no
+/// live window or its pane is too small to paint (mirrors
+/// `window_text_geometry`).
+/// `(window_start, point, is_selected, buffer, text_rows)`.
+type WindowSnapshot = (usize, usize, bool, Rc<RefCell<Buffer>>, usize);
+
+fn window_snapshot(interp: &Interp, editor: &Editor, win_id: usize) -> Option<WindowSnapshot> {
+    let win = editor.windows.get(&win_id)?;
+    let buf = win.buffer.clone();
+    let is_selected = win_id == editor.selected_window;
+    let point = window_point(editor, win_id)?;
+    let (_, text_rows, _) = window_text_geometry(interp, editor, win_id)?;
+    Some((win.window_start, point, is_selected, buf, text_rows))
+}
+
+/// The point GNU would use for `win_id` when none is given explicitly --
+/// the live buffer point for the selected window, the saved `win.point`
+/// otherwise (mirrors `render_window`'s own `is_selected` split). Shared
+/// by `window_snapshot` and `pos-visible-in-window-p`'s nil-POS default
+/// (fix round item 4) so the two can't drift apart on which window's
+/// point a nil POS/WINDOW combination means.
+pub(crate) fn window_point(editor: &Editor, win_id: usize) -> Option<usize> {
+    let win = editor.windows.get(&win_id)?;
+    Some(if win_id == editor.selected_window {
+        win.buffer.borrow().point
+    } else {
+        win.point
+    })
+}
+
+/// Whether `pos` falls within the `text_rows` visible rows starting at
+/// `start`. Shared by `pos_visible` and `set_window_start`'s own
+/// visibility check (fix round item 8) so the two definitions of
+/// "visible" can't drift apart.
+fn row_visible(ctx: &RowCtx, b: &Buffer, start: usize, pos: usize, text_rows: usize) -> bool {
+    pos >= start && ctx.rows_between(b, start, pos) < text_rows
+}
+
+/// M138: write a viewport op's result back -- `window_start`, and `point`
+/// (into the buffer when `win_id` is selected, into the saved `win.point`
+/// otherwise, same split as `window_snapshot`), and pin the scroll so the
+/// very next `render_window` doesn't immediately recentre it back out from
+/// under the op (`Window::scroll_pin`'s doc; the same failure mode
+/// `scroll_window_start`'s own doc comment describes for mouse-wheel
+/// scrolling).
+fn apply_viewport_move(
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    is_selected: bool,
+    new_start: usize,
+    new_point: usize,
+) {
+    apply_viewport_move_pinned(ed, win_id, is_selected, new_start, new_point, true)
+}
+
+/// Fix round (item 2): `set-window-start`'s NOFORCE non-nil must set
+/// `window_start` WITHOUT pinning it -- otherwise the pin would keep the
+/// window exactly there even though point never followed it, permanently
+/// defeating `ensure_point_visible`'s job of recentring back onto point
+/// on the very next render (GNU's own "redisplay may choose a different
+/// start" wording for NOFORCE).
+fn apply_viewport_move_pinned(
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    is_selected: bool,
+    new_start: usize,
+    new_point: usize,
+    set_pin: bool,
+) {
+    let mut editor = ed.borrow_mut();
+    if is_selected {
+        if let Some(win) = editor.windows.get(&win_id) {
+            let buf = win.buffer.clone();
+            buf.borrow_mut().point = new_point;
+        }
+    }
+    if let Some(win) = editor.windows.get_mut(&win_id) {
+        win.window_start = new_start;
+        if !is_selected {
+            win.point = new_point;
+        }
+        win.scroll_pin = if set_pin { Some(new_point) } else { None };
+    }
+}
+
+/// M138: `scroll-up-command`/`scroll-down-command`'s two failure modes,
+/// mapped 1:1 onto GNU's `end-of-buffer`/`beginning-of-buffer` error
+/// symbols by the `(scroll-up-command ...)` builtin (builtins/ui.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollError {
+    EndOfBuffer,
+    BeginningOfBuffer,
+}
+
+/// M138 `(set-window-start WINDOW POS &optional NOFORCE)`: move
+/// `win_id`'s `window_start` to the visual row containing `pos`. When
+/// `move_point` and point would then be off-screen, moves point to the
+/// start of the row `text_rows / 2` rows below the new start -- measured
+/// against GNU Emacs 30.2 (`dev/gnu-scroll/`, h=21): start at line 1 with
+/// point on line 41 lands point on line 11; start at line 50 with point on
+/// line 1 lands point on line 60. Both are "the middle row", regardless of
+/// which direction point had to move.
+/// `move_point`: GNU's NOFORCE, inverted (`move_point == NOFORCE nil`).
+/// When true, point is forced onto the new visible region exactly as
+/// before, and the move is pinned (`Window::scroll_pin`'s doc) so it
+/// survives the next render. When false (NOFORCE non-nil, fix round item
+/// 2), point is left untouched and NOT pinned -- GNU's own words for
+/// NOFORCE are "redisplay may choose a different start", which here means
+/// the very next `ensure_point_visible` is free to recentre back onto
+/// point if `pos` left it off-screen.
+pub(crate) fn set_window_start(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    pos: usize,
+    move_point: bool,
+) {
+    let Some((_, point, is_selected, buf, text_rows)) =
+        window_snapshot(interp, &ed.borrow(), win_id)
+    else {
+        return;
+    };
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    let new_start = ctx.row_start(&b, pos);
+    let mut new_point = point;
+    if move_point {
+        let visible = row_visible(&ctx, &b, new_start, point, text_rows);
+        if !visible {
+            let mid = text_rows / 2;
+            new_point = ctx
+                .rows_forward(&b, new_start, mid)
+                .unwrap_or_else(|| ctx.eob_row_start(&b));
+        }
+    }
+    drop(b);
+    apply_viewport_move_pinned(ed, win_id, is_selected, new_start, new_point, move_point);
+}
+
+/// M138 `(pos-visible-in-window-p POS WINDOW)`: whether `pos` currently
+/// falls within `win_id`'s `text_rows` visible rows.
+pub(crate) fn pos_visible(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    pos: usize,
+) -> bool {
+    let Some((window_start, _, _, buf, text_rows)) = window_snapshot(interp, &ed.borrow(), win_id)
+    else {
+        return false;
+    };
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    row_visible(&ctx, &b, window_start, pos, text_rows)
+}
+
+/// M138 `(scroll-up-command ARG)` (`C-v`, `<next>`): scroll forward
+/// `ARG` visual rows, or `text_rows - next-screen-context-lines` when
+/// `ARG` is nil (clamped to at least 1). Negative `ARG` defers to
+/// `scroll_down`. Signals `ScrollError::EndOfBuffer` and changes nothing
+/// when the target row would be at or past `point-max` -- measured
+/// against GNU Emacs 30.2 (`dev/gnu-scroll/`, 100-line buffer + trailing
+/// newline, h=21): scrolling from window-start line 81 reaches line 100
+/// (allowed); from 82 or 83 it signals; a `C-v` loop from the top visits
+/// lines 20, 39, 58, 77, 96 and then signals on every further press.
+pub(crate) fn scroll_up(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    arg: Option<i64>,
+) -> Result<(), ScrollError> {
+    if let Some(a) = arg {
+        if a < 0 {
+            return scroll_down(interp, ed, win_id, Some(-a));
+        }
+    }
+    let Some((window_start, point, is_selected, buf, text_rows)) =
+        window_snapshot(interp, &ed.borrow(), win_id)
+    else {
+        return Ok(());
+    };
+    let n = match arg {
+        Some(a) => a as usize,
+        None => {
+            let ctx_lines = var_int(interp, "next-screen-context-lines", 2);
+            ((text_rows as i64) - ctx_lines).max(1) as usize
+        }
+    };
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    let point_max = b.text.len();
+    let target = ctx.rows_forward(&b, window_start, n);
+    let new_start = match target {
+        Some(t) if t < point_max => t,
+        _ => return Err(ScrollError::EndOfBuffer),
+    };
+    let mut new_point = point;
+    if new_point < new_start {
+        new_point = new_start;
+    } else if ctx.rows_between(&b, new_start, new_point) >= text_rows {
+        new_point = ctx
+            .rows_forward(&b, new_start, text_rows.saturating_sub(1))
+            .unwrap_or_else(|| ctx.eob_row_start(&b));
+    }
+    drop(b);
+    apply_viewport_move(ed, win_id, is_selected, new_start, new_point);
+    Ok(())
+}
+
+/// M138 `(scroll-down-command ARG)` (`M-v`, `<prior>`): scroll backward
+/// `ARG` visual rows (default as in `scroll_up`). Negative `ARG` defers to
+/// `scroll_up`. Signals `ScrollError::BeginningOfBuffer` and changes
+/// nothing when `window_start` is already 0.
+pub(crate) fn scroll_down(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    arg: Option<i64>,
+) -> Result<(), ScrollError> {
+    if let Some(a) = arg {
+        if a < 0 {
+            return scroll_up(interp, ed, win_id, Some(-a));
+        }
+    }
+    let Some((window_start, point, is_selected, buf, text_rows)) =
+        window_snapshot(interp, &ed.borrow(), win_id)
+    else {
+        return Ok(());
+    };
+    if window_start == 0 {
+        return Err(ScrollError::BeginningOfBuffer);
+    }
+    let n = match arg {
+        Some(a) => a as usize,
+        None => {
+            let ctx_lines = var_int(interp, "next-screen-context-lines", 2);
+            ((text_rows as i64) - ctx_lines).max(1) as usize
+        }
+    };
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    let new_start = ctx.rows_backward(&b, window_start, n);
+    let mut new_point = point;
+    if ctx.rows_between(&b, new_start, new_point) >= text_rows {
+        new_point = ctx
+            .rows_forward(&b, new_start, text_rows.saturating_sub(1))
+            .unwrap_or_else(|| ctx.eob_row_start(&b));
+    } else if new_point < new_start {
+        new_point = new_start;
+    }
+    drop(b);
+    apply_viewport_move(ed, win_id, is_selected, new_start, new_point);
+    Ok(())
+}
+
+/// M138 `(recenter ARG)` (`C-l`'s underlying primitive): put point `ARG`
+/// rows below the top of the window (nil = middle, negative counts up
+/// from the bottom, exactly as GNU's `recenter`). Measured against GNU
+/// Emacs 30.2 (`dev/gnu-scroll/`, h=21, point on line 50): `(recenter)` ->
+/// 40, `(recenter 0)` -> 50, `(recenter -1)` -> 30, `(recenter 3)` -> 47,
+/// `(recenter -3)` -> 32, `(recenter 25)` -> 30 (clamped to the bottom
+/// row), `(recenter -25)` -> 40 (falls back to the middle).
+pub(crate) fn recenter_window(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    arg: Option<i64>,
+) {
+    let Some((_, point, is_selected, buf, text_rows)) =
+        window_snapshot(interp, &ed.borrow(), win_id)
+    else {
+        return;
+    };
+    let h = text_rows as i64;
+    let rows_above = match arg {
+        None => h / 2,
+        Some(a) if a >= 0 => a.min(h - 1),
+        Some(a) => {
+            if -a <= h {
+                h + a
+            } else {
+                h / 2
+            }
+        }
+    }
+    .max(0) as usize;
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    let point_row_start = ctx.row_start(&b, point);
+    let new_start = ctx.rows_backward(&b, point_row_start, rows_above);
+    drop(b);
+    apply_viewport_move(ed, win_id, is_selected, new_start, point);
+}
+
+/// M139 `(window-row-start N &optional WINDOW)`: the position of the row
+/// `N` visual rows from `win_id`'s `window_start` (negative = above),
+/// clamped to the last row when the walk would run off the end of the
+/// buffer and to row 0 when it would go past the top (`rows_backward`
+/// already clamps there). Backs evil's `C-f`/`C-b`/`C-e`/`C-y`/`C-d`/`C-u`
+/// family (M139), which all need "the position N rows below/above the
+/// start" without moving point the way `scroll-up-command` does.
+pub(crate) fn window_row_start(
+    interp: &Interp,
+    ed: &Rc<RefCell<Editor>>,
+    win_id: usize,
+    n: i64,
+) -> Option<usize> {
+    let (window_start, _, _, buf, _) = window_snapshot(interp, &ed.borrow(), win_id)?;
+    let ctx = RowCtx::for_window(interp, &ed.borrow(), win_id, &buf);
+    let b = buf.borrow();
+    Some(if n >= 0 {
+        ctx.rows_forward(&b, window_start, n as usize)
+            .unwrap_or_else(|| ctx.eob_row_start(&b))
+    } else {
+        ctx.rows_backward(&b, window_start, (-n) as usize)
+    })
 }
 
 /// A screen-cell rectangle: one window pane's slice of the frame, or the
@@ -2020,6 +2718,34 @@ fn diag_message_lines(msg: &str) -> Vec<String> {
     lines
 }
 
+/// Pure shaping for one buffer line's diagnostic block rows: applies the
+/// same two skip rules `emit_block_rows` draws by (M87 stage 3, F5/F6) --
+/// a message whose `trim()` is empty is dropped entirely, and after
+/// `diag_message_lines` splits a message, any resulting line whose
+/// `trim()` is empty is dropped too -- and returns the `(severity,
+/// line_text)` rows that would actually be drawn, in the order they'd be
+/// drawn. Factored out so the draw loop (`emit_block_rows`) and the row
+/// count used for point-follow (`block_rows_per_line` in `render_window`)
+/// walk the exact same list and cannot drift apart; this is used for
+/// budgeting text_rows in redisplay's row-counting code before any window
+/// width/truncation is known, so it does not need `cols`, unlike
+/// `emit_block_rows`.
+fn block_row_lines(diags: &[(u8, String)]) -> Vec<(u8, String)> {
+    let mut out = Vec::new();
+    for (sev, msg) in diags {
+        if msg.trim().is_empty() {
+            continue;
+        }
+        for line_text in diag_message_lines(msg) {
+            if line_text.trim().is_empty() {
+                continue;
+            }
+            out.push((*sev, line_text));
+        }
+    }
+    out
+}
+
 /// Truncate one diagnostic block row's (already-sanitized) text to at
 /// most `budget` display columns, dropping from the *tail* and suffixing
 /// `ML_ELLIPSIS` -- the opposite direction from `ml_truncate_head`
@@ -2073,10 +2799,11 @@ fn render_window(
     is_selected: bool,
     grid: &mut Grid,
 ) -> Option<(WindowLayout, Option<(usize, usize)>)> {
-    if rect.height < 2 || rect.width == 0 {
-        return None;
-    }
-    let text_rows = rect.height - 1;
+    // Fix round item 8: the same height/width guard, `text_rows`
+    // derivation, and gutter-width rule `window_text_geometry` computes
+    // -- routed through it instead of two separate inline copies (one
+    // here, one further down) so they can't drift apart.
+    let (cols, text_rows, gutter_w) = window_text_geometry(interp, editor, win_id)?;
 
     let buf = editor.windows.get(&win_id)?.buffer.clone();
     let point = if is_selected {
@@ -2127,20 +2854,6 @@ fn render_window(
     // buffer-local (M24: prog-mode-hook turns it on per-buffer), so this
     // must read it as seen by `buf` — the window being painted here may
     // not be the currently-selected one.
-    let mut gutter_w = if buffer_var_on(interp, editor, &buf, "display-line-numbers") {
-        // total_lines() is O(1) (M24: incrementally maintained newline
-        // count), so this is cheap even on a huge buffer — but it's still
-        // only computed when the gutter is actually shown.
-        let total_lines = buf.borrow().text.total_lines();
-        let digits = total_lines.to_string().len().max(2);
-        digits + 2 // number, diagnostic-dot column, space
-    } else {
-        0
-    };
-    if rect.width < gutter_w + 8 {
-        gutter_w = 0; // degenerate pane: give the text every column
-    }
-    let cols = rect.width - gutter_w;
     let raw_diags: Vec<(usize, u8, String)> = editor
         .diagnostics
         .get(&(Rc::as_ptr(&buf) as usize))
@@ -2169,6 +2882,14 @@ fn render_window(
     } else {
         std::collections::HashMap::new()
     };
+    // Per-line block-row counts, shaped by the exact same `block_row_lines`
+    // the draw loop (`emit_block_rows`) iterates -- fed to
+    // `ensure_point_visible` below so the row-counting scan and the draw
+    // loop cannot disagree about how many rows a line's diagnostics
+    // consume (M137). Only non-zero counts are stored; empty when
+    // `inline-diagnostics` is nil, since `diag_msgs` is already empty
+    // then.
+    let block_rows_per_line: HashMap<usize, usize> = block_rows_from_diag_msgs(&diag_msgs);
     let ln_face = face_or(
         interp,
         editor,
@@ -2204,7 +2925,15 @@ fn render_window(
     } else {
         editor.windows.get_mut(&win_id).unwrap().scroll_pin = None;
         let b = buf.borrow();
-        ensure_point_visible(&b, point, &mut window_start, cols, text_rows, &inv);
+        ensure_point_visible(
+            &b,
+            point,
+            &mut window_start,
+            cols,
+            text_rows,
+            &inv,
+            &block_rows_per_line,
+        );
     }
     editor.windows.get_mut(&win_id).unwrap().window_start = window_start;
 
@@ -2314,72 +3043,54 @@ fn render_window(
         };
         let prefix = "  \u{258f} ";
         let prefix_w = ml_width(prefix);
-        'outer: for (sev, msg) in diags {
-            // An empty message (the pre-stage-3 `(LINE . SEVERITY)` shape,
-            // still accepted for backward compatibility -- see
-            // `lsp--set-buffer-diagnostics`'s doc) has nothing to show;
-            // skip it rather than drawing a blank row that would still
-            // eat into the window's text-row budget for no visible
-            // reason.
-            if msg.trim().is_empty() {
-                continue;
+        // The skip rules (an empty message; a blank interior line of a
+        // multi-line message, F6) live in `block_row_lines` now, shared
+        // with the row-counting code in `render_window` that feeds
+        // `ensure_point_visible` -- see its doc for why this must not be
+        // reimplemented here.
+        for (sev, line_text) in block_row_lines(diags) {
+            if *row + 1 >= text_rows {
+                break;
             }
-            for line_text in diag_message_lines(msg) {
-                // F6 (M87 stage 3 fix round): a blank *interior* line of
-                // a multi-line message (e.g. "real text\n   \n") must be
-                // skipped the same way a wholly blank message already is
-                // above -- otherwise it becomes a row with nothing but
-                // the "  \u{258f} " prefix. Checked post-split so this
-                // still applies per rendered line, not just to the whole
-                // message; a capped-and-ellipsized 3rd line is never
-                // blank (it always ends in ML_ELLIPSIS), so this can't
-                // accidentally eat that one.
-                if line_text.trim().is_empty() {
-                    continue;
+            *row += 1;
+            let r = rect.row + *row;
+            grid.row_scale[r] = 75;
+            grid.row_kind[r] = RowKind::Block;
+            paint_gutter(grid, *row, None, gutter_w);
+            let color = severity_color(interp, editor, sev);
+            let style = Style {
+                fg: Some(color),
+                italic: true,
+                ..Style::default()
+            };
+            let budget = cols.saturating_sub(prefix_w);
+            let sanitized = ml_sanitize(&line_text);
+            let body = diag_truncate_tail(&sanitized, budget);
+            let text = format!("{prefix}{body}");
+            // F1 (M87 stage 3 fix round): no manual `grid.runs.push`
+            // here -- `fill_chrome_runs` (called once, after every
+            // window/popup/panel finishes painting) already turns
+            // every screen cell not claimed by a `src: Some(...)`
+            // buffer-text run into a same-style chrome run, same as
+            // the gutter/mode-line/echo text this block row's cells
+            // are otherwise indistinguishable from. A manual push
+            // here duplicated that: `fill_chrome_runs`'s `covered`
+            // check only looks at `r.src.is_some()`, so a `src: None`
+            // run pushed early is invisible to it and it synthesizes
+            // a second, byte-identical run over the same columns --
+            // every block row's text was shaped and drawn twice.
+            let mut c = 0usize;
+            for ch in text.chars() {
+                let w = wide_char_width(ch);
+                if tx + c + w > rect.col + rect.width {
+                    break;
                 }
-                if *row + 1 >= text_rows {
-                    break 'outer;
+                if w == 2 {
+                    grid.put_wide(r, tx + c, ch, style);
+                } else {
+                    grid.put(r, tx + c, ch, style);
                 }
-                *row += 1;
-                let r = rect.row + *row;
-                grid.row_scale[r] = 75;
-                grid.row_kind[r] = RowKind::Block;
-                paint_gutter(grid, *row, None, gutter_w);
-                let color = severity_color(interp, editor, *sev);
-                let style = Style {
-                    fg: Some(color),
-                    italic: true,
-                    ..Style::default()
-                };
-                let budget = cols.saturating_sub(prefix_w);
-                let sanitized = ml_sanitize(&line_text);
-                let body = diag_truncate_tail(&sanitized, budget);
-                let text = format!("{prefix}{body}");
-                // F1 (M87 stage 3 fix round): no manual `grid.runs.push`
-                // here -- `fill_chrome_runs` (called once, after every
-                // window/popup/panel finishes painting) already turns
-                // every screen cell not claimed by a `src: Some(...)`
-                // buffer-text run into a same-style chrome run, same as
-                // the gutter/mode-line/echo text this block row's cells
-                // are otherwise indistinguishable from. A manual push
-                // here duplicated that: `fill_chrome_runs`'s `covered`
-                // check only looks at `r.src.is_some()`, so a `src: None`
-                // run pushed early is invisible to it and it synthesizes
-                // a second, byte-identical run over the same columns --
-                // every block row's text was shaped and drawn twice.
-                let mut c = 0usize;
-                for ch in text.chars() {
-                    let w = wide_char_width(ch);
-                    if tx + c + w > rect.col + rect.width {
-                        break;
-                    }
-                    if w == 2 {
-                        grid.put_wide(r, tx + c, ch, style);
-                    } else {
-                        grid.put(r, tx + c, ch, style);
-                    }
-                    c += w;
-                }
+                c += w;
             }
         }
     };

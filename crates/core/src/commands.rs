@@ -929,6 +929,17 @@ fn self_insert(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, ch: char) {
         editor.this_command = Value::Nil;
         buf
     };
+    // M138: keep the elisp-visible `this-command`/`last-command` in sync
+    // with the Rust-side reset above -- self-insert doesn't go through
+    // `execute_command`, so without this a self-insert would leave stale
+    // values behind and `recenter-top-bottom` would wrongly think it was
+    // itself the previous command.
+    if let Some(id) = interp.intern_soft("last-command") {
+        interp.set_sym_value(id, Value::Nil);
+    }
+    if let Some(id) = interp.intern_soft("this-command") {
+        interp.set_sym_value(id, Value::Nil);
+    }
     let point = buf.borrow().point;
     crate::editor::edit_insert(ed, &buf, point, &ch.to_string());
     run_post_insert_hook(interp, ed, ch);
@@ -1115,6 +1126,16 @@ fn run_post_insert_hook(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, _ch: char
 }
 
 pub fn execute_command(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, cmd: Value) {
+    // M138: mirror the Rust-side `Editor::this_command` bookkeeping into
+    // the elisp global `this-command`, so `recenter-top-bottom` (simple.el)
+    // can tell "was I the previous command" the same way GNU Emacs's own
+    // `this-command`/`last-command` do. `execute_command` is the single
+    // place both the keymap-dispatch path (`dispatch_key`, below) and
+    // M-x (`builtins/ui.rs`'s `execute-extended-command`) funnel through,
+    // so this can't be missed by either caller.
+    if let Some(id) = interp.intern_soft("this-command") {
+        interp.set_sym_value(id, cmd.clone());
+    }
     {
         let mut editor = ed.borrow_mut();
         editor.this_command = cmd.clone();
@@ -1346,8 +1367,28 @@ fn call_command(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, cmd: &Value, args
 /// pending state from `post-command-hook`).
 fn finish_command(interp: &mut Interp, ed: &Rc<RefCell<Editor>>) {
     run_hook_by_name(interp, "post-command-hook");
+    // Fix round item 3: a command body may reassign the elisp variable
+    // `this-command` itself (e.g. `(setq this-command 'foo)`, the same
+    // idiom GNU uses to make a command masquerade as another for
+    // `last-command`-sensitive callers like `recenter-top-bottom`). That
+    // live value, when it's a symbol, must win over the Rust-side
+    // `editor.this_command` field frozen back in `execute_command` --
+    // otherwise the elisp-level override would be silently discarded
+    // right here.
+    let elisp_this_command = interp
+        .intern_soft("this-command")
+        .and_then(|id| interp.sym_value(id));
     let mut editor = ed.borrow_mut();
-    editor.last_command = editor.this_command.clone();
+    let this_command = match elisp_this_command {
+        Some(v @ Value::Sym(_)) => v,
+        _ => editor.this_command.clone(),
+    };
+    editor.last_command = this_command.clone();
+    // M138: elisp-visible counterpart of the Rust-side copy above -- see
+    // `execute_command`'s comment on why `this-command` is set there.
+    if let Some(id) = interp.intern_soft("last-command") {
+        interp.set_sym_value(id, this_command);
+    }
 }
 
 fn minibuffer_key(interp: &mut Interp, ed: &Rc<RefCell<Editor>>, key: Key) {

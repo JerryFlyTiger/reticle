@@ -1,0 +1,39 @@
+start                      w0=  1 cur=  1 w$= 23 scroll=11 so=0
+C-f #1                     w0= 22 cur= 22 w$= 44 scroll=11 so=0
+C-f #2                     w0= 43 cur= 43 w$= 65 scroll=11 so=0
+C-b #1                     w0= 22 cur= 44 w$= 44 scroll=11 so=0
+gg                         w0=  1 cur=  1 w$= 23 scroll=11 so=0
+C-b at top                 w0=  1 cur=  1 w$= 23 scroll=11 so=0
+G                          w0= 78 cur=100 w$=100 scroll=11 so=0
+C-f at end #1              w0=100 cur=100 w$=100 scroll=11 so=0
+C-f at end #2              w0=100 cur=100 w$=100 scroll=11 so=0
+C-e #1 (cur on top)        w0=  2 cur=  2 w$= 24 scroll=11 so=0
+C-e #2                     w0=  3 cur=  3 w$= 25 scroll=11 so=0
+3 C-e                      w0=  6 cur=  6 w$= 28 scroll=11 so=0
+C-y #1                     w0=  5 cur=  6 w$= 27 scroll=11 so=0
+10G                        w0=  5 cur= 10 w$= 27 scroll=11 so=0
+C-y cur mid                w0=  4 cur= 10 w$= 26 scroll=11 so=0
+C-y at top ws1             w0=  3 cur= 10 w$= 25 scroll=11 so=0
+C-d #1                     w0= 12 cur= 12 w$= 34 scroll=11 so=0
+C-d #2                     w0= 23 cur= 23 w$= 45 scroll=11 so=0
+C-u #1                     w0= 12 cur= 12 w$= 34 scroll=11 so=0
+5 C-d                      w0=  6 cur=  6 w$= 28 scroll=5 so=0
+C-d after 5C-d             w0= 11 cur= 11 w$= 33 scroll=5 so=0
+C-d at end                 w0= 78 cur=100 w$=100 scroll=11 so=0
+95G                        w0= 78 cur= 95 w$=100 scroll=11 so=0
+C-d near end               w0= 78 cur=100 w$=100 scroll=11 so=0
+C-u at top                 w0=  1 cur=  1 w$= 23 scroll=11 so=0
+C-u at 3G                  w0=  1 cur=  1 w$= 23 scroll=11 so=0
+50G                        w0= 39 cur= 50 w$= 61 scroll=11 so=0
+zz                         w0= 39 cur= 50 w$= 61 scroll=11 so=0
+zt                         w0= 50 cur= 50 w$= 72 scroll=11 so=0
+zb                         w0= 28 cur= 50 w$= 50 scroll=11 so=0
+z<CR>                      w0= 50 cur= 50 w$= 72 scroll=11 so=0
+z.                         w0= 39 cur= 50 w$= 61 scroll=11 so=0
+z-                         w0= 28 cur= 50 w$= 50 scroll=11 so=0
+zz at 3G                   w0=  1 cur=  3 w$= 23 scroll=11 so=0
+zb at 3G                   w0=  1 cur=  3 w$= 23 scroll=11 so=0
+zt at 98G                  w0= 98 cur= 98 w$=100 scroll=11 so=0
+zz at 98G                  w0= 87 cur= 98 w$=100 scroll=11 so=0
+30zt                       w0= 30 cur= 30 w$= 52 scroll=11 so=0
+20zz                       w0=  9 cur= 20 w$= 31 scroll=11 so=0

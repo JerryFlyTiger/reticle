@@ -96,7 +96,7 @@ while [ $i -lt 15 ]; do
         echo "error: the editor exited before a window appeared" >&2
         exit 1
     fi
-    INFO=$("$HELPER" reticle 2>/dev/null || true)
+    INFO=$("$HELPER" reticle "$APP" 2>/dev/null || true)
     [ -n "$INFO" ] && break
     sleep 1
     i=$((i + 1))

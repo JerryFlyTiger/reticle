@@ -295,6 +295,190 @@ fn merged_default_and_explicit_merged_symbol_agree() {
     });
 }
 
+/// M141: `Merged` mode must preserve the child's write order. Before the
+/// fix, stdout and stderr each got their own pipe and reader thread, and
+/// the two threads raced to push onto one channel -- nothing serialized
+/// them against each other, so interleaving was arrival order, not write
+/// order. This asserts the exact expected sequence for N alternating
+/// writes; see the milestone report for the pre-fix failure counts.
+#[test]
+fn merged_mode_preserves_write_order() {
+    with_interp(|i| {
+        eval(
+            i,
+            r#"(setq proc (start-shell-process "for i in $(seq 1 300); do echo o$i; echo e$i >&2; done" "."))"#,
+        );
+        let mut got = String::new();
+        let mut saw_exit = false;
+        // A deadline, not a fixed iteration count: under the full gate's
+        // parallel load a 600-line shell loop can outlast a few seconds
+        // (M135's false-red family), and running out still fails loudly
+        // below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let v = eval(i, "(shell-process-poll proc)");
+            match &v {
+                Value::Str(s) => got.push_str(s),
+                Value::Cons(_) => {
+                    let printed = prin1_to_string(i, &v);
+                    assert!(
+                        printed.starts_with("(exit ."),
+                        "unexpected cons in merged mode: {}",
+                        printed
+                    );
+                    saw_exit = true;
+                    break;
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_exit, "did not see exit within the poll budget");
+
+        let mut expected = String::new();
+        for n in 1..=300 {
+            expected.push_str(&format!("o{}\n", n));
+            expected.push_str(&format!("e{}\n", n));
+        }
+        if got != expected {
+            let got_lines: Vec<&str> = got.lines().collect();
+            let expected_lines: Vec<&str> = expected.lines().collect();
+            let mismatch = got_lines
+                .iter()
+                .zip(expected_lines.iter())
+                .position(|(a, b)| a != b);
+            let idx = mismatch.unwrap_or(got_lines.len().min(expected_lines.len()));
+            let lo = idx.saturating_sub(3);
+            let hi_got = (idx + 3).min(got_lines.len());
+            let hi_exp = (idx + 3).min(expected_lines.len());
+            panic!(
+                "output out of order at line {}: got {:?}, expected {:?}",
+                idx,
+                &got_lines[lo..hi_got],
+                &expected_lines[lo..hi_exp]
+            );
+        }
+    });
+}
+
+/// M141: `Separate` mode must NOT be affected by the single-pipe change
+/// to `Merged` mode -- stdout and stderr stay on their own pipes, so each
+/// accumulator must equal exactly its own lines in order.
+#[test]
+fn separate_mode_keeps_streams_independent_and_ordered() {
+    with_interp(|i| {
+        eval(
+            i,
+            r#"(setq proc (start-shell-process "for i in $(seq 1 300); do echo o$i; echo e$i >&2; done" "." nil 'separate))"#,
+        );
+        let mut stdout_acc = String::new();
+        let mut stderr_acc = String::new();
+        let mut saw_exit = false;
+        // Same deadline as `merged_mode_preserves_write_order`, for the
+        // same 600-line loop under the full gate's load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let v = eval(i, "(shell-process-poll proc)");
+            match &v {
+                Value::Nil => {}
+                Value::Cons(_) => {
+                    let tag = v.car();
+                    let val = v.cdr();
+                    let tag_name = match &tag {
+                        Value::Sym(s) => i.sym_name(*s).to_string(),
+                        _ => panic!("unexpected tag shape"),
+                    };
+                    match tag_name.as_str() {
+                        "stdout" => {
+                            if let Value::Str(s) = &val {
+                                stdout_acc.push_str(s);
+                            }
+                        }
+                        "stderr" => {
+                            if let Value::Str(s) = &val {
+                                stderr_acc.push_str(s);
+                            }
+                        }
+                        "exit" => {
+                            saw_exit = true;
+                        }
+                        other => panic!("unexpected tag in poll result: {}", other),
+                    }
+                    if saw_exit {
+                        break;
+                    }
+                }
+                other => panic!(
+                    "unexpected non-cons, non-nil poll result: {}",
+                    prin1_to_string(i, other)
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_exit, "did not see exit within the poll budget");
+
+        let mut expected_stdout = String::new();
+        let mut expected_stderr = String::new();
+        for n in 1..=300 {
+            expected_stdout.push_str(&format!("o{}\n", n));
+            expected_stderr.push_str(&format!("e{}\n", n));
+        }
+        assert_eq!(stdout_acc, expected_stdout);
+        assert_eq!(stderr_acc, expected_stderr);
+    });
+}
+
+/// M141: the single-pipe change must not break EOF accounting when the
+/// stdin writer thread is also present -- `cat` echoes stdin back on
+/// stdout while a stderr write happens too, and the process must still
+/// report exit exactly once with all output intact.
+#[test]
+fn merged_mode_with_stdin_reports_exit_and_full_output() {
+    with_interp(|i| {
+        let payload = "line one\nline two\nline three\n".to_string();
+        let id = i.intern("test-payload");
+        i.set_sym_value(id, Value::string(payload.clone()));
+        eval(
+            i,
+            r#"(setq proc (start-shell-process "cat; echo done >&2" "." test-payload))"#,
+        );
+        // Polled directly rather than through `poll_until_exit`, so the
+        // chunks are collected as raw strings: `cat` and `echo done` are two
+        // separate writes, a poll can land between them, and joining
+        // prin1-printed chunks would splice `""` into the text.
+        //
+        // What this guards is EOF accounting when the stdin writer thread
+        // exists alongside the single pipe: all output arrives and exit is
+        // reported. It is NOT an ordering test -- `cat; echo done` runs its
+        // two writes one after the other, so they could not race even on
+        // two pipes. `merged_mode_preserves_write_order` is the ordering
+        // test. Exit-exactly-once past the first exit is
+        // `exit_reported_exactly_once`'s job.
+        let mut got = String::new();
+        let mut exit = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let v = eval(i, "(shell-process-poll proc)");
+            match &v {
+                Value::Str(s) => got.push_str(s),
+                Value::Cons(_) => {
+                    exit = Some(prin1_to_string(i, &v));
+                    break;
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            exit.as_deref(),
+            Some("(exit . 0)"),
+            "no exit within the poll budget; output so far: {:?}",
+            got
+        );
+        assert_eq!(got, "line one\nline two\nline three\ndone\n");
+    });
+}
+
 #[test]
 fn invalid_streams_value_errors() {
     let out = run(r#"(start-shell-process "echo hi" "." nil 'nonsense)"#);

@@ -772,13 +772,7 @@ mod tests {
         // this frame has been rasterized) and asserts the baked UV now
         // agrees with the correctly-normalized one, even though 'M' was
         // collected while the atlas was still small.
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(home).join("Library/Fonts/JetBrainsMono-Regular.ttf");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
+        let bytes = crate::JETBRAINS_MONO_REGULAR.to_vec();
         let face = ab_glyph::FontArc::try_from_vec(bytes).expect("valid font file");
 
         let atlas = egui::epaint::mutex::Mutex::new(egui::epaint::TextureAtlas::new([1024, 64]));
@@ -880,18 +874,11 @@ mod tests {
     #[test]
     fn real_jetbrains_mono_shapes_plain_text_one_glyph_per_char() {
         // Uses the real font this milestone's measurement was taken
-        // against, if present on the machine running the test -- skips
-        // otherwise (this is the same "depends on what's installed"
-        // acknowledged gap `install_fonts` already documents).
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(home).join("Library/Fonts/JetBrainsMono-Regular.ttf");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
+        // against -- the same bytes `lib.rs` embeds into the shipped
+        // binary via `include_bytes!`, so this runs identically on every
+        // machine regardless of what is installed under `~/Library/Fonts`.
         let face = LoadedFont {
-            bytes: Arc::from(bytes.into_boxed_slice()),
+            bytes: Arc::from(crate::JETBRAINS_MONO_REGULAR),
             index: 0,
         };
         let shaped = shape_calt_only(&face, "assign a = b != c;", true);
@@ -901,15 +888,8 @@ mod tests {
 
     #[test]
     fn real_jetbrains_mono_ligature_glyph_ids_differ_from_plain_glyphs() {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(home).join("Library/Fonts/JetBrainsMono-Regular.ttf");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
         let face = LoadedFont {
-            bytes: Arc::from(bytes.into_boxed_slice()),
+            bytes: Arc::from(crate::JETBRAINS_MONO_REGULAR),
             index: 0,
         };
         // "a = b" must NOT substitute (no `=>`/`!=` pattern); "a => b"
@@ -931,15 +911,8 @@ mod tests {
         // monospace font's `.notdef` plausibly carries the same advance
         // as every other glyph, so this run would have passed and drawn
         // a tofu box. It must now fall back instead.
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(home).join("Library/Fonts/JetBrainsMono-Regular.ttf");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return;
-        };
         let face = LoadedFont {
-            bytes: Arc::from(bytes.into_boxed_slice()),
+            bytes: Arc::from(crate::JETBRAINS_MONO_REGULAR),
             index: 0,
         };
         let shaped = shape_calt_only(&face, "a\u{E000}b", true);

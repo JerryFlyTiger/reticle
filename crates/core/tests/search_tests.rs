@@ -14,9 +14,14 @@
 //! for a fake compiler) so the suite doesn't depend on a real engine
 //! being installed. A handful of tests genuinely need real `rg` (real
 //! regex-engine behavior, or real command-not-found/bad-regex exit
-//! codes, can't be faked by a canned-output generator) and skip
-//! themselves if `rg` isn't on PATH -- same precedent this codebase
-//! already has for `verible-verilog-ls` (see CLAUDE.md).
+//! codes, can't be faked by a canned-output generator). **M145: those
+//! tests FAIL, not skip, when `rg` isn't on PATH**, by default -- an
+//! earlier version silently `eprintln!`+`return`ed, but `cargo test
+//! --workspace --no-fail-fast` (this project's own definition of done,
+//! no `--nocapture`) discards a passing test's stdout/stderr, so a
+//! green gate could mean none of them ever ran. Set
+//! `RETICLE_ALLOW_MISSING_RG=1` to deliberately opt out on a machine
+//! that genuinely lacks `rg`. See `require_tool`'s own doc comment.
 //!
 //! Fix round R1 (independent cold-read review, post-M82): F1-F7 below
 //! are new coverage/behavior added in this round; the file header
@@ -621,15 +626,13 @@ fn starting_second_search_kills_first() {
 
 // --- 11. Real-rg end-to-end, skipped if rg isn't on PATH ------------------
 
+// `_if_available` in this name predates M145: before this milestone the
+// test skipped itself when `rg` was absent; it now FAILS by default
+// instead (see `require_tool`'s doc comment near `has_rg`/`require_rg`
+// below), unless `RETICLE_ALLOW_MISSING_RG` is set.
 #[test]
 fn search_e2e_with_real_rg_if_available() {
-    let has_rg = std::process::Command::new("rg")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !has_rg {
-        eprintln!("search_e2e_with_real_rg_if_available: skipping, `rg` not on PATH");
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("e2e");
@@ -692,6 +695,109 @@ fn has_rg() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// M145: decides whether a test needing PROGRAM should run. Split out
+/// from its thin per-tool wrapper below so the decision itself --
+/// present/absent x opt-out-env-value -- is testable without touching
+/// real process environment or PATH (see `require_tool_tests` below).
+/// Returns true if the caller should proceed; false if the caller
+/// should `return` early because a deliberate, visible opt-out was set
+/// (ENV_VALUE is exactly "1"/"true"/"yes" -- anything else, including
+/// "0", means "no, don't skip", so a leftover boolean-style "false" or
+/// an accidental "0" cannot silently disable the check). Panics -- does
+/// not return -- when PROGRAM is absent and no opt-out was given: the
+/// six `*_if_rg_available`/`*_if_available` tests in this file used to
+/// `eprintln!` and silently `return`, which `cargo test --workspace
+/// --no-fail-fast` (this project's own definition of done, no
+/// `--nocapture`) discards for a PASSING test, so a green gate could
+/// mean none of them ever ran at all.
+fn require_tool(program: &str, present: bool, env_name: &str, env_value: Option<&str>) -> bool {
+    if present {
+        return true;
+    }
+    let opted_out = matches!(env_value, Some("1") | Some("true") | Some("yes"));
+    if opted_out {
+        // Opt-out convention for this project: RETICLE_ALLOW_MISSING_*
+        // / RETICLE_SKIP_* env vars (see `test_source_hygiene_tests.rs`).
+        eprintln!(
+            "skipping (opted out via {}): {} is not on PATH",
+            env_name, program
+        );
+        return false;
+    }
+    panic!(
+        "{} is not on PATH -- this e2e test was not run. Failing by default so a \
+         missing dependency cannot silently pass as a green gate. Install {}, or set \
+         {}=1 to deliberately skip on a machine that genuinely lacks it.",
+        program, program, env_name
+    );
+}
+
+const RG_SKIP_ENV: &str = "RETICLE_ALLOW_MISSING_RG";
+
+fn require_rg() -> bool {
+    let env_value = std::env::var(RG_SKIP_ENV).ok();
+    require_tool("rg", has_rg(), RG_SKIP_ENV, env_value.as_deref())
+}
+
+#[cfg(test)]
+mod require_tool_tests {
+    use super::require_tool;
+
+    /// M145 deletion question: if `require_tool` silently returned
+    /// `false` on an absent tool with no opt-out set (instead of
+    /// panicking), this is the test that would have to go red to catch
+    /// it -- so it must actually observe the panic, not just call the
+    /// function.
+    #[test]
+    fn absent_and_no_opt_out_panics_naming_the_env_var() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", None)
+        });
+        let payload = result.expect_err("expected require_tool to panic when absent, no opt-out");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("RETICLE_ALLOW_MISSING_FAKE"),
+            "panic message should name the env var: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn absent_and_opted_out_with_1_returns_false() {
+        assert!(!require_tool(
+            "fake-tool",
+            false,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            Some("1")
+        ));
+    }
+
+    /// `FOO=0` must NOT mean "yes, skip" -- an environment left over
+    /// from some other boolean convention must not silently disable
+    /// this check.
+    #[test]
+    fn absent_and_env_set_to_0_still_panics() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", Some("0"))
+        });
+        assert!(result.is_err(), "FOO=0 must not opt out of the check");
+    }
+
+    #[test]
+    fn present_returns_true_regardless_of_env() {
+        assert!(require_tool(
+            "fake-tool",
+            true,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            None
+        ));
+    }
 }
 
 // --- F1a. A nonexistent `search-program' gets an explicit abnormal-exit
@@ -758,12 +864,11 @@ fn search_reports_no_matches_message_for_exit_code_one() {
 // --- fake generator can't misparse a regex it never actually reads. ---
 
 #[test]
+// `_if_rg_available` predates M145: this test now FAILS by default
+// (rather than silently skipping) when `rg` is absent, unless
+// `RETICLE_ALLOW_MISSING_RG` is set -- see `require_tool`'s doc comment.
 fn search_regexp_reports_abnormal_exit_for_invalid_regex_if_rg_available() {
-    if !has_rg() {
-        eprintln!(
-            "search_regexp_reports_abnormal_exit_for_invalid_regex_if_rg_available: \
-             skipping, `rg` not on PATH"
-        );
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("badregex");
@@ -957,12 +1062,11 @@ fn search_shell_quote_protects_special_characters_from_injection() {
 // --- Verilog bus width `[7:0]' as a regex bracket expression. ----------
 
 #[test]
+// `_if_rg_available` predates M145: this test now FAILS by default
+// (rather than silently skipping) when `rg` is absent, unless
+// `RETICLE_ALLOW_MISSING_RG` is set -- see `require_tool`'s doc comment.
 fn search_project_literal_mode_does_not_treat_bus_width_as_char_class_if_rg_available() {
-    if !has_rg() {
-        eprintln!(
-            "search_project_literal_mode_does_not_treat_bus_width_as_char_class_if_rg_available: \
-             skipping, `rg` not on PATH"
-        );
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("literalbus");
@@ -990,12 +1094,11 @@ fn search_project_literal_mode_does_not_treat_bus_width_as_char_class_if_rg_avai
 // --- regex bracket expression -- the opt-in counterpart to F7a. --------
 
 #[test]
+// `_if_rg_available` predates M145: this test now FAILS by default
+// (rather than silently skipping) when `rg` is absent, unless
+// `RETICLE_ALLOW_MISSING_RG` is set -- see `require_tool`'s doc comment.
 fn search_project_regexp_mode_treats_bracket_expression_as_regex_if_rg_available() {
-    if !has_rg() {
-        eprintln!(
-            "search_project_regexp_mode_treats_bracket_expression_as_regex_if_rg_available: \
-             skipping, `rg` not on PATH"
-        );
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("regexbus");
@@ -1248,9 +1351,11 @@ fn search_again_reruns_last_pattern_and_root() {
 // --- (see F7's own `[7:0]' bracket-expression fixture, reused here). ---
 
 #[test]
+// `_if_rg_available` predates M145: this test now FAILS by default
+// (rather than silently skipping) when `rg` is absent, unless
+// `RETICLE_ALLOW_MISSING_RG` is set -- see `require_tool`'s doc comment.
 fn search_again_reuses_regexp_mode_if_rg_available() {
-    if !has_rg() {
-        eprintln!("search_again_reuses_regexp_mode_if_rg_available: skipping, `rg` not on PATH");
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("againregexp");
@@ -1283,9 +1388,11 @@ fn search_again_reuses_regexp_mode_if_rg_available() {
 }
 
 #[test]
+// `_if_rg_available` predates M145: this test now FAILS by default
+// (rather than silently skipping) when `rg` is absent, unless
+// `RETICLE_ALLOW_MISSING_RG` is set -- see `require_tool`'s doc comment.
 fn search_again_reuses_literal_mode_if_rg_available() {
-    if !has_rg() {
-        eprintln!("search_again_reuses_literal_mode_if_rg_available: skipping, `rg` not on PATH");
+    if !require_rg() {
         return;
     }
     let scratch = Scratch::new("againliteral");

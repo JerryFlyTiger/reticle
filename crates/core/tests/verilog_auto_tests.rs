@@ -7454,7 +7454,7 @@ fn unreachable_autoinst_string_adjacent_to_bracket_is_now_rescued_by_text_fallba
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "the site deletes via the text fallback, zero left unrecovered: {}",
         msg
     );
@@ -7535,7 +7535,7 @@ fn unreachable_autoinst_unterminated_string_is_reported_not_silent() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "an unterminated string literal must trip the SAME unreachable-site accounting, and the M129 text fallback must ALSO refuse it (lexical error): {}",
         msg
     );
@@ -7554,7 +7554,7 @@ fn unreachable_autoinst_negative_control_unbalanced_paren_recovers_locally() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 0)",
+        msg, "(1 0 0 0 0)",
         "an unbalanced paren recovers LOCALLY (module_instantiation still found) -- must NOT be counted as unreachable: {}",
         msg
     );
@@ -7572,7 +7572,7 @@ fn unreachable_autoinst_negative_control_unbalanced_bracket_recovers_locally() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 0)",
+        msg, "(1 0 0 0 0)",
         "an unbalanced bracket recovers LOCALLY -- must NOT be counted as unreachable: {}",
         msg
     );
@@ -7590,7 +7590,7 @@ fn unreachable_autoinst_negative_control_backtick_recovers_locally() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 0)",
+        msg, "(1 0 0 0 0)",
         "a stray backtick recovers LOCALLY -- must NOT be counted as unreachable: {}",
         msg
     );
@@ -7608,7 +7608,7 @@ fn unreachable_autoinst_negative_control_hash_recovers_locally() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 0)",
+        msg, "(1 0 0 0 0)",
         "a lone `#' recovers LOCALLY -- must NOT be counted as unreachable: {}",
         msg
     );
@@ -7626,7 +7626,7 @@ fn unreachable_autoinst_negative_control_bare_keyword_recovers_locally() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 0)",
+        msg, "(1 0 0 0 0)",
         "a bare keyword recovers LOCALLY -- must NOT be counted as unreachable: {}",
         msg
     );
@@ -7655,7 +7655,7 @@ fn unreachable_autoinst_mixed_file_good_and_fallback_rescued_sites_both_delete_a
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(2 0 0 1)",
+        msg, "(2 0 0 1 0)",
         "the good (tree-reachable) site plus the fallback-rescued site both deleted, none left unrecovered: {}",
         msg
     );
@@ -7757,7 +7757,7 @@ fn lisp_result_embedding_a_quote_adjacent_to_bracket_is_rescued_by_text_fallback
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "the Part-A-manufactured site must be rescued and deleted by the text fallback, zero left unrecovered: {}",
         msg
     );
@@ -7783,7 +7783,7 @@ fn unreachable_autoinst_stray_marker_with_no_enclosing_instantiation() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "a stray marker with no enclosing instantiation must still be counted via the SAME unreachable-site mechanism, and the M129 text fallback cannot rescue it either (no enclosing paren pair at all): {}",
         msg
     );
@@ -7824,7 +7824,7 @@ fn m129_text_fallback_deletes_a_string_adjacent_to_bracket_site() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "deleted via the text fallback (element 3), zero left unrecovered (element 2): {}",
         msg
     );
@@ -7877,7 +7877,7 @@ fn m129_text_fallback_leaves_text_before_the_marker_untouched() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "one site, rescued by the text fallback: {}",
         msg
     );
@@ -7906,7 +7906,7 @@ fn m129_text_fallback_preserves_trailing_text_after_the_close_paren() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "one site, rescued by the text fallback: {}",
         msg
     );
@@ -7933,7 +7933,7 @@ fn m129_text_fallback_strips_the_trailing_templated_annotation() {
     // annotation range, same as the tree path already does), so this is
     // 2 here even though only ONE site was rescued (element 3).
     assert_eq!(
-        msg, "(2 0 0 1)",
+        msg, "(2 0 0 1 0)",
         "one site, rescued by the text fallback, contributing two ranges (ports region + annotation): {}",
         msg
     );
@@ -7962,7 +7962,7 @@ fn m129_text_fallback_handles_several_stuck_sites_in_one_file() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(2 0 0 2)",
+        msg, "(2 0 0 2 0)",
         "both stuck sites rescued and deleted by the text fallback: {}",
         msg
     );
@@ -8004,7 +8004,7 @@ fn m129_mixed_file_good_and_stuck_sites_both_delete() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 1 0)",
+        msg, "(1 0 1 0 0)",
         "u2 (good, tree path) deletes; u1 (no matching close paren) stays unrecovered -- neither blocks the other: {}",
         msg
     );
@@ -8028,7 +8028,7 @@ fn m129_text_fallback_ignores_a_close_paren_inside_a_string() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite the `)' inside a string literal: {}",
         msg
     );
@@ -8053,7 +8053,7 @@ fn m129_text_fallback_ignores_parens_inside_a_line_comment() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite the `)' inside a line comment: {}",
         msg
     );
@@ -8078,7 +8078,7 @@ fn m129_text_fallback_ignores_parens_inside_a_block_comment() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite the `)' inside a block comment: {}",
         msg
     );
@@ -8103,7 +8103,7 @@ fn m129_text_fallback_honours_a_backslash_escape_inside_a_string() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite an escaped quote (`\\\"') inside a string not ending it early: {}",
         msg
     );
@@ -8128,7 +8128,7 @@ fn m129_text_fallback_balances_nested_parens_in_a_connection() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite nested, balanced parens in a connection: {}",
         msg
     );
@@ -8169,7 +8169,7 @@ fn m129_text_fallback_ignores_parens_inside_an_escaped_identifier() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `(' and `)' embedded in an escaped identifier's own name: {}",
         msg
     );
@@ -8203,7 +8203,7 @@ fn m129_text_fallback_escaped_identifier_ends_at_a_carriage_return() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `\\r' right after an escaped identifier, before the connection's own close paren: {}",
         msg
     );
@@ -8236,7 +8236,7 @@ fn m129_text_fallback_ignores_a_close_bracket_inside_a_string_within_a_bracket_g
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `]' inside a string nested inside a bracket group: {}",
         msg
     );
@@ -8308,7 +8308,7 @@ fn m129_text_fallback_ignores_a_close_bracket_inside_an_escaped_identifier_withi
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `]' embedded in an escaped identifier nested inside a bracket group: {}",
         msg
     );
@@ -8354,7 +8354,7 @@ fn m129_text_fallback_ignores_a_close_bracket_inside_a_line_comment_within_a_bra
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `]' inside a line comment nested inside a bracket group: {}",
         msg
     );
@@ -8396,7 +8396,7 @@ fn m129_text_fallback_ignores_a_close_bracket_inside_a_block_comment_within_a_br
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "rescued despite a `]' inside a block comment nested inside a bracket group: {}",
         msg
     );
@@ -8421,7 +8421,7 @@ fn m129_text_fallback_refuses_a_marker_inside_a_module_header() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the guard must refuse a module header's own port-list parens (`module'/`top' fail the whitelist): {}",
         msg
     );
@@ -8442,7 +8442,7 @@ fn m129_text_fallback_refuses_a_marker_inside_a_for_loop_paren() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the guard must refuse a `for' loop's own parens (`for' fails the whitelist): {}",
         msg
     );
@@ -8459,7 +8459,7 @@ fn m129_text_fallback_refuses_a_marker_inside_an_always_sensitivity_list() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the guard must refuse an `always' sensitivity list's own parens (`@' is not a plain identifier): {}",
         msg
     );
@@ -8476,7 +8476,7 @@ fn m129_text_fallback_refuses_a_marker_inside_a_function_argument_list() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the guard must refuse a function argument list's own parens (`function' fails the whitelist): {}",
         msg
     );
@@ -8501,7 +8501,7 @@ fn m129_text_fallback_refuses_a_marker_inside_a_let_declaration() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the guard must refuse a `let' declaration's own argument list (`let' fails the whitelist): {}",
         msg
     );
@@ -8520,7 +8520,7 @@ fn m129_text_fallback_accepts_a_parameterised_instantiation() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "shape 2 (`MODULE #(...) INSTANCE (') accepted: {}",
         msg
     );
@@ -8543,7 +8543,7 @@ fn m129_text_fallback_accepts_an_instance_array() {
     );
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(1 0 0 1)",
+        msg, "(1 0 0 1 0)",
         "an instance-array bracket group accepted: {}",
         msg
     );
@@ -8567,7 +8567,7 @@ fn m129_text_fallback_refuses_an_unterminated_string_site() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "an unterminated string is a genuine lexical error -- GNU also fails here (spec 1d) -- stays unrecovered: {}",
         msg
     );
@@ -8587,7 +8587,7 @@ fn m129_text_fallback_refuses_a_site_with_no_matching_close_paren() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "the instantiation's own `(' is never closed anywhere in the buffer -- no CLOSE, so step 1 of the fallback's own range search returns nil: {}",
         msg
     );
@@ -8629,7 +8629,7 @@ fn m129_text_fallback_refuses_a_well_formed_site_after_an_earlier_lexical_anomal
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "u1's own pair is individually well-formed, but an EARLIER, unrelated lexical anomaly must still refuse it (the anomaly's own index precedes u1's own CLOSE): {}",
         msg
     );
@@ -8643,7 +8643,7 @@ fn m129_stray_marker_with_no_enclosing_paren_is_still_reported_not_deleted() {
     let src_before = bs(&mut i);
     let msg = delete_auto(&mut i);
     assert_eq!(
-        msg, "(0 0 1 0)",
+        msg, "(0 0 1 0 0)",
         "no enclosing pair exists at all -- step 1 of the fallback's own range search returns nil immediately: {}",
         msg
     );
@@ -9417,6 +9417,881 @@ fn autounused_port_and_instance_name_collision_via_hierarchical_read_is_a_known_
          reference into a SAME-NAMED instance's own port, which this scan cannot tell apart \
          from a genuine read of the module-level port with the same name -- currently NOT \
          listed here: {}",
+        text
+    );
+}
+
+// ===================== M143 Part A: `.*` wildcard connection =====================
+//
+// A `.*' connection parses as its own `named_port_connection' with NO
+// `port_name' field (measured: `treesit-node-child-by-field-name' on it
+// returns nil). Before this milestone, every one of the three sites below
+// read that field unconditionally and crashed the WHOLE `verilog-auto'
+// command with `Wrong type argument: treesit-node-p, nil', leaving the
+// buffer completely untouched:
+//   - verilog-auto.el's AUTOINST connected-port list (feeds AUTOINST alone)
+//   - `verilog-auto--port-propagation-candidates' (feeds AUTOOUTPUT,
+//     AUTOINPUT, AUTOINOUT directly, and AUTOREG/AUTOTIEOFF indirectly via
+//     `verilog-auto--driven-output-names', which explicitly reuses it)
+//   - the AUTOWIRE candidate walk
+// So seven AUTO commands repro from three physical sites. Reference
+// behaviour measured against real GNU Emacs 30.2 (`emacs -Q --batch'):
+// `.*' itself is not a connection and excludes nothing; only an explicit
+// `.NAME(...)' counts as already-connected.
+
+#[test]
+fn autoinst_wildcard_present_matches_no_wildcard_control() {
+    // Control is `autoinst_full_expansion_groups_aligns_and_orders' above,
+    // with only `.*, ' added to the instance's own connection list -- the
+    // wildcard connects nothing, so every port must still be generated
+    // exactly as it is without it.
+    let (mut i, _ed) = setup();
+    let inst_line = "  sub_mod u1 (.*, /*AUTOINST*/);\n";
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top;\n  wire clk;\n  wire rst_n;\n  wire io_bus;\n  wire [WIDTH-1:0] count;\n  wire done;\n{}endmodule\n",
+            SUB_MOD, inst_line
+        ),
+    );
+    verilog_auto(&mut i);
+    let expected_block = format!(
+        "/*AUTOINST*/\n{indent}// Outputs\n{c1},\n{c2},\n{indent}// Inouts\n{c3},\n{indent}// Inputs\n{c4},\n{c5}",
+        indent = indent,
+        c1 = conn(&indent, "count", "count[WIDTH-1:0]"),
+        c2 = conn(&indent, "done", "done"),
+        c3 = conn(&indent, "io_bus", "io_bus"),
+        c4 = conn(&indent, "clk", "clk"),
+        c5 = conn(&indent, "rst_n", "rst_n"),
+    );
+    let text = bs(&mut i);
+    assert!(
+        text.contains(&expected_block),
+        "expected block:\n{}\n\ngot buffer:\n{}",
+        expected_block,
+        text
+    );
+    assert!(
+        text.contains("sub_mod u1 (.*, /*AUTOINST*/"),
+        "the `.*' itself must survive untouched: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_wildcard_present_matches_control() {
+    // Control is `autowire_declares_wire_for_undeclared_output' above, with
+    // `.*, ' added to the connection list.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic [WIDTH-1:0] count,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/\n  sub_mod u1 (.*, .clk(clk), .count(count), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [WIDTH-1:0] count;\n  wire done;\n  // End of automatics\n"
+        ),
+        "buffer:\n{}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_wildcard_present_matches_control() {
+    // Control is `autooutput_declares_output_for_undriven_submodule_output'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.*, .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", Some("logic"), None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoinput_wildcard_present_matches_control() {
+    // Control is `autoinput_declares_input_for_unconnected_submodule_input'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input logic clk\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOINPUT*/\n  sub_mod u1 (.*, .clk(clk));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOINPUT*/\n  // Beginning of automatic inputs (from unused autoinst inputs)\n{}\n  // End of automatics",
+        port_decl("  ", "input", Some("logic"), None, "clk", "To", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoinout_wildcard_present_matches_control() {
+    // Control is `autoinout_declares_inout_for_submodule_inout'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  inout logic io_bus\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOINOUT*/\n  sub_mod u1 (.*, .io_bus(io_bus));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOINOUT*/\n  // Beginning of automatic inouts (from unused autoinst inouts)\n{}\n  // End of automatics",
+        port_decl("  ", "inout", Some("logic"), None, "io_bus", "To/From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreg_wildcard_present_matches_control() {
+    // Control is `autoreg_instance_driven_output_skipped': `a' is
+    // instance-driven (must stay unreged), `b' is not (must get `reg b;').
+    // `.*, ' is added to the instance's own connection list, which reaches
+    // AUTOREG only indirectly via `verilog-auto--driven-output-names'
+    // reusing `verilog-auto--port-propagation-candidates'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic [3:0] a\n);\nendmodule\n\nmodule dut (a, b);\n  output [3:0] a;\n  output b;\n  /*AUTOREG*/\n  sub_mod u1 (.*, .a(a));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("reg [3:0] a;"),
+        "a is instance-driven, must not be declared reg: {}",
+        text
+    );
+    assert!(text.contains("reg b;"), "buffer: {}", text);
+}
+
+#[test]
+fn autotieoff_wildcard_present_matches_control() {
+    // A `.*' sitting in a DIFFERENT instance than the one being tied off --
+    // `verilog-auto--driven-output-names' walks every `module_instantiation'
+    // in the module, not just ones relevant to the tied-off port, so this
+    // still exercises the crash site.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk\n);\nendmodule\n\nmodule dut (a);\n  output [3:0] a;\n  /*AUTOTIEOFF*/\n  sub_mod u1 (.*, .clk(clk));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(&tieoff_line("  ", "wire", false, "[3:0]", "a", "4'h0")),
+        "buffer: {}",
+        text
+    );
+}
+
+#[test]
+fn wildcard_pins_gnu_rule_explicit_connection_excluded_wildcard_left_in_place() {
+    // Measured against real GNU Emacs 30.2 (`emacs -Q --batch -l drive.el',
+    // module `sram_bank (input clk_i, input rst_ni, input aw_valid_i, output
+    // aw_ready_o)', instance `sram_bank u_bank (.*, .clk_i(c), /*AUTOINST*/);'):
+    // GNU produces a byte-identical expansion to the same line WITHOUT the
+    // `.*' -- `clk_i' is absent because it is EXPLICITLY connected, and the
+    // `.*' itself excludes nothing:
+    //
+    //   sram_bank u_bank (.*, .clk_i(c), /*AUTOINST*/
+    //                     // Outputs
+    //                     .aw_ready_o         (aw_ready_o),
+    //                     // Inputs
+    //                     .rst_ni             (rst_ni),
+    //                     .aw_valid_i         (aw_valid_i));
+    //
+    // This tool's own layout differs (space- not tab-padded, this file's
+    // established `conn'/pad shape), but the SET of ports and the exclusion
+    // rule are the same measured GNU behaviour.
+    let (mut i, _ed) = setup();
+    let inst_line = "  sram_bank u_bank (.*, .clk_i(c), /*AUTOINST*/);\n";
+    let indent = " ".repeat("  sram_bank u_bank (".len());
+    insert_src(
+        &mut i,
+        &format!(
+            "module sram_bank (\n  input  logic clk_i,\n  input  logic rst_ni,\n  input  logic aw_valid_i,\n  output logic aw_ready_o\n);\nendmodule\n\nmodule top;\n{}endmodule\n",
+            inst_line
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected_block = format!(
+        "/*AUTOINST*/\n{indent}// Outputs\n{c1},\n{indent}// Inputs\n{c2},\n{c3}",
+        indent = indent,
+        c1 = conn(&indent, "aw_ready_o", "aw_ready_o"),
+        c2 = conn(&indent, "rst_ni", "rst_ni"),
+        c3 = conn(&indent, "aw_valid_i", "aw_valid_i"),
+    );
+    assert!(
+        text.contains(&expected_block),
+        "expected block:\n{}\n\ngot buffer:\n{}",
+        expected_block,
+        text
+    );
+    assert!(
+        text.contains("u_bank (.*, .clk_i(c), /*AUTOINST*/"),
+        "the `.*, .clk_i(c)' prefix must survive untouched: {}",
+        text
+    );
+    assert_eq!(
+        text.matches(".clk_i(").count(),
+        1,
+        "clk_i must be excluded -- explicitly connected, must not be regenerated: {}",
+        text
+    );
+}
+
+#[test]
+fn wildcard_in_one_of_two_instances_does_not_change_sibling_expansion() {
+    // Two `hierarchical_instance's under one `module_instantiation'
+    // statement -- u_a carries the `.*', u_b carries the AUTOINST comment.
+    // AUTOWIRE walks every hierarchical_instance under the SAME
+    // module_instantiation (the M92 trap this file's header documents), so
+    // this exercises exactly the site where a wildcard in a SIBLING
+    // instance could otherwise be misread as u_b's own connection.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/\n  sub_mod u_a (.*), u_b (.clk(clk), /*AUTOINST*/);\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u_a (.*), u_b (".len());
+    assert!(
+        text.contains(&conn(&indent, "done", "done")),
+        "u_b's own done port must still be auto-connected: {}",
+        text
+    );
+    assert!(
+        text.contains("wire done;"),
+        "AUTOWIRE must still see u_b's newly-connected `done' as a bare \
+         candidate, unaffected by u_a's own `.*': {}",
+        text
+    );
+    assert!(
+        !text.contains("u_a (.*, "),
+        "u_a's wildcard-only connection list must not be rewritten: {}",
+        text
+    );
+}
+
+#[test]
+fn wildcard_survives_delete_expand_round_trip() {
+    // Expand, delete, expand again with a `.*' present -- the buffer must
+    // return exactly to its pre-expansion text, and the second expansion
+    // must equal the first (`verilog-delete-auto' is explicitly out of
+    // scope for M143 -- measured unaffected by a wildcard -- so this pins
+    // that `verilog-auto' as a whole stays a clean round trip with one
+    // present).
+    let (mut i, _ed) = setup();
+    let src = "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  sub_mod u1 (.*, /*AUTOINST*/);\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    let first_expansion = bs(&mut i);
+    let indent = " ".repeat("  sub_mod u1 (".len());
+    assert!(
+        first_expansion.contains(&conn(&indent, "done", "done")),
+        "buffer: {}",
+        first_expansion
+    );
+    delete_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "verilog-delete-auto must return the buffer to its pre-expansion text"
+    );
+    verilog_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        first_expansion,
+        "the second expansion must equal the first"
+    );
+}
+
+// ============ M143 Part A cold-review gap: `.foo()` explicit disconnect ============
+//
+// `.foo()' is legal SystemVerilog: the port name is present but the parens
+// are deliberately left empty. Per the tree-sitter-systemverilog grammar it
+// parses as its own `named_port_connection' that HAS a `port_name' field
+// but has NO `connection' field -- the mirror image of `.*', which has no
+// `port_name' field at all. Before M143 Part A, the AUTOWIRE candidate walk
+// in verilog-auto.el read `(string-trim (treesit-node-text cnode))'
+// UNCONDITIONALLY, so a `.foo()' ANYWHERE in the buffer already crashed
+// AUTOWIRE with `Wrong type argument: treesit-node-p, nil' -- entirely
+// independently of `.*', and before this milestone existed at all. Part
+// A's `(and cnode ...)' guard fixed this too, as an unclaimed drive-by fix
+// with zero test coverage until now.
+//
+// `verilog-auto--port-propagation-candidates' (feeds AUTOOUTPUT, AUTOINPUT,
+// AUTOINOUT) already guarded `ctext' on `cnode' before this milestone, so
+// it never crashed on `.foo()' -- but nothing exercised that guard either.
+
+#[test]
+fn autowire_explicit_disconnect_present_matches_control() {
+    // Control is `autowire_declares_wire_for_undeclared_output' above, with
+    // `.foo(), ' added to the instance's own connection list -- an explicit
+    // disconnect of a port name that is not even one of sub_mod's real
+    // ports, so it must contribute nothing and the expansion must be
+    // byte-identical to the control's.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic [WIDTH-1:0] count,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/\n  sub_mod u1 (.foo(), .clk(clk), .count(count), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [WIDTH-1:0] count;\n  wire done;\n  // End of automatics\n"
+        ),
+        "buffer:\n{}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_explicit_disconnect_present_matches_control() {
+    // Control is `autooutput_declares_output_for_undriven_submodule_output'
+    // above, with `.foo(), ' added to the instance's connection list. This
+    // exercises `verilog-auto--port-propagation-candidates', whose `(and
+    // cnode ...)' guard predates M143 and was never crash-prone on this
+    // shape -- but was also never tested against it until now.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.foo(), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", Some("logic"), None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autowire_wildcard_and_explicit_disconnect_together() {
+    // `.*' (no `port_name' field) and `.foo()' (has `port_name', no
+    // `connection' field) are independent absent-field shapes on
+    // `named_port_connection' -- nothing else in this file exercises both
+    // together in one instance. Control is
+    // `autowire_declares_wire_for_undeclared_output' above, with `.*, ' and
+    // `.foo(), ' both added to the instance's connection list.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic [WIDTH-1:0] count,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/\n  sub_mod u1 (.*, .foo(), .clk(clk), .count(count), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [WIDTH-1:0] count;\n  wire done;\n  // End of automatics\n"
+        ),
+        "buffer:\n{}",
+        text
+    );
+}
+
+// ============================================================
+// M144 -- one port-name accessor for named_port_connection; MISSING
+// port names
+// ============================================================
+
+#[test]
+fn connection_with_missing_port_name_connects_nothing() {
+    // M144 fact 1/2, adapted after real testing against THIS grammar
+    // (not just the spec's GNU-measured text). CORRECTED (M144 Part D):
+    // an earlier version of this comment claimed `.,' ALSO pushed the
+    // `/*AUTOINST*/' comment outside `hierarchical_instance' and would
+    // crash -- that was a bracket-counting misreading of a
+    // `treesit-node-string' dump, not a real measurement. A fresh dump
+    // shows `.,' keeps the comment reachable
+    // (`(hierarchical_instance ... (list_of_port_connections
+    // (named_port_connection port_name: clk_i ...)) (ERROR)
+    // (block_comment))' -- ERROR and block_comment are BOTH still
+    // children of `hierarchical_instance' itself, not siblings of it),
+    // exactly like the bare `.' shape below, and `verilog-auto' does not
+    // signal for it. `.(sig)' with no comma parses as an
+    // `ordered_port_connection' (a different node type none of the four
+    // Part A sites ever walk), also not this shape. Only `.(sig),' as a
+    // SECOND connection genuinely escapes `hierarchical_instance' --
+    // that shape has a DEFINED, divergent-from-GNU outcome (the marker
+    // is skipped, not silently dropped), tested separately by
+    // `autoinst_marker_pushed_outside_hierarchical_instance_does_not_abort_verilog_auto',
+    // not here -- this test is specifically the "connects nothing,
+    // matches GNU" case.
+    //
+    // Both `.' and `.,' reproduce fact 1 (MISSING `port_name') and GNU
+    // fact 2 (connects nothing, byte-identical to the control apart from
+    // the literal `<CONN>' text) -- built by running the SAME template
+    // through the editor twice per shape (once with an empty `<CONN>',
+    // once with the shape) rather than hand-typing the expected output.
+    let template = "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  /*AUTOOUTPUT*/\n  /*AUTOWIRE*/\n  sub u0 (.clk_i(clk), {conn}\n          /*AUTOINST*/);\nendmodule\n";
+
+    let (mut ci, _ced) = setup();
+    insert_src(&mut ci, &template.replace("{conn}", ""));
+    verilog_auto(&mut ci);
+    let control = bs(&mut ci);
+
+    for conn_text in [".", ".,"] {
+        // Strip the exact literal `<CONN>' substitution site (`, {conn}\n',
+        // the comma/space the template already carries plus CONN_TEXT plus
+        // the newline before `/*AUTOINST*/') rather than CONN_TEXT alone --
+        // a bare `"."' is not unique in the buffer (`.clk_i' has one too)
+        // and a plain `replacen' would strip the WRONG dot.
+        let (mut wi, _wed) = setup();
+        insert_src(&mut wi, &template.replace("{conn}", conn_text));
+        verilog_auto(&mut wi);
+        let with_conn = bs(&mut wi);
+        let needle = format!(", {}\n", conn_text);
+        let stripped = with_conn.replacen(&needle, ", \n", 1);
+        assert_eq!(
+            stripped, control,
+            "conn_text={:?}\nwith_conn:\n{}\ncontrol:\n{}",
+            conn_text, with_conn, control
+        );
+    }
+}
+
+#[test]
+fn explicitly_connected_port_names_skips_missing_port_name_and_honours_exclude_node() {
+    // M144: `verilog-auto--explicitly-connected-port-names' on
+    // `u0 ( .clk_i(c), . )' must return exactly `("clk_i")' -- the bare
+    // trailing dot's MISSING `port_name' must not appear as `""' the
+    // way the pre-M144 walk did (fact 1). With EXCLUDE-NODE set to the
+    // `clk_i' connection itself, the result must be nil. A real
+    // instance type (`sub') is required -- a scratch probe found that
+    // `u0 ( ... )' with no type name at all does not parse as a
+    // `hierarchical_instance' in this grammar (`u0' is read as the
+    // TYPE name, with no instance name, and the whole thing falls back
+    // to `nil' from `--find-all-of-type').
+    let (mut i, _ed) = setup();
+    let r = run(
+        &mut i,
+        "(let* ((root (verilog-auto--parse-string \"module top;\\n  sub u0 ( .clk_i(c), . );\\nendmodule\\n\"))\n       (hier (car (verilog-auto--find-all-of-type root \"hierarchical_instance\")))\n       (conns (verilog-auto--find-all-of-type hier \"named_port_connection\"))\n       (clk-conn (nth 0 conns)))\n  (list (verilog-auto--explicitly-connected-port-names hier)\n        (verilog-auto--explicitly-connected-port-names hier clk-conn)))",
+    );
+    assert_eq!(r, "((\"clk_i\") nil)", "{}", r);
+}
+
+// M144 fix round -- exact wording used by `verilog-auto--orphaned-
+// connection-autoinst-markers's own two call sites (`verilog-delete-
+// auto' and `verilog-auto'), pinned once here so every test below
+// checks the SAME literal string a real user would see, not a
+// substring shared with the "recovered by a text-based fallback scan"
+// or "no enclosing instantiation" branches (Finding 2, cold review).
+const ORPHANED_CONNECTION_SUFFIX: &str =
+    "; 1 /*AUTOINST*/ marker(s) sit past a malformed connection in the same instantiation, left untouched (not deleted, not regenerated)";
+const ORPHANED_CONNECTION_DELETE_MESSAGE: &str =
+    "verilog-delete-auto: 1 /*AUTOINST*/ marker(s) sit past a malformed connection in the same instantiation, left untouched (not deleted, not regenerated)";
+
+#[test]
+fn autoinst_marker_pushed_outside_hierarchical_instance_does_not_abort_verilog_auto() {
+    // M144 Part D (scope extension): of the six `<CONN>' shapes audited
+    // by a scratch `treesit-node-string' dump (single-connection AND
+    // two-connection variants, both reported to the coordinator), only
+    // `.(sig),' as a SECOND connection right after a valid
+    // `.clk_i(clk),' pushes the `/*AUTOINST*/' marker comment OUTSIDE
+    // `hierarchical_instance' entirely (a sibling `(ERROR
+    // (block_comment))' under `module_instantiation' instead of a
+    // descendant of `hierarchical_instance') -- every other shape
+    // (`.*,', `.foo(),', bare `.,', `.a(b c),') keeps the comment
+    // reachable. Before the fix, `verilog-auto--expand-autoinst-site'
+    // dereferences that nil `hier' unconditionally and crashes the
+    // WHOLE command with `Wrong type argument: treesit-node-p, nil' --
+    // so `u_good''s own, syntactically fine AUTOINST site never runs
+    // either. This test pins BOTH halves: no signal, AND the
+    // well-formed sibling site still expands.
+    //
+    // FIX ROUND CORRECTION (HIGH-severity cold-review finding): an
+    // earlier version of this fix routed this marker through the
+    // EXISTING `verilog-auto--unreachable-autoinst-markers' channel
+    // (M128/M129), whose own M129 text-based fallback scan then
+    // DELETED any already-generated connections on a second run with
+    // nothing left to regenerate them -- silent, permanent data loss,
+    // see `autoinst_marker_second_run_does_not_lose_generated_
+    // connections' below for the exact repro. That channel is safe only
+    // when GENERATED text broke the parse (M128's own narrow cause);
+    // here the USER'S OWN malformed connection broke it, which the
+    // fallback scan's own lexical scan cannot safely delete past. The
+    // fix now uses a SEPARATE function
+    // (`verilog-auto--orphaned-connection-autoinst-markers') that keeps
+    // `verilog-auto--unreachable-autoinst-markers' itself byte-for-byte
+    // reverted to its pre-M144 form (M128/M129's own existing tests
+    // pass unchanged), and routes THIS category onto a leave-
+    // completely-untouched path with its own accurately-worded report.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_bad (.clk_i(clk), .(sig),\n             /*AUTOINST*/);\n  sub u_good (.clk_i(clk),\n              /*AUTOINST*/);\nendmodule\n",
+    );
+    let r = run(&mut i, "(verilog-auto)");
+    assert!(
+        !r.starts_with("ERROR"),
+        "verilog-auto must not signal on an unreachable AUTOINST marker: {}",
+        r
+    );
+    let text = bs(&mut i);
+    assert!(
+        text.contains(".rd") && text.contains(".wr"),
+        "u_good's own well-formed AUTOINST site must still expand: {}",
+        text
+    );
+    assert!(
+        text.contains("/*AUTOINST*/);") && text.contains(".clk_i(clk), .(sig),"),
+        "u_bad's own marker and malformed connection must survive untouched, not be \
+         partially rewritten by any deletion attempt: {}",
+        text
+    );
+    assert!(
+        // `run''s own `prin1-to-string' wraps the returned elisp STRING
+        // in a literal trailing `"' -- strip it before the suffix check.
+        r.trim_end_matches('"')
+            .ends_with(ORPHANED_CONNECTION_SUFFIX),
+        "the skip must be reported with the EXACT accurate wording (not a substring shared \
+         with the \"recovered\"/\"no enclosing instantiation\" branches): {}",
+        r
+    );
+}
+
+#[test]
+fn autoinst_marker_second_run_does_not_lose_generated_connections() {
+    // M144 fix round -- HIGH-severity cold-review finding (Finding 1),
+    // the exact 3-step repro:
+    // 1. `sub u_bad (.clk_i(clk),\n /*AUTOINST*/);' + `verilog-auto' ->
+    //    expands `.rd(rd[7:0])', `.wr(wr)'.
+    // 2. User types a bad override: `.(sig),' inserted before the
+    //    marker, with the PREVIOUSLY GENERATED connections still
+    //    textually present (the user did not delete them, just added a
+    //    new, broken connection above them).
+    // 3. `verilog-auto' again -- before the fix, this deleted the
+    //    generated connections via the M129 text-based fallback scan
+    //    (which found a plausible enclosing paren pair -- the OUTER
+    //    instantiation's own closing paren -- and treated that as
+    //    "recovered") and never regenerated them, since `hier' is still
+    //    nil on every subsequent run. After the fix, `u_bad' is
+    //    byte-for-byte unchanged by step 3.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_bad (.clk_i(clk),\n             /*AUTOINST*/);\n  sub u_good (.clk_i(clk),\n              /*AUTOINST*/);\nendmodule\n",
+    );
+    // Step 1.
+    let r1 = run(&mut i, "(verilog-auto)");
+    assert!(!r1.starts_with("ERROR"), "step 1 must not signal: {}", r1);
+    let after_step1 = bs(&mut i);
+    assert!(
+        after_step1.contains(".rd") && after_step1.contains(".wr"),
+        "step 1 must expand u_bad's own connections: {}",
+        after_step1
+    );
+
+    // Step 2: the user edits the buffer directly (simulated by
+    // `erase-buffer' + `insert', matching how every other test in this
+    // file drives buffer content) -- u_bad now carries a malformed
+    // `.(sig),' connection ABOVE its own, still-present, previously
+    // generated connections.
+    let step2_src = "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_bad (.clk_i(clk), .(sig),\n             /*AUTOINST*/\n             // Outputs\n             .rd                       (rd[7:0]),\n             // Inputs\n             .wr                       (wr));\n  sub u_good (.clk_i(clk),\n              /*AUTOINST*/);\nendmodule\n";
+    run(&mut i, "(erase-buffer)");
+    insert_src(&mut i, step2_src);
+    let after_step2 = bs(&mut i);
+    assert_eq!(after_step2, step2_src, "step 2 setup must match exactly");
+
+    // Step 3.
+    let r3 = run(&mut i, "(verilog-auto)");
+    assert!(!r3.starts_with("ERROR"), "step 3 must not signal: {}", r3);
+    let after_step3 = bs(&mut i);
+
+    // u_bad must be byte-for-byte the SAME TEXT it carried after step 2
+    // -- extract just its own instantiation statement from both buffers
+    // (u_good's own text differs only in that it gets ITS OWN AUTOINST
+    // expansion at all, which never touched u_bad in the first place,
+    // but comparing the u_bad slice directly is the most direct
+    // "generated connections did not vanish" check).
+    let bad_start = "sub u_bad (";
+    let bad_before =
+        &after_step2[after_step2.find(bad_start).unwrap()..after_step2.find("sub u_good").unwrap()];
+    let bad_after =
+        &after_step3[after_step3.find(bad_start).unwrap()..after_step3.find("sub u_good").unwrap()];
+    assert_eq!(
+        bad_after, bad_before,
+        "u_bad must be byte-identical after step 3 to its own step-2 text -- the previously \
+         generated .rd/.wr connections must NOT be silently deleted:\nstep2:\n{}\nstep3:\n{}",
+        bad_before, bad_after
+    );
+
+    assert!(
+        after_step3.contains(".rd") && after_step3.contains(".wr"),
+        "u_good's own well-formed AUTOINST site must still expand in step 3: {}",
+        after_step3
+    );
+    assert!(
+        r3.trim_end_matches('"')
+            .ends_with(ORPHANED_CONNECTION_SUFFIX),
+        "step 3's message must report the skipped site with the exact accurate wording: {}",
+        r3
+    );
+}
+
+#[test]
+fn delete_auto_on_the_step2_buffer_leaves_the_malformed_site_untouched() {
+    // M144 fix round -- same repro as `autoinst_marker_second_run_
+    // does_not_lose_generated_connections', but calling `verilog-
+    // delete-auto' directly (not through `verilog-auto') on the
+    // step-2 buffer, and checking its own return value accounts for
+    // the site (the 5th, M144-fix-round-added ORPHANED-CONNECTION-COUNT
+    // element).
+    let (mut i, ed) = setup();
+    let step2_src = "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_bad (.clk_i(clk), .(sig),\n             /*AUTOINST*/\n             // Outputs\n             .rd                       (rd[7:0]),\n             // Inputs\n             .wr                       (wr));\n  sub u_good (.clk_i(clk),\n              /*AUTOINST*/);\nendmodule\n";
+    insert_src(&mut i, step2_src);
+    let before = bs(&mut i);
+    let r = run(&mut i, "(verilog-delete-auto)");
+    assert!(!r.starts_with("ERROR"), "must not signal: {}", r);
+    assert_eq!(
+        r, "(1 0 0 0 1)",
+        "return value: 1 good range deleted (u_good's own generated \
+        block), 0 overlap, 0 unreachable-unrecovered, 0 text-recovered, 1 orphaned-connection \
+        (u_bad, accounted for): {}",
+        r
+    );
+    let echo = ed.borrow().echo.clone();
+    assert_eq!(
+        echo.as_deref(),
+        Some(ORPHANED_CONNECTION_DELETE_MESSAGE),
+        "verilog-delete-auto's own echo must use the exact accurate wording: {:?}",
+        echo
+    );
+    let after = bs(&mut i);
+    let bad_start = "sub u_bad (";
+    let bad_before = &before[before.find(bad_start).unwrap()..before.find("sub u_good").unwrap()];
+    let bad_after = &after[after.find(bad_start).unwrap()..after.find("sub u_good").unwrap()];
+    assert_eq!(
+        bad_after, bad_before,
+        "u_bad's own text must be completely untouched by verilog-delete-auto:\nbefore:\n{}\nafter:\n{}",
+        bad_before, bad_after
+    );
+}
+
+#[test]
+fn multi_instance_statement_second_marker_broken_is_orphaned_not_unreachable() {
+    // M144 second fix round -- HIGH cold-review Finding 1: both
+    // `verilog-auto--unreachable-autoinst-markers' and `verilog-auto--
+    // orphaned-connection-autoinst-markers' used to locate a
+    // `module_instantiation''s own `/*AUTOINST*/' marker via
+    // `verilog-auto--find-comment' (singular, FIRST match only) --
+    // exactly wrong for the M92 comma-separated multi-instance shape
+    // (`sub u_a (...), u_b (...);', ONE `module_instantiation' with TWO
+    // `hierarchical_instance' children, each with its OWN marker).
+    // u_b's own marker was invisible to the orphaned predicate, then
+    // wrongly swept into the "unreachable" bucket by the general
+    // KIND-based scan, reported with the WRONG wording ("no enclosing
+    // instantiation (parse error or stray marker)") even though u_b's
+    // own `module_instantiation' plainly exists and u_a's own marker,
+    // right next to it, proves so.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_a (.clk_i(clk),\n           /*AUTOINST*/), u_b (.clk_i(clk), .(sig),\n           /*AUTOINST*/);\nendmodule\n",
+    );
+    let r = run(&mut i, "(verilog-auto)");
+    assert!(!r.starts_with("ERROR"), "must not signal: {}", r);
+    assert!(
+        !r.contains("no enclosing instantiation"),
+        "u_b's marker must NOT be reported as having no enclosing instantiation -- its \
+         `module_instantiation' plainly exists: {}",
+        r
+    );
+    assert!(
+        r.trim_end_matches('"')
+            .ends_with(ORPHANED_CONNECTION_SUFFIX),
+        "must report exactly one orphaned-connection marker, exact wording: {}",
+        r
+    );
+    let text = bs(&mut i);
+    let u_a_slice = &text[text.find("sub u_a (").unwrap()..text.find(", u_b (").unwrap()];
+    assert!(
+        u_a_slice.contains(".rd") && u_a_slice.contains(".wr"),
+        "u_a's own well-formed marker must still expand: {}",
+        text
+    );
+    let u_b_slice = &text[text.find(", u_b (").unwrap()..];
+    assert!(
+        u_b_slice.contains(".clk_i(clk), .(sig),") && u_b_slice.contains("/*AUTOINST*/);"),
+        "u_b's own marker and malformed connection must survive untouched: {}",
+        text
+    );
+}
+
+#[test]
+fn multi_instance_statement_second_marker_broken_second_run_does_not_lose_connections() {
+    // Same shape as `multi_instance_statement_second_marker_broken_is_
+    // orphaned_not_unreachable', but u_b starts WELL-FORMED, gets
+    // expanded once, THEN the user introduces the typo while u_b's own
+    // previously generated connections are still textually present --
+    // the exact data-loss shape Finding 1 (first fix round) already
+    // covered for a single-instance statement, now pinned for the
+    // multi-instance one too.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_a (.clk_i(clk),\n           /*AUTOINST*/), u_b (.clk_i(clk),\n           /*AUTOINST*/);\nendmodule\n",
+    );
+    let r1 = run(&mut i, "(verilog-auto)");
+    assert!(!r1.starts_with("ERROR"), "step 1 must not signal: {}", r1);
+    let after_step1 = bs(&mut i);
+    assert!(
+        after_step1.contains(".rd") && after_step1.contains(".wr"),
+        "step 1 must expand both instances: {}",
+        after_step1
+    );
+
+    // Step 2: user edits u_b directly, inserting `.(sig),' ABOVE its own
+    // still-present, previously generated connections.
+    let step2_src = "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_a (.clk_i(clk),\n           /*AUTOINST*/\n           // Outputs\n           .rd                          (rd[7:0]),\n           // Inputs\n           .wr                          (wr)), u_b (.clk_i(clk), .(sig),\n           /*AUTOINST*/\n           // Outputs\n           .rd                          (rd[7:0]),\n           // Inputs\n           .wr                          (wr));\nendmodule\n";
+    run(&mut i, "(erase-buffer)");
+    insert_src(&mut i, step2_src);
+    assert_eq!(bs(&mut i), step2_src, "step 2 setup must match exactly");
+
+    let r3 = run(&mut i, "(verilog-auto)");
+    assert!(!r3.starts_with("ERROR"), "step 3 must not signal: {}", r3);
+    let after_step3 = bs(&mut i);
+    let u_b_before = &step2_src[step2_src.find(", u_b (").unwrap()..];
+    let u_b_after = &after_step3[after_step3.find(", u_b (").unwrap()..];
+    assert_eq!(
+        u_b_after, u_b_before,
+        "u_b must be byte-identical after step 3 -- the previously generated .rd/.wr \
+         connections must NOT be silently deleted:\nbefore:\n{}\nafter:\n{}",
+        u_b_before, u_b_after
+    );
+    assert!(
+        r3.trim_end_matches('"')
+            .ends_with(ORPHANED_CONNECTION_SUFFIX),
+        "step 3's message must report the skipped site with the exact accurate wording: {}",
+        r3
+    );
+}
+
+#[test]
+fn multi_instance_statement_first_marker_broken_is_orphaned_not_unreachable() {
+    // Mirror of `multi_instance_statement_second_marker_broken_is_
+    // orphaned_not_unreachable' with the roles swapped: u_a (the FIRST
+    // hierarchical_instance under the module_instantiation) carries the
+    // malformed connection, u_b (the second) is well-formed. Confirms
+    // the fix is not accidentally position-dependent (e.g. only
+    // correct for "first is good, second is broken").
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_a (.clk_i(clk), .(sig),\n           /*AUTOINST*/), u_b (.clk_i(clk),\n           /*AUTOINST*/);\nendmodule\n",
+    );
+    let r = run(&mut i, "(verilog-auto)");
+    assert!(!r.starts_with("ERROR"), "must not signal: {}", r);
+    assert!(
+        !r.contains("no enclosing instantiation"),
+        "u_a's marker must NOT be reported as having no enclosing instantiation: {}",
+        r
+    );
+    assert!(
+        r.trim_end_matches('"')
+            .ends_with(ORPHANED_CONNECTION_SUFFIX),
+        "must report exactly one orphaned-connection marker, exact wording: {}",
+        r
+    );
+    let text = bs(&mut i);
+    let u_a_slice = &text[text.find("sub u_a (").unwrap()..text.find(", u_b (").unwrap()];
+    assert!(
+        u_a_slice.contains(".clk_i(clk), .(sig),") && u_a_slice.contains("/*AUTOINST*/)"),
+        "u_a's own marker and malformed connection must survive untouched: {}",
+        text
+    );
+    // Does NOT assert u_b's own connections are expanded: with u_a
+    // (the FIRST hierarchical_instance) broken, `verilog-auto--expand-
+    // all-autoinst''s own mi-scoped `verilog-auto--find-comment' picks
+    // U_A's marker as "the" site for this `module_instantiation' and
+    // never even considers u_b's -- the same pre-existing,
+    // out-of-Finding-1-scope gap documented in
+    // `multi_instance_statement_both_markers_well_formed_neither_misclassified'.
+    // What THIS test actually pins is the classification/reporting fix:
+    // no crash, and u_a's own marker correctly named orphaned rather
+    // than unreachable, regardless of which position it occupies.
+    let u_b_slice = &text[text.find(", u_b (").unwrap()..];
+    assert!(
+        u_b_slice.contains("/*AUTOINST*/);"),
+        "u_b's own marker must at least survive, unexpanded: {}",
+        text
+    );
+}
+
+#[test]
+fn multi_instance_statement_both_markers_well_formed_neither_misclassified() {
+    // Control: NEITHER instance's connection is malformed --
+    // `verilog-auto''s own message must carry NEITHER the orphaned-
+    // connection wording NOR the unreachable-marker wording for either
+    // marker, and u_a (the FIRST hierarchical_instance) must still
+    // expand normally. Guards against a fix that over-applies
+    // (misclassifying an innocent second marker in a multi-instance
+    // statement just because it isn't the FIRST one a naive
+    // `verilog-auto--find-comment' scoped to the whole
+    // `module_instantiation' would have found).
+    //
+    // Does NOT assert that u_b (the SECOND hierarchical_instance) is
+    // itself expanded: `verilog-auto--expand-all-autoinst''s own site
+    // collection (a DIFFERENT function from the two Finding-1 fixed
+    // here) ALSO calls `verilog-auto--find-comment' scoped to the
+    // whole `module_instantiation', singular, so it only ever adds
+    // U_A's own marker as an expansion SITE in the first place -- u_b's
+    // marker is simply never attempted, well-formed or not. Measured
+    // (scratch test, main conversation reported to the coordinator):
+    // this pre-dates all three M144 AUTOINST-orphan fix rounds and is
+    // not part of Finding 1's own scope (which named only `--
+    // unreachable-autoinst-markers' and `--orphaned-connection-
+    // autoinst-markers'), so it is reported here, not fixed.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub (input clk_i, input wr, output [7:0] rd);\nendmodule\n\nmodule top;\n  sub u_a (.clk_i(clk),\n           /*AUTOINST*/), u_b (.clk_i(clk),\n           /*AUTOINST*/);\nendmodule\n",
+    );
+    let r = run(&mut i, "(verilog-auto)");
+    assert!(!r.starts_with("ERROR"), "must not signal: {}", r);
+    assert!(
+        !r.contains("no enclosing instantiation") && !r.contains("malformed connection"),
+        "neither marker is malformed -- no orphaned/unreachable wording of any kind: {}",
+        r
+    );
+    let text = bs(&mut i);
+    let u_a_slice = &text[text.find("sub u_a (").unwrap()..text.find(", u_b (").unwrap()];
+    assert!(
+        u_a_slice.contains(".rd") && u_a_slice.contains(".wr"),
+        "u_a must expand: {}",
         text
     );
 }

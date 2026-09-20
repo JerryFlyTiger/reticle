@@ -140,29 +140,55 @@ fn worker_can_native_compile_internally() {
 
 #[test]
 fn genuine_parallelism_beats_sequential() {
-    // The core claim: N workers run N jobs concurrently across CPU
-    // cores, so wall-clock time for the parallel dispatch is well under
-    // the sum of the individual jobs. We only assert a conservative
-    // bound (parallel < 70% of sequential) to stay robust on busy or
-    // few-core CI machines while still failing if work were secretly
-    // serialized.
-    let r = eval(
-        "(let ((job '(let ((acc 0) (i 0))
-                       (while (< i 1000000) (setq acc (+ acc i)) (setq i (1+ i))) acc)))
-           ;; sequential: one worker, two jobs back to back
-           (let ((w (worker-start)) (t0 (float-time)))
-             (worker-eval w job) (worker-wait w)
-             (worker-eval w job) (worker-wait w)
-             (worker-kill w)
-             (let ((seq (- (float-time) t0)))
-               ;; parallel: two workers, both jobs at once
-               (let ((a (worker-start)) (b (worker-start)) (t1 (float-time)))
-                 (worker-eval a job) (worker-eval b job)
-                 (worker-wait a) (worker-wait b)
-                 (worker-kill a) (worker-kill b)
-                 (let ((par (- (float-time) t1)))
-                   (if (< par (* seq 0.7)) 'parallel-confirmed
-                     (list 'too-slow seq par)))))))",
+    // The core claim: N workers run N jobs concurrently across CPU cores, so
+    // wall-clock time for the parallel dispatch is well under the sum of the
+    // individual jobs. This used to assert that bound on a *single*
+    // measurement, with a comment claiming the 70% threshold was
+    // "conservative ... robust on busy machines" -- that claim was false: on
+    // 2026-09-13 it went red on a loaded machine (4.42s parallel vs 3.42s
+    // sequential, i.e. par > 0.7 * seq even though the worker was genuinely
+    // running both jobs concurrently).
+    //
+    // What this now asserts instead: genuine parallelism is *observable at
+    // least once in five tries*. A worker that is secretly serialized (the
+    // defect this test exists to catch) cannot satisfy that in any of the
+    // five attempts, no matter how many times it's measured, because its
+    // parallel path always costs the same as its sequential path. A busy
+    // machine can cause any *individual* measurement to miss the bound, but
+    // it would have to stay loaded for all five consecutive measurements to
+    // produce a false failure here. Accepted trade-offs: the worst case now
+    // costs up to 5x this test's process-spawn overhead instead of 1x, and
+    // retrying until the first success slightly raises the false-positive
+    // risk (a flaky machine getting "lucky" once in five tries) relative to
+    // a single measurement.
+    let mut attempts = Vec::new();
+    for _ in 0..5 {
+        let r = eval(
+            "(let ((job '(let ((acc 0) (i 0))
+                           (while (< i 1000000) (setq acc (+ acc i)) (setq i (1+ i))) acc)))
+               ;; sequential: one worker, two jobs back to back
+               (let ((w (worker-start)) (t0 (float-time)))
+                 (worker-eval w job) (worker-wait w)
+                 (worker-eval w job) (worker-wait w)
+                 (worker-kill w)
+                 (let ((seq (- (float-time) t0)))
+                   ;; parallel: two workers, both jobs at once
+                   (let ((a (worker-start)) (b (worker-start)) (t1 (float-time)))
+                     (worker-eval a job) (worker-eval b job)
+                     (worker-wait a) (worker-wait b)
+                     (worker-kill a) (worker-kill b)
+                     (let ((par (- (float-time) t1)))
+                       (if (< par (* seq 0.7)) 'parallel-confirmed
+                         (list 'too-slow seq par)))))))",
+        );
+        if r == "parallel-confirmed" {
+            return;
+        }
+        attempts.push(r);
+    }
+    panic!(
+        "parallelism not observed in any of 5 attempts (each entry is a \
+         (too-slow seq par) pair from one measurement): {:?}",
+        attempts
     );
-    assert_eq!(r, "parallel-confirmed", "parallelism not observed");
 }

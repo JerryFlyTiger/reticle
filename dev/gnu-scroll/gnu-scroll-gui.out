@@ -1,0 +1,54 @@
+start                          ws=  1 pt=  1 wend= 23 h=22
+C-v #1                         ws= 20 pt= 20 wend= 41 h=21
+C-v #2                         ws= 39 pt= 39 wend= 60 h=21
+C-v arg 3                      ws= 42 pt= 42 wend= 63 h=21
+C-v arg -3                     ws= 39 pt= 42 wend= 60 h=21
+M-v #1                         ws= 20 pt= 40 wend= 41 h=21
+M-v arg 3                      ws= 17 pt= 37 wend= 38 h=21
+reset top                      ws=  1 pt=  1 wend= 22 h=21
+M-v at top                     SIGNAL: (beginning-of-buffer)
+line 6 ws 1                    ws=  1 pt=  6 wend= 22 h=21
+M-v at top pt 6                SIGNAL: (beginning-of-buffer)
+after M->                      ws= 91 pt=101 wend=101 h=21
+C-v last page                  SIGNAL: (end-of-buffer)
+C-v loop #1                    ws= 20 pt= 20 wend= 41 h=21
+C-v loop #2                    ws= 39 pt= 39 wend= 60 h=21
+C-v loop #3                    ws= 58 pt= 58 wend= 79 h=21
+C-v loop #4                    ws= 77 pt= 77 wend= 98 h=21
+C-v loop #5                    ws= 96 pt= 96 wend=101 h=21
+C-v loop #6 SIGNAL: (end-of-buffer)
+C-v loop #7 SIGNAL: (end-of-buffer)
+C-v loop #8 SIGNAL: (end-of-buffer)
+C-v loop #9 SIGNAL: (end-of-buffer)
+C-v loop #10 SIGNAL: (end-of-buffer)
+C-v loop #11 SIGNAL: (end-of-buffer)
+C-v loop #12 SIGNAL: (end-of-buffer)
+M-v from last page             ws= 77 pt= 96 wend= 98 h=21
+line 50 ws 1                   ws=  1 pt= 11 wend= 22 h=21
+recenter nil                   ws=  1 pt= 11 wend= 22 h=21
+recenter 0                     ws= 11 pt= 11 wend= 32 h=21
+recenter -1                    ws=  1 pt= 11 wend= 22 h=21
+recenter 3                     ws=  8 pt= 11 wend= 29 h=21
+recenter -3                    ws=  1 pt= 11 wend= 22 h=21
+C-l #1                         ws=  1 pt= 11 wend= 22 h=21
+C-l #2                         ws= 11 pt= 11 wend= 32 h=21
+C-l #3                         ws=  1 pt= 11 wend= 22 h=21
+C-l #4                         ws=  1 pt= 11 wend= 22 h=21
+C-l arg 2                      ws=  9 pt= 11 wend= 30 h=21
+line 3 ws 1                    ws=  1 pt=  3 wend= 22 h=21
+C-l near top #1                ws=  1 pt=  3 wend= 22 h=21
+C-l near top #2                ws=  3 pt=  3 wend= 24 h=21
+C-l near top #3                ws=  1 pt=  3 wend= 22 h=21
+line 99                        ws= 89 pt= 99 wend=101 h=21
+C-l near end #1                ws= 89 pt= 99 wend=101 h=21
+C-l near end #2                ws= 99 pt= 99 wend=101 h=21
+C-l near end #3                ws= 79 pt= 99 wend=100 h=21
+line 9 ws 1                    ws=  1 pt=  9 wend= 22 h=21
+C-v from line 9                ws= 20 pt= 20 wend= 41 h=21
+line 23 ws 1 (last visible)    ws=  1 pt= 11 wend= 22 h=21
+C-v from line 23               ws= 20 pt= 20 wend= 41 h=21
+two pages                      ws= 39 pt= 39 wend= 60 h=21
+pt last visible                ws= 39 pt= 59 wend= 60 h=21
+M-v pt last visible            ws= 20 pt= 40 wend= 41 h=21
+pos-visible: point=t pmin=nil
+pt 50 ws 1 (set-window-start, pt off) ws=  1 pt= 11 wend= 22 h=21

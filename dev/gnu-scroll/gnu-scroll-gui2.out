@@ -1,0 +1,8 @@
+ws 70 pt 71                    ws= 70 pt= 71 wend= 92 h=22
+C-v arg 50 from ws70           SIGNAL: (end-of-buffer)
+ws 30                          ws= 30 pt= 30 wend= 51 h=21
+M-v arg 50 from ws30           ws=  1 pt= 21 wend= 22 h=21
+ws 30 again                    ws= 30 pt= 30 wend= 51 h=21
+M-v arg 29 from ws30           ws=  1 pt= 21 wend= 22 h=21
+pt 41 ws 1 -> redisplay        ws=  1 pt= 11 wend= 22 h=21
+ws 50 pt 1 -> redisplay        ws= 50 pt= 60 wend= 71 h=21

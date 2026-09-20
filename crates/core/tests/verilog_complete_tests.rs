@@ -653,6 +653,17 @@ fn second_port_connection_in_same_instantiation_offers_ports() {
 fn bare_second_dot_after_comma_offers_all_ports() {
     // Docstring's own shape 2, verbatim: `.wr(x), .' -- a bare SECOND
     // dot right after a comma, port_name a zero-width MISSING node.
+    //
+    // M143 Part B changed this test's own expectation: `wr' is a
+    // genuinely SEPARATE, already-completed connection on this same
+    // instance, not the connection under the cursor (that's the bare
+    // `.', a different `named_port_connection' with no `port_name'
+    // field at all -- see `verilog-complete--port-context''s own
+    // SELF-CONNECTION doc). So `wr' is now correctly EXCLUDED from the
+    // popup; only `clk' and `rd' remain unconnected. Before M143 Part B
+    // this asserted `["clk", "rd", "wr"]' (v1 offered every port,
+    // already-connected or not, see this file's own no-longer-true
+    // header note this milestone rewrote).
     let (mut i, ed) = setup();
     let src = "module top;\n  fifo u_fifo ( .wr(1), . );\nendmodule\n\nmodule fifo (input wr, input rd, input clk);\nendmodule\n";
     insert_src(&mut i, src);
@@ -668,8 +679,9 @@ fn bare_second_dot_after_comma_offers_all_ports() {
     names.sort();
     assert_eq!(
         names,
-        vec!["clk".to_string(), "rd".to_string(), "wr".to_string()],
-        "empty prefix -> every port of fifo offered: {:?}",
+        vec!["clk".to_string(), "rd".to_string()],
+        "empty prefix -> every NOT-YET-connected port of fifo offered, \
+         `wr' excluded as already connected on this instance: {:?}",
         names
     );
 }
@@ -689,6 +701,274 @@ fn multiline_instantiation_offers_ports() {
     let items = popup_items(&ed).expect("popup must open");
     let names = insert_names(&items);
     assert_eq!(names, vec!["wr".to_string()]);
+}
+
+// ============================================================
+// M143 Part B: already-connected ports (on the SAME instance) are
+// excluded from the popup, without deleting the connection currently
+// under the cursor.
+// ============================================================
+
+#[test]
+fn already_connected_ports_absent_from_popup_with_empty_prefix() {
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_fifo ( .wr(1), .rd(2), . );\nendmodule\n\nmodule fifo (input wr, input rd, input clk);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, ".wr(1), .rd(2), .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let names = insert_names(&items);
+    assert_eq!(
+        names,
+        vec!["clk".to_string()],
+        "wr/rd already connected on this instance must be excluded, empty prefix: {:?}",
+        names
+    );
+}
+
+#[test]
+fn already_connected_ports_absent_from_popup_with_typed_prefix() {
+    // The already-connected port MUST share the typed prefix, or this test
+    // cannot see the feature it names. The first version of this fixture
+    // connected `.wr(1)' and typed "r": `wr' does not start with "r", so the
+    // ordinary prefix filter removed it on its own and the assertion held
+    // identically with exclusion deleted. M143's mutation run caught that --
+    // entry B1c SURVIVED while B1/B1b, the byte-identical mutation, both went
+    // red. Here `rd' is connected AND matches the prefix, so `rd' can only be
+    // absent because exclusion removed it: with the feature deleted this
+    // returns ["rd", "rst"].
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_fifo ( .rd(1), .r );\nendmodule\n\nmodule fifo (input rd, input rst, input wr);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, ".rd(1), .r");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["rst".to_string()],
+        "typed prefix \"r\" excludes the already-connected `rd' (which also matches \"r\") and \
+         narrows to the remaining r-prefixed port: {:?}",
+        names
+    );
+}
+
+#[test]
+fn two_instances_in_one_statement_named_shape_do_not_leak_connections() {
+    // Companion to `two_instances_in_one_statement_do_not_leak_connections_
+    // between_them', which covers the OTHER parse shape. That one's dot is
+    // bare (`u_b ( . )'), which parses as an ERROR node, so
+    // `verilog-complete--port-context' resolves it through its ERROR branch.
+    // This one types an identifier after the dot (`u_b ( .w )'), so the dot's
+    // parent IS a `named_port_connection' and the FIRST branch runs instead.
+    //
+    // Both branches build the exclusion scope independently, so a scope
+    // widened to `module_instantiation' in only one of them is invisible to
+    // the other's test. M143's mutation run demonstrated exactly that: the
+    // mutation rewrote the first branch, and the bare-dot test SURVIVED it.
+    //
+    // Here u_a's own `.wr(1)' must not narrow u_b's popup. With the scope
+    // widened to the enclosing `module_instantiation', `wr' is excluded, the
+    // prefix "w" then matches nothing, and no popup opens at all.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_a ( .wr(1) ), u_b ( .w );\nendmodule\n\nmodule fifo (input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, "u_b ( .w");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["wr".to_string()],
+        "u_a's own .wr(1) must not be excluded from u_b's separate popup: {:?}",
+        names
+    );
+}
+
+#[test]
+fn two_instances_in_one_statement_do_not_leak_connections_between_them() {
+    // `u_a'/`u_b' are two `hierarchical_instance' children of the SAME
+    // `module_instantiation'. Scoping the exclusion set on the wider
+    // `module_instantiation' node (instead of the `hierarchical_
+    // instance' the dot actually belongs to) would leak `u_a''s own
+    // `.wr(1)' connection into `u_b''s popup -- this test fails exactly
+    // that way if the scope node is `module_instantiation'.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_a ( .wr(1) ), u_b ( . );\nendmodule\n\nmodule fifo (input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, "u_b ( .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["rd".to_string(), "wr".to_string()],
+        "u_a's own .wr(1) connection must not narrow u_b's own, separate popup: {:?}",
+        names
+    );
+}
+
+#[test]
+fn reediting_an_existing_connection_still_offers_its_own_port_name() {
+    // `sram_bank u_bank ( .|clk_i(c), .rst_ni(r) );' -- the cursor sits
+    // right after the dot of an already-complete connection (empty
+    // typed prefix, the rest of `clk_i(c)' already in the buffer --
+    // treesit parses the WHOLE buffer regardless of point, so this is
+    // still the SAME `named_port_connection' node
+    // `verilog-complete--port-context' returns as SELF-CONNECTION).
+    // Naive exclusion (scoped on the whole instance, no self-skip)
+    // would delete `clk_i' from its own popup; correct behavior offers
+    // it right alongside `wr_en', the one genuinely unconnected port.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  sram_bank u_bank ( .clk_i(c), .rst_ni(r) );\nendmodule\n\nmodule sram_bank (input clk_i, input rst_ni, input wr_en);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, "u_bank ( .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["clk_i".to_string(), "wr_en".to_string()],
+        "clk_i is the connection under the cursor, must not be excluded from its own popup; \
+         rst_ni is a genuinely separate connection, must be excluded: {:?}",
+        names
+    );
+}
+
+#[test]
+fn a_sibling_instance_elsewhere_in_the_module_does_not_narrow_this_one() {
+    // Two entirely separate instantiation STATEMENTS (not comma-
+    // separated within one) of the same module type -- u_a's own
+    // connection must not leak into u_b's popup either.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_a ( .wr(1) );\n  fifo u_b ( . );\nendmodule\n\nmodule fifo (input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, "u_b ( .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["rd".to_string(), "wr".to_string()],
+        "a sibling instance's own connection must not narrow this instance's popup: {:?}",
+        names
+    );
+}
+
+#[test]
+fn wildcard_connection_does_not_suppress_unconnected_ports() {
+    // `.*' auto-connects every port not otherwise named, but it is not
+    // an EXPLICIT connection itself (see `verilog-auto--explicitly-
+    // connected-port-names's own docstring, verilog-auto.el M143 Part
+    // A) -- it must contribute ZERO names to the exclusion set. Before
+    // this test, this file's own header flatly said this shape was
+    // UNTESTED.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_fifo ( .*, .wr(1), . );\nendmodule\n\nmodule fifo (input wr, input rd, input clk);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, ".*, .wr(1), .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["clk".to_string(), "rd".to_string()],
+        "wr excluded (explicitly connected), .* contributes nothing to the exclusion set so \
+         clk/rd -- not explicitly connected -- are still offered: {:?}",
+        names
+    );
+}
+
+#[test]
+fn missing_port_name_connection_does_not_poison_the_exclusion_set() {
+    // M144: a bare, non-self `.' has a MISSING `port_name' node (empty
+    // text) -- it must not survive into the exclusion set as if some
+    // invisible port were connected (that would be the pre-M144 `""'
+    // bug, verilog-auto.el fact 1), and it must not itself show up as a
+    // candidate. Only `clk_i', explicitly connected, is excluded; the
+    // self-dot (the SECOND, non-self bare dot in this source -- point
+    // sits at the THIRD dot, which is the one under the cursor) is
+    // excluded from the exclusion set for the ordinary self-skip
+    // reason, not because of anything M144 changed.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  sub u0 ( ., .clk_i(c), . );\nendmodule\n\nmodule sub (input clk_i, input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, "sub u0 ( ., .clk_i(c), .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    let items = popup_items(&ed).expect("popup must open");
+    let mut names = insert_names(&items);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["rd".to_string(), "wr".to_string()],
+        "clk_i excluded (explicitly connected); the first bare-dot MISSING connection \
+         contributes nothing -- no empty-string candidate, no signal name: {:?}",
+        names
+    );
+    // "no empty candidate" is already pinned by the exact `names'
+    // equality above (an inert `""' from the pre-M144 bug would have
+    // shown up as a THIRD candidate, not changed `rd'/`wr'). `echo' is
+    // NOT asserted here: a fresh `setup()' editor already carries an
+    // unrelated startup message (observed: "Theme: dracula"), so
+    // `echo.is_none()' does not hold even on an unrelated buffer -- it
+    // is not a signal this completion path itself produces.
+}
+
+#[test]
+fn cursor_at_the_wildcards_own_dot_offers_nothing() {
+    // M144 Part C: header section (a) named this shape STILL UNTESTED.
+    // Point right after `.*' itself (`.*|') -- the character
+    // immediately before point is `*', not `.', so
+    // `verilog-complete--port-context''s own `(eq before ?.)' check
+    // fails and it returns nil before ever reaching treesit.
+    // `verilog-complete-at-point' must return nil and show no popup.
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_fifo ( .clk_i(c), .* );\nendmodule\n\nmodule fifo (input clk_i, input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, ".clk_i(c), .*");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(
+        r, "nil",
+        "cursor right after the wildcard's own `.*' must not trigger port completion: {}",
+        r
+    );
+    assert!(popup_items(&ed).is_none(), "no popup expected");
+}
+
+#[test]
+fn every_port_already_connected_produces_a_distinct_message_naming_the_module() {
+    let (mut i, ed) = setup();
+    let src = "module top;\n  fifo u_fifo ( .wr(1), .rd(2), . );\nendmodule\n\nmodule fifo (input wr, input rd);\nendmodule\n";
+    insert_src(&mut i, src);
+    goto_after(&mut i, ".wr(1), .rd(2), .");
+    let r = run(&mut i, "(verilog-complete-at-point)");
+    assert_eq!(r, "t", "{}", r);
+    assert!(
+        popup_items(&ed).is_none(),
+        "no candidates once every port is already connected"
+    );
+    let echo = ed.borrow().echo.clone();
+    assert!(
+        echo.as_deref()
+            .is_some_and(|m| m.contains("already connected") && m.contains("fifo")),
+        "must message that every port of `fifo' is already connected, distinguishing from \
+         both module-not-found and no-matching-prefix: {:?}",
+        echo
+    );
 }
 
 #[test]
@@ -981,6 +1261,15 @@ fn clear_library_cache_command_forces_a_reparse() {
     goto_after(&mut i, ".wr");
     ok(&mut i, "(verilog-complete-at-point)");
     assert_eq!(run(&mut i, "test-parse-count"), "1");
+    // M143 Part B coverage gap this test used to leave open: `fifo' has
+    // exactly ONE port (`wr'), and the cursor's own connection IS that
+    // port -- a self-skip regression (excluding the connection under
+    // the cursor from its own popup) would silently empty this popup
+    // and swap it for the "every port already connected" message
+    // instead, invisible to this test's own `test-parse-count'
+    // assertions alone.
+    let items = popup_items(&ed).expect("self connection must not be excluded from its own popup");
+    assert_eq!(insert_names(&items), vec!["wr".to_string()]);
     ok(&mut i, "(hide-completion-popup)");
     ok(&mut i, "(verilog-complete-clear-library-cache)");
     ok(&mut i, "(verilog-complete-at-point)");
@@ -989,7 +1278,8 @@ fn clear_library_cache_command_forces_a_reparse() {
         "2",
         "manual cache clear must force a re-read/re-parse even with unchanged content"
     );
-    let _ = &ed;
+    let items = popup_items(&ed).expect("self connection must not be excluded after cache clear");
+    assert_eq!(insert_names(&items), vec!["wr".to_string()]);
 }
 
 // ============================================================
@@ -1793,6 +2083,44 @@ fn parameter_completion_recovers_the_type_name_across_a_comment_between_hash_and
 // 9. verible-verilog-ls e2e: local source wins over a connected LSP
 // ============================================================
 
+/// Set this to an affirmative value to turn a missing `verible-verilog-ls`
+/// on PATH into a deliberate, visible skip instead of a failure -- M143
+/// Part B: the two `manual_e2e_verible_*` tests below used to
+/// `eprintln!` and silently `return` on a missing binary, which
+/// `cargo test --workspace --no-fail-fast` (this project's own
+/// definition of done, no `--nocapture`) discards for a PASSING test,
+/// so a green gate could mean these never ran at all. Shape copied from
+/// `dev_tools_tests.rs`'s own `SKIP_ENV`/opt-out gate.
+const SKIP_ENV: &str = "RETICLE_ALLOW_MISSING_VERIBLE_LS";
+
+/// true if the caller should proceed (the binary is present); false if
+/// the caller should `return` early because a deliberate opt-out was
+/// set. Panics (does not return) when the binary is absent and no
+/// opt-out was set -- see `SKIP_ENV`'s own doc comment.
+fn require_verible_verilog_ls() -> bool {
+    if have_on_path("verible-verilog-ls") {
+        return true;
+    }
+    let opted_out = matches!(
+        std::env::var(SKIP_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if opted_out {
+        eprintln!(
+            "skipping (opted out via {}): verible-verilog-ls is not on PATH",
+            SKIP_ENV
+        );
+        return false;
+    }
+    panic!(
+        "verible-verilog-ls is not on PATH -- this e2e test was not run. Failing by \
+         default so a missing dependency cannot silently pass as a green gate. Install \
+         verible-verilog-ls, or set {}=1 to deliberately skip on a machine that \
+         genuinely lacks it.",
+        SKIP_ENV
+    );
+}
+
 /// Whether CMD resolves to a real executable on PATH -- copied from
 /// `lsp_mode_tests.rs`'s own `have_on_path` verbatim (deliberately not
 /// shared across test files, matching that file's own note on why).
@@ -1821,8 +2149,7 @@ fn manual_e2e_verible_connected_port_completion_still_opens_the_local_popup() {
     // still open a real popup -- proving `local-completion-function'
     // (verilog-complete.el) wins ahead of, and entirely independently
     // of, whatever the connected server can or can't do.
-    if !have_on_path("verible-verilog-ls") {
-        eprintln!("skipping: verible-verilog-ls not on PATH");
+    if !require_verible_verilog_ls() {
         return;
     }
     let (mut i, ed) = setup();
@@ -1890,8 +2217,7 @@ fn manual_e2e_verible_capability_gate_falls_to_dabbrev_at_a_non_port_position() 
     //      returns nil) falls all the way through to `dabbrev-expand',
     //      not a doomed `textDocument/completion' request -- i.e. the
     //      gate this milestone exists for actually blocks something.
-    if !have_on_path("verible-verilog-ls") {
-        eprintln!("skipping: verible-verilog-ls not on PATH");
+    if !require_verible_verilog_ls() {
         return;
     }
     let (mut i, ed) = setup();
@@ -2040,13 +2366,57 @@ fn instantiate_item_for_a_real_demo_rtl_module_with_parameters_and_many_ports() 
     let r = run(&mut i, "(verilog-complete-at-point)");
     assert_eq!(r, "t", "sram_bank must match the typed prefix: {}", r);
     let items = popup_items(&ed).expect("popup must open");
+    // M143 Part C added `demo/rtl/mem/sram_bank_4k.sv', a `.*' wrapper
+    // whose name also starts with the typed "sram_ban", so this prefix
+    // now matches TWO modules and each contributes a plain item plus an
+    // instantiate item. This test used to assert `items.len() == 4' and
+    // index into `items[0]'/`items[1]'/`items[2]' by position, relying
+    // on `sram_bank' sorting before `sram_bank_4k' -- fragile the
+    // moment any further `sram_bank*' demo module lands (M144). Locate
+    // the two `sram_bank'-specific items by label/kind instead, and
+    // assert only that each is present exactly once; the total count
+    // (however many OTHER modules the prefix happens to match) is not
+    // this test's concern.
+    //
+    // Worth recording how the original position-based version broke: a
+    // name-filtered run of the tests being edited at the time passed,
+    // and only the FULL target run showed it -- the same full-vs-
+    // filtered divergence this project's own task-spec rules call out.
+    // The mutation runner's baseline check is what refused to proceed.
+    let plain_matches: Vec<&(String, String, usize, String)> =
+        items.iter().filter(|it| it.1 == "sram_bank").collect();
     assert_eq!(
-        items.len(),
-        2,
-        "one matching module -> plain item + instantiate item: {:?}",
+        plain_matches.len(),
+        1,
+        "exactly one plain `sram_bank' item (insert == \"sram_bank\"): {:?}",
         items
     );
-    assert_eq!(items[0].1, "sram_bank", "plain-name item unchanged");
+    // The instantiate item's own label is `"sram_bank  (instantiate,
+    // N ports)"' (built below) -- the two-space-then-paren prefix
+    // distinguishes it from `sram_bank_4k'\'s own instantiate item,
+    // whose label is `"sram_bank_4k  (instantiate, ...)"' and does NOT
+    // share this exact prefix.
+    let instantiate_matches: Vec<&(String, String, usize, String)> = items
+        .iter()
+        .filter(|it| it.0.starts_with("sram_bank  (instantiate"))
+        .collect();
+    assert_eq!(
+        instantiate_matches.len(),
+        1,
+        "exactly one `sram_bank' instantiate item: {:?}",
+        items
+    );
+    let plain = plain_matches[0];
+    let instantiate = instantiate_matches[0];
+    // `plain.1' ("insert") is already pinned to exactly "sram_bank" by
+    // `plain_matches''s own filter above; `plain.0' ("label") carries
+    // additional provenance (`"sram_bank (sram_bank.sv)"') this test
+    // has never pinned and isn't the M144 rewrite's concern.
+    assert!(
+        plain.0.starts_with("sram_bank"),
+        "plain item's own label still names sram_bank: {:?}",
+        plain
+    );
 
     let indent = "  ";
     let cont_indent = "    ";
@@ -2106,30 +2476,37 @@ fn instantiate_item_for_a_real_demo_rtl_module_with_parameters_and_many_ports() 
     );
 
     assert_eq!(
-        items[1].1, expanded_expected,
+        instantiate.1, expanded_expected,
         "instantiate item's `insert' must be the raw snippet with every tab stop expanded"
     );
     assert_eq!(
-        items[1].0,
+        instantiate.0,
         format!("sram_bank  (instantiate, {} ports)", port_names.len())
     );
 
     // Cursor lands right at the default instance name -- payload isn't
     // observable via `popup_items' (label/insert/start/filter only), so
     // read `PopupItem::payload' directly off `Editor::completion_popup'.
-    let payload = ed.borrow().completion_popup.as_ref().unwrap().items[1]
-        .payload
-        .clone();
+    // Located by label match rather than a fixed index, same reasoning
+    // as `instantiate_matches' above.
+    let popup_borrow = ed.borrow();
+    let raw_items = &popup_borrow.completion_popup.as_ref().unwrap().items;
+    let instantiate_idx = raw_items
+        .iter()
+        .position(|it| it.label.starts_with("sram_bank  (instantiate"))
+        .expect("instantiate item present in the raw popup");
+    let payload = raw_items[instantiate_idx].payload.clone();
+    drop(popup_borrow);
     let offset = payload
         .as_deref()
         .and_then(|p| p.strip_prefix("offset:"))
         .and_then(|n| n.parse::<usize>().ok())
         .expect("instantiate item must carry an `offset:N' payload (the `$0' stop)");
     assert!(
-        items[1].1[offset..].starts_with("u_sram_bank"),
+        instantiate.1[offset..].starts_with("u_sram_bank"),
         "offset must point right at the default instance name: {} / {}",
         offset,
-        items[1].1
+        instantiate.1
     );
 }
 
@@ -2170,5 +2547,386 @@ fn instantiate_item_for_a_zero_port_zero_parameter_module_offers_an_empty_shell(
         payload.as_deref().unwrap_or("").starts_with("offset:"),
         "even the empty-shell skeleton carries a `$0' cursor stop at the instance name: {:?}",
         payload
+    );
+}
+
+// ============================================================
+// M147: library-order contract + dedupe of the popup's unactionable
+// duplicates. Fixture: two library directories, `liba/' and `libb/',
+// each declaring `module fifo' with a DIFFERENT port list, so ports
+// alone tell which directory answered.
+// ============================================================
+
+/// Writes `liba/fifo.sv' and `libb/fifo.sv' (a distinct one-port port
+/// list each, so the two are trivially distinguishable) under DIR, and
+/// returns (liba_path, libb_path) as strings, in that order.
+fn write_two_library_dirs(dir: &std::path::Path) -> (String, String) {
+    let liba = dir.join("liba");
+    let libb = dir.join("libb");
+    std::fs::create_dir_all(&liba).unwrap();
+    std::fs::create_dir_all(&libb).unwrap();
+    std::fs::write(
+        liba.join("fifo.sv"),
+        "module fifo (input wr_a, output full_a);\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        libb.join("fifo.sv"),
+        "module fifo (input wr_b, output full_b, input clk_b);\nendmodule\n",
+    )
+    .unwrap();
+    (
+        liba.to_str().unwrap().to_string(),
+        libb.to_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn library_entry_resolves_by_verilog_library_directories_order() {
+    // B2: `verilog-complete--library-entry' has no cross-directory
+    // coverage at all before this test -- it is the order-sensitive
+    // site every port/parameter completion resolves through.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("lib_order");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (liba, libb) = write_two_library_dirs(&dir);
+    let top_path = dir.join("top.sv");
+    std::fs::write(&top_path, "module top;\nendmodule\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+    ok(&mut i, "(verilog-mode)");
+
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?} {:?}))",
+            liba, libb
+        ),
+    );
+    let ports = extract_quoted(&ok(
+        &mut i,
+        "(mapcar (function car) (verilog-complete--library-ports \"fifo\"))",
+    ));
+    assert_eq!(
+        ports,
+        vec!["wr_a".to_string(), "full_a".to_string()],
+        "liba listed first -> its `fifo' wins: {:?}",
+        ports
+    );
+
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?} {:?}))",
+            libb, liba
+        ),
+    );
+    let ports_rev = extract_quoted(&ok(
+        &mut i,
+        "(mapcar (function car) (verilog-complete--library-ports \"fifo\"))",
+    ));
+    assert_eq!(
+        ports_rev,
+        vec![
+            "wr_b".to_string(),
+            "full_b".to_string(),
+            "clk_b".to_string()
+        ],
+        "reversing `verilog-library-directories' must flip the winner: {:?}",
+        ports_rev
+    );
+}
+
+#[test]
+fn all_modules_dedupes_same_named_library_files_first_occurrence_wins() {
+    // B3: the dedupe itself. Same two-directory fixture as B2. Before
+    // M147, `(verilog-complete--all-modules)' held ONE `fifo' entry per
+    // library file (two here), and the popup built from them showed
+    // FOUR items for a "fifo" prefix where only two are meaningful
+    // (every resolver downstream re-resolves by bare name and picks
+    // the first match regardless of which popup item was chosen).
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("dedupe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (liba, _libb) = write_two_library_dirs(&dir);
+    let top_path = dir.join("top.sv");
+    std::fs::write(&top_path, "module top;\n  fif\nendmodule\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+    ok(&mut i, "(verilog-mode)");
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?} {:?}))",
+            liba, _libb
+        ),
+    );
+
+    // Exactly one `fifo' entry in `--all-modules', SOURCE = the
+    // basename of the winning (first) file.
+    let all = ok(&mut i, "(verilog-complete--all-modules)");
+    let fifo_count = all.matches("(\"fifo\"").count();
+    assert_eq!(
+        fifo_count, 1,
+        "exactly one `fifo' entry, not one per library file: {}",
+        all
+    );
+    assert!(
+        all.contains("(\"fifo\" . \"fifo.sv\")"),
+        "surviving SOURCE names the winning file's basename: {}",
+        all
+    );
+
+    // The popup built for a typed "fif" prefix has exactly 2 `fifo'
+    // items (plain + instantiate), not 4. Reached through
+    // `--items-for-entry' directly over the filtered candidates,
+    // rather than through the live popup, since
+    // `--handle-instantiation-type-context' needs a live popup and
+    // this asserts on the underlying item-construction step it calls.
+    let items_src = ok(
+        &mut i,
+        "(let* ((all (verilog-complete--all-modules)) \
+           (candidates (verilog-auto--filter (lambda (e) (string-prefix-p \"fif\" (car e))) all)) \
+           (indent \"\")) \
+           (apply (function append) \
+             (mapcar (lambda (e) (verilog-complete--items-for-entry e (point) indent)) candidates)))",
+    );
+    // Count ITEMS, not raw occurrences of the string "fifo" -- each
+    // item's own label/insert/filter can legitimately repeat the name
+    // (e.g. `("fifo (fifo.sv)" "fifo" 1 "fifo")' already has two), so
+    // count by each item's own distinguishing label prefix instead:
+    // exactly one plain item (`"fifo (fifo.sv)"') and exactly one
+    // instantiate item (`"fifo  (instantiate"'), never a second
+    // occurrence of either.
+    let plain_count = items_src.matches("(\"fifo (fifo.sv)\"").count();
+    let instantiate_count = items_src.matches("(\"fifo  (instantiate").count();
+    assert_eq!(
+        (plain_count, instantiate_count),
+        (1, 1),
+        "exactly 2 `fifo' items (one plain, one instantiate), not 4: {}",
+        items_src
+    );
+}
+
+#[test]
+fn all_modules_dedupe_prefers_the_buffer_over_a_library_file() {
+    // B4: a module declared BOTH in the current buffer and in a
+    // library file, same name -- the buffer's own entry (SOURCE nil,
+    // bare label) must be the survivor, not the library one. Without
+    // this test, a dedupe that kept the LAST occurrence instead of the
+    // FIRST would still pass B3 (which only has library-side
+    // duplicates).
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("buffer_wins");
+    std::fs::create_dir_all(&dir).unwrap();
+    let libdir = dir.join("lib");
+    std::fs::create_dir_all(&libdir).unwrap();
+    std::fs::write(
+        libdir.join("fifo.sv"),
+        "module fifo (input wr_lib);\nendmodule\n",
+    )
+    .unwrap();
+    let top_path = dir.join("top.sv");
+    std::fs::write(
+        &top_path,
+        "module fifo (input wr_buf);\nendmodule\n\nmodule top;\nendmodule\n",
+    )
+    .unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+    ok(&mut i, "(verilog-mode)");
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?}))",
+            libdir.to_str().unwrap()
+        ),
+    );
+    let all = ok(&mut i, "(verilog-complete--all-modules)");
+    let fifo_count = all.matches("(\"fifo\"").count();
+    assert_eq!(
+        fifo_count, 1,
+        "exactly one `fifo' entry after dedupe: {}",
+        all
+    );
+    assert!(
+        all.contains("(\"fifo\")") || all.contains("(\"fifo\" . nil)"),
+        "the surviving entry must be the buffer's own (SOURCE nil, bare label): {}",
+        all
+    );
+}
+
+// ============================================================
+// M147 fix round: `verilog-complete--any-module-name-matches-p' and
+// `verilog-complete--module-found-p' each have a `(or <buffer scan>
+// <library loop>)' shape. Both existing library-branch tests above
+// (`empty_port_list_in_a_library_file_exercises_the_module_found_p_
+// library_branch' and the keyword-prefix test for `--any-module-name-
+// matches-p') either short-circuit on the buffer scan or only ever
+// populate ONE library file, so `(verilog-auto--library-files)'
+// returns a single-element list there -- reversing a one-element list
+// is the identity, so a mutation swapping scan ORDER inside the
+// library loop is unobservable by either test. These two tests give
+// each function a buffer with NO matching module at all (forcing the
+// `or' into its library branch) and TWO library directories with
+// DIFFERENT module names, so the loop must actually walk past the
+// first file's entry before it can find the second file's -- a real,
+// executed two-element scan, not a single-file loop that happens to
+// terminate on iteration one.
+// ============================================================
+
+#[test]
+fn any_module_name_matches_p_reaches_the_library_loop_with_two_library_files() {
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("m147_any_name_two_libs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let liba = dir.join("liba");
+    let libb = dir.join("libb");
+    std::fs::create_dir_all(&liba).unwrap();
+    std::fs::create_dir_all(&libb).unwrap();
+    std::fs::write(
+        liba.join("unrelated.sv"),
+        "module unrelated_mod (input a);\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        libb.join("target.sv"),
+        "module target_mod (input b);\nendmodule\n",
+    )
+    .unwrap();
+    // The buffer itself declares no module at all, so `(verilog-
+    // complete--any-module-name-matches-p ...)''s buffer-scan half of
+    // the `or' can never supply the answer -- only the library loop
+    // can.
+    let top_path = dir.join("top.sv");
+    std::fs::write(&top_path, "// no module declared here\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+    ok(&mut i, "(verilog-mode)");
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?} {:?}))",
+            liba.to_str().unwrap(),
+            libb.to_str().unwrap()
+        ),
+    );
+
+    // Ground truth: confirm the library-file scan really does see BOTH
+    // files before trusting the loop-reaching claim above -- if this
+    // came back with only one path, the fixture itself would be the
+    // one-file trap this test exists to avoid.
+    let files = ok(&mut i, "(verilog-auto--library-files)");
+    assert_eq!(
+        files.matches(".sv").count(),
+        2,
+        "fixture must expose exactly two distinct library files, not one: {}",
+        files
+    );
+
+    let found = ok(
+        &mut i,
+        "(verilog-complete--any-module-name-matches-p \"target_mod\")",
+    );
+    assert_eq!(
+        found, "t",
+        "\"target_mod\" only exists in the SECOND library directory -- the loop must walk \
+         past liba's unrelated file to reach it: {}",
+        found
+    );
+
+    let not_found = ok(
+        &mut i,
+        "(verilog-complete--any-module-name-matches-p \"nonexistent_prefix_zzz\")",
+    );
+    assert_eq!(
+        not_found, "nil",
+        "a prefix present in neither library directory nor the buffer must return nil only \
+         after the loop has walked both files: {}",
+        not_found
+    );
+}
+
+#[test]
+fn module_found_p_reaches_the_library_loop_with_two_library_files() {
+    // Same fixture shape as `any_module_name_matches_p_reaches_the_
+    // library_loop_with_two_library_files' above, for `verilog-
+    // complete--module-found-p''s own `(or (verilog-auto--find-module-
+    // in-buffer name) <library loop>)'. The existing library-branch
+    // test for this function
+    // (`empty_port_list_in_a_library_file_exercises_the_module_found_p_
+    // library_branch') does force the loop to run, but its fixture
+    // only ever creates ONE library file -- `(verilog-auto--library-
+    // files)' there returns a single-element list, so reversing scan
+    // order inside the loop is a no-op on that data. Here there are
+    // two library directories with two DIFFERENTLY NAMED modules, so
+    // the loop must actually advance past the first file to find the
+    // module that only exists in the second.
+    let (mut i, _ed) = setup();
+    let dir = scratch_dir("m147_module_found_two_libs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let liba = dir.join("liba");
+    let libb = dir.join("libb");
+    std::fs::create_dir_all(&liba).unwrap();
+    std::fs::create_dir_all(&libb).unwrap();
+    std::fs::write(
+        liba.join("unrelated.sv"),
+        "module unrelated_mod (input a);\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        libb.join("target.sv"),
+        "module target_mod (input b);\nendmodule\n",
+    )
+    .unwrap();
+    let top_path = dir.join("top.sv");
+    std::fs::write(&top_path, "// no module declared here\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file-internal {:?})", top_path.to_str().unwrap()),
+    );
+    ok(&mut i, "(verilog-mode)");
+    ok(
+        &mut i,
+        &format!(
+            "(setq-local verilog-library-directories (list {:?} {:?}))",
+            liba.to_str().unwrap(),
+            libb.to_str().unwrap()
+        ),
+    );
+
+    let files = ok(&mut i, "(verilog-auto--library-files)");
+    assert_eq!(
+        files.matches(".sv").count(),
+        2,
+        "fixture must expose exactly two distinct library files, not one: {}",
+        files
+    );
+
+    let found = ok(&mut i, "(verilog-complete--module-found-p \"target_mod\")");
+    assert_eq!(
+        found, "t",
+        "\"target_mod\" only exists in the SECOND library directory -- the loop must walk \
+         past liba's unrelated file to reach it: {}",
+        found
+    );
+
+    let not_found = ok(
+        &mut i,
+        "(verilog-complete--module-found-p \"nonexistent_mod_zzz\")",
+    );
+    assert_eq!(
+        not_found, "nil",
+        "a module present in neither library directory nor the buffer must return nil only \
+         after the loop has walked both files: {}",
+        not_found
     );
 }

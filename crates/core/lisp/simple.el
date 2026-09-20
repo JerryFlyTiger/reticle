@@ -910,6 +910,54 @@ worth flagging.")
 (global-set-key "C-x {" 'shrink-window-horizontally)
 (global-set-key "C-x +" 'balance-windows)
 
+;; M138: `this-command'/`last-command' -- the interpreter has no built-in
+;; notion of these; `execute_command'/`finish_command' (commands.rs) copy
+;; the Rust-side bookkeeping into these two elisp globals on every
+;; dispatched command, so `recenter-top-bottom' below can tell whether it
+;; was itself the previous command.
+(defvar this-command nil
+  "The command currently being executed, set by the command dispatcher.")
+(defvar last-command nil
+  "The previous value of this-command, set after a command finishes.")
+
+;; M138: viewport primitives / Emacs paging commands. `window-start',
+;; `set-window-start', `pos-visible-in-window-p', `window-text-height',
+;; `recenter', `scroll-up-command' and `scroll-down-command' are Rust
+;; builtins (builtins/ui.rs); `recenter-top-bottom' is the only elisp-level
+;; piece, since GNU's own cycling behavior needs `last-command'.
+(defvar next-screen-context-lines 2
+  "Number of lines of continuity kept on screen by scroll-up-command
+and scroll-down-command when called with no explicit count.")
+(defvar recenter-positions '(middle top bottom)
+  "Cycle order `recenter-top-bottom' advances through on repeated calls.")
+(defvar recenter-last-op nil
+  "Which element of `recenter-positions' the last `recenter-top-bottom'
+call used, or nil if the last command was something else.")
+
+(defun recenter-top-bottom (&optional arg)
+  "Move point's line to the center, or cycle center/top/bottom on
+repeated calls with no ARG, exactly as GNU Emacs's command of the
+same name."
+  (interactive)
+  (if arg
+      (recenter arg)
+    (progn
+      (setq recenter-last-op
+            (if (eq last-command 'recenter-top-bottom)
+                (let ((rest (cdr (member recenter-last-op recenter-positions))))
+                  (if rest (car rest) (car recenter-positions)))
+              (car recenter-positions)))
+      (cond
+       ((eq recenter-last-op 'middle) (recenter))
+       ((eq recenter-last-op 'top) (recenter 0))
+       ((eq recenter-last-op 'bottom) (recenter -1))))))
+
+(global-set-key "C-v" 'scroll-up-command)
+(global-set-key "M-v" 'scroll-down-command)
+(global-set-key "<next>" 'scroll-up-command)
+(global-set-key "<prior>" 'scroll-down-command)
+(global-set-key "C-l" 'recenter-top-bottom)
+
 (global-set-key "C-s" 'isearch-forward)
 (global-set-key "C-r" 'isearch-backward)
 

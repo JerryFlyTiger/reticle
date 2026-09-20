@@ -1397,8 +1397,9 @@ fn c_g_after_a_change_operator_clears_the_undo_amalgamation_flag() {
     feed(&mut i, &ed, "C-g"); // abandons the change via keyboard-quit-hook, not execute_command
     assert_eq!(run(&mut i, "evil--state"), "normal");
     // M34: normal state now sets buffer-local `inhibit-self-insert', so
-    // "z" (unbound in evil--normal-map, the very fact this test used to
-    // exploit) no longer self-inserts there -- flip the flag directly,
+    // "\" (unbound in evil--normal-map, the very fact this test used to
+    // exploit with "z" until M139 claimed it for the scroll-window
+    // family) no longer self-inserts there -- flip the flag directly,
     // bypassing evil.el's state machine, so this probe still reaches a
     // BARE `self_insert' call, i.e. one NOT preceded by any
     // `execute_command' (which would itself clear
@@ -1407,13 +1408,13 @@ fn c_g_after_a_change_operator_clears_the_undo_amalgamation_flag() {
     // would also unbind "u" below, which is bound to `undo' only via
     // evil--normal-map.
     run(&mut i, "(setq-local inhibit-self-insert nil)");
-    feed(&mut i, &ed, "z"); // now an ordinary self-insert again
-    assert_eq!(bs(&mut i), "z");
+    feed(&mut i, &ed, "\\"); // now an ordinary self-insert again
+    assert_eq!(bs(&mut i), "\\");
     feed(&mut i, &ed, "u");
     assert_eq!(
         bs(&mut i),
         "",
-        "a single undo should revert ONLY the unrelated \"z\", not the abandoned cw too"
+        "a single undo should revert ONLY the unrelated \"\\\", not the abandoned cw too"
     );
     feed(&mut i, &ed, "u");
     assert_eq!(
@@ -2640,14 +2641,23 @@ fn normal_state_blocks_an_unbound_ascii_key_from_self_inserting() {
     // enumeration (which couldn't cover CJK anyway).
     //
     // `q` was this test's original example key (still unbound as of
-    // M34) until M42-II claimed it for `evil-record-macro` -- `z' is
-    // the replacement (real vim's fold/scroll-window prefix, none of
-    // which this editor implements, so it stays genuinely unbound).
+    // M34) until M42-II claimed it for `evil-record-macro`; `z' was the
+    // next replacement until M139 claimed it for the scroll-window
+    // family (`zz`/`zt`/`zb`/`z RET`/`z .`/`z -`). This is now the
+    // SECOND time the "guaranteed unbound" example key later got bound
+    // (`q` -> `z` -> `\`) -- a key with a real vim meaning is never a
+    // safe example, so this switches to `\` (vim's default `mapleader`,
+    // bound to nothing in either real vim or this editor).
     let (mut i, ed) = setup_evil("hello world");
-    feed(&mut i, &ed, "z"); // unbound in evil--normal-map
+    assert_eq!(
+        run(&mut i, "(lookup-key (list ?\\\\))"),
+        "nil",
+        "setup: \\ must actually be unbound in normal state"
+    );
+    feed(&mut i, &ed, "\\"); // unbound in evil--normal-map
     assert_eq!(bs(&mut i), "hello world");
     assert_eq!(pt(&mut i), 1);
-    assert_eq!(ed.borrow().echo.clone().as_deref(), Some("z is undefined"));
+    assert_eq!(ed.borrow().echo.clone().as_deref(), Some("\\ is undefined"));
 }
 
 #[test]
@@ -2703,16 +2713,19 @@ fn emacs_state_is_not_inhibited_from_attempting_self_insert() {
 #[test]
 fn evil_mode_off_restores_plain_self_insert_for_cjk_and_unbound_ascii() {
     // `q` was this test's original ASCII example (still unbound as of
-    // M34) until M42-II claimed it for `evil-record-macro` -- `z' is
-    // the replacement (real vim's unimplemented fold/scroll prefix, so
-    // it stays genuinely unbound both here and with evil-mode off).
+    // M34) until M42-II claimed it for `evil-record-macro`, then `z'
+    // until M139 claimed it for the scroll-window family -- `\' is the
+    // replacement (vim's default `mapleader`, bound to nothing in
+    // either real vim or this editor). This is the second time the
+    // "guaranteed unbound" example key later got bound (`q` -> `z` ->
+    // `\`): a key with a real vim meaning is never a safe example.
     // Using a now-BOUND key here would still leave the buffer
     // unchanged (armed a macro-recording capture instead of inserting
     // -- coincidentally the same observable buffer state), but would
     // no longer be testing `inhibit-self-insert' at all.
     let (mut i, ed) = setup_evil("ab");
     run(&mut i, "(goto-char (point-min))");
-    feed(&mut i, &ed, "z"); // blocked: unbound ASCII while evil's normal state is active
+    feed(&mut i, &ed, "\\"); // blocked: unbound ASCII while evil's normal state is active
     assert_eq!(bs(&mut i), "ab");
     feed(&mut i, &ed, CJK_CHAR); // blocked: CJK, same reason
     assert_eq!(bs(&mut i), "ab");
@@ -2722,15 +2735,15 @@ fn evil_mode_off_restores_plain_self_insert_for_cjk_and_unbound_ascii() {
     assert_eq!(run(&mut i, "inhibit-self-insert"), "nil");
 
     run(&mut i, "(goto-char (point-min))");
-    feed(&mut i, &ed, "z");
-    assert_eq!(bs(&mut i), "zab", "z now self-inserts with evil off");
+    feed(&mut i, &ed, "\\");
+    assert_eq!(bs(&mut i), "\\ab", "\\ now self-inserts with evil off");
     assert_eq!(pt(&mut i), 2);
 
     run(&mut i, "(goto-char (point-min))");
     feed(&mut i, &ed, CJK_CHAR);
     assert_eq!(
         bs(&mut i),
-        "界zab",
+        "界\\ab",
         "CJK now self-inserts with evil off too"
     );
 }
@@ -2795,5 +2808,900 @@ fn evil_scroll_down_uses_selected_windows_height_not_frames() {
         5,
         "C-d must scroll by half the SELECTED window's text height (2 \
          lines here), not half the frame's (20 lines)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// M139: viewport family (C-f/C-b/C-e/C-y/C-d/C-u, z-family)
+//
+// Every measured pair below is quoted from a real vim run
+// (`/usr/bin/vim -u NONE -N`, 23 text rows) captured under
+// `dev/vim-scroll/` -- see its README for the exact command and the raw
+// `.out` files. Frame `(80, 25)` gives `text_rows == 23` the same way
+// `viewport_tests.rs`'s own header documents (`rows - 2`: echo row +
+// this single window's own mode-line row).
+// ---------------------------------------------------------------------
+
+/// A 100-line buffer ("line 1".."line 100", trailing newline), the exact
+/// shape `dev/vim-scroll/vimprobe.vim` was run against.
+fn hundred_lines_evil(interp: &mut Interp) {
+    let mut text = String::new();
+    for n in 1..=100 {
+        text.push_str(&format!("line {}\n", n));
+    }
+    let r = run(interp, &format!("(insert {:?})", text));
+    assert!(!r.starts_with("ERROR"), "insert failed: {}", r);
+    run(interp, "(goto-char (point-min))");
+}
+
+/// The same 100 lines with ODD lines indented by four spaces -- the
+/// exact shape `dev/vim-scroll/vimprobe2.vim` was run against.
+fn hundred_indent_lines_evil(interp: &mut Interp) {
+    let mut text = String::new();
+    for n in 1..=100 {
+        if n % 2 == 1 {
+            text.push_str(&format!("    line {}\n", n));
+        } else {
+            text.push_str(&format!("line {}\n", n));
+        }
+    }
+    let r = run(interp, &format!("(insert {:?})", text));
+    assert!(!r.starts_with("ERROR"), "insert failed: {}", r);
+    run(interp, "(goto-char (point-min))");
+}
+
+/// Frame `(80, 25)` (`text_rows == 23`) plus one of the two 100-line
+/// fixtures above, evil-mode already on.
+fn setup_scroll(indented: bool) -> (Interp, Rc<RefCell<Editor>>) {
+    let (mut i, ed) = setup_evil("");
+    ed.borrow_mut().frame = (80, 25);
+    if indented {
+        hundred_indent_lines_evil(&mut i);
+    } else {
+        hundred_lines_evil(&mut i);
+    }
+    render(&i, &ed);
+    (i, ed)
+}
+
+/// The selected window's `window-start`, as a 1-based line number --
+/// mirrors `viewport_tests.rs`'s own `ws_line`.
+fn ws_line(ed: &Rc<RefCell<Editor>>) -> usize {
+    let editor = ed.borrow();
+    let sel = editor.selected_window;
+    let win = &editor.windows[&sel];
+    let n = win.buffer.borrow().text.line_number(win.window_start);
+    n
+}
+
+/// Point's 1-based line number.
+fn pt_line(interp: &mut Interp) -> i64 {
+    match run(interp, "(line-number-at-pos)").parse() {
+        Ok(n) => n,
+        Err(_) => panic!("(line-number-at-pos) didn't return an integer"),
+    }
+}
+
+/// Point's 0-based display column.
+fn pt_col(interp: &mut Interp) -> i64 {
+    match run(interp, "(current-column)").parse() {
+        Ok(n) => n,
+        Err(_) => panic!("(current-column) didn't return an integer"),
+    }
+}
+
+/// `(LINE SEV . "MSG")` per entry, 0-based LINE -- mirrors
+/// `viewport_tests.rs`'s own `set_diags` (each test file brings its own
+/// helpers, per project convention).
+fn set_diags(interp: &mut Interp, items: &[(usize, u8, &str)]) {
+    let body: String = items
+        .iter()
+        .map(|(line, sev, msg)| format!("({} {} . {:?})", line, sev, msg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let r = run(
+        interp,
+        &format!("(lsp--set-buffer-diagnostics (current-buffer) '({}))", body),
+    );
+    assert!(!r.starts_with("ERROR"), "set_diags failed: {}", r);
+}
+
+fn goto_line_evil(interp: &mut Interp, line: usize) {
+    let r = run(
+        interp,
+        &format!(
+            "(progn (goto-char (point-min)) (forward-line {}))",
+            line - 1
+        ),
+    );
+    assert!(!r.starts_with("ERROR"), "goto_line failed: {}", r);
+}
+
+/// Fix round: a raw buffer position (not a line number) -- needed once a
+/// row can be a WRAP-CONTINUATION row, where `ws_line'/`pt_line''s
+/// logical-line numbers can't distinguish which of a wrapped line's
+/// several rows is meant.
+fn pos_i64(interp: &mut Interp, expr: &str) -> i64 {
+    match run(interp, expr).parse() {
+        Ok(n) => n,
+        Err(_) => panic!("{:?} didn't return an integer", expr),
+    }
+}
+
+/// Frame `(40, 25)` (`text_rows == 23`, `cols == 40` -- explicitly turns
+/// `display-line-numbers' off so the gutter can't eat into that column
+/// count). Line 1 is 40 'a's (room for a column-30 cursor, one visual
+/// row); line 2 is 100 'b's, wrapping into 3 visual rows at width 40
+/// (`ceil(100/40) == 3`) -- the fixture the fix round's wrap-
+/// continuation-row tests need. Lines 3-30 are plain `line N` filler so
+/// there is real content both above and below the wrapped line.
+fn setup_wrap_fixture() -> (Interp, Rc<RefCell<Editor>>) {
+    let (mut i, ed) = setup_evil("");
+    ed.borrow_mut().frame = (40, 25);
+    run(&mut i, "(setq-local display-line-numbers nil)");
+    let mut text = String::new();
+    text.push_str(&"a".repeat(40));
+    text.push('\n');
+    text.push_str(&"b".repeat(100));
+    text.push('\n');
+    for n in 3..=30 {
+        text.push_str(&format!("line {}\n", n));
+    }
+    let r = run(&mut i, &format!("(insert {:?})", text));
+    assert!(!r.starts_with("ERROR"), "insert failed: {}", r);
+    run(&mut i, "(goto-char (point-min))");
+    render(&i, &ed);
+    (i, ed)
+}
+
+/// Frame `(40, 5)` (`text_rows == 3`, `cols == 40`) plus a SINGLE
+/// 500-character line (13 visual rows) followed by a handful of short
+/// filler lines. The tiny 3-row window is what lets a within-the-same-
+/// long-line C-e push point off-screen with just one press; the line's
+/// own length (500) is what keeps its line-end far away from any
+/// middle row's own boundary, so a middle-row landing can't
+/// coincidentally be "protected" by the pre-existing line-end clamp the
+/// way a shorter fixture's LAST row always would be (see the fix
+/// round's own test comment).
+fn setup_long_line_fixture() -> (Interp, Rc<RefCell<Editor>>) {
+    let (mut i, ed) = setup_evil("");
+    ed.borrow_mut().frame = (40, 5);
+    run(&mut i, "(setq-local display-line-numbers nil)");
+    let mut text = String::new();
+    text.push_str(&"a".repeat(500));
+    text.push('\n');
+    for n in 2..=10 {
+        text.push_str(&format!("line {}\n", n));
+    }
+    let r = run(&mut i, &format!("(insert {:?})", text));
+    assert!(!r.starts_with("ERROR"), "insert failed: {}", r);
+    run(&mut i, "(goto-char (point-min))");
+    render(&i, &ed);
+    (i, ed)
+}
+
+/// A 100-line buffer with NO trailing newline (`evil--last-line-start''s
+/// OTHER branch: `point-max' already sits inside the last real line,
+/// not on a synthetic empty line after it).
+fn setup_scroll_no_trailing_newline() -> (Interp, Rc<RefCell<Editor>>) {
+    let (mut i, ed) = setup_evil("");
+    ed.borrow_mut().frame = (80, 25);
+    let mut lines: Vec<String> = (1..=100).map(|n| format!("line {}", n)).collect();
+    let text = lines.join("\n");
+    lines.clear();
+    let r = run(&mut i, &format!("(insert {:?})", text));
+    assert!(!r.starts_with("ERROR"), "insert failed: {}", r);
+    run(&mut i, "(goto-char (point-min))");
+    render(&i, &ed);
+    (i, ed)
+}
+
+// --- C-f (evil-scroll-page-down) ---------------------------------------
+
+#[test]
+fn c_f_advances_by_h_minus_2_rows_landing_first_non_blank() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(ws_line(&ed), 22);
+    assert_eq!(pt_line(&mut i), 22);
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(ws_line(&ed), 43);
+    assert_eq!(pt_line(&mut i), 43);
+}
+
+#[test]
+fn c_f_clamps_at_the_end_by_jumping_straight_to_the_last_line() {
+    // Real vim's own clamp here is NOT "cap at old_start + (h-2)": from
+    // window-start 78 (h=23, last line 100) a further C-f jumps to
+    // window-start 100 directly, skipping the usual -1 overlap and
+    // showing blank rows below (see the file header's own comment on
+    // `evil-scroll-page-down`). A repeated press after that is a no-op.
+    let (mut i, ed) = setup_scroll(false);
+    // `G's own window-start algorithm is a separate, pre-existing
+    // concern outside this milestone's scope -- set window-start
+    // directly to the exact precondition real vim's `G' produced
+    // (window-start 78, point on line 100) instead of depending on it.
+    goto_line_evil(&mut i, 78);
+    run(&mut i, "(set-window-start nil (point) t)");
+    goto_line_evil(&mut i, 100);
+    assert_eq!(ws_line(&ed), 78);
+    assert_eq!(pt_line(&mut i), 100);
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(ws_line(&ed), 100);
+    assert_eq!(pt_line(&mut i), 100);
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(
+        ws_line(&ed),
+        100,
+        "a further C-f past EOF must be a no-op, not an error"
+    );
+    assert_eq!(pt_line(&mut i), 100);
+}
+
+// --- C-b (evil-scroll-page-up) ------------------------------------------
+
+#[test]
+fn c_b_retreats_by_h_minus_2_rows_landing_last_visible_row() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-f");
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(ws_line(&ed), 43);
+    feed(&mut i, &ed, "C-b");
+    assert_eq!(ws_line(&ed), 22);
+    assert_eq!(
+        pt_line(&mut i),
+        44,
+        "cursor lands on the LAST visible row, not the top"
+    );
+}
+
+#[test]
+fn c_b_at_window_start_zero_is_a_total_no_op() {
+    let (mut i, ed) = setup_scroll(false);
+    assert_eq!(ws_line(&ed), 1);
+    assert_eq!(pt_line(&mut i), 1);
+    feed(&mut i, &ed, "C-b");
+    assert_eq!(ws_line(&ed), 1, "no error, no message, nothing moves");
+    assert_eq!(pt_line(&mut i), 1);
+}
+
+// --- C-e (evil-scroll-line-down) ----------------------------------------
+
+#[test]
+fn c_e_scrolls_without_moving_point_until_point_would_leave_the_window() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-e"); // cursor was ON the top row -- it leaves immediately
+    assert_eq!(ws_line(&ed), 2);
+    assert_eq!(pt_line(&mut i), 2);
+    feed(&mut i, &ed, "C-e");
+    assert_eq!(ws_line(&ed), 3);
+    assert_eq!(pt_line(&mut i), 3);
+    feed(&mut i, &ed, "3 C-e");
+    assert_eq!(ws_line(&ed), 6);
+    assert_eq!(pt_line(&mut i), 6);
+}
+
+#[test]
+fn c_e_keeps_point_and_its_column_while_point_stays_in_view() {
+    // Indented fixture: line 10 is even, unindented -- column stays 1
+    // throughout, matching `dev/vim-scroll/vimprobe2.out`'s "C-e x5"/
+    // "C-e cur leaves" pair exactly.
+    let (mut i, ed) = setup_scroll(true);
+    goto_line_evil(&mut i, 10);
+    assert_eq!(ws_line(&ed), 1);
+    feed(&mut i, &ed, "5 C-e");
+    assert_eq!(ws_line(&ed), 6);
+    assert_eq!(
+        pt_line(&mut i),
+        10,
+        "point 10 is still visible in [6,28] -- must not move"
+    );
+    feed(&mut i, &ed, "5 C-e");
+    assert_eq!(ws_line(&ed), 11);
+    assert_eq!(
+        pt_line(&mut i),
+        11,
+        "point 10 left the window -- lands on the new top row"
+    );
+    assert_eq!(pt_col(&mut i), 0);
+}
+
+// --- C-y (evil-scroll-line-up) -------------------------------------------
+
+#[test]
+fn c_y_scrolls_without_moving_point_until_point_would_leave_the_window() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-e");
+    feed(&mut i, &ed, "C-e");
+    feed(&mut i, &ed, "3 C-e"); // w0=6, cur=6 (see the C-e test above)
+    assert_eq!(ws_line(&ed), 6);
+    assert_eq!(pt_line(&mut i), 6);
+    feed(&mut i, &ed, "C-y");
+    assert_eq!(ws_line(&ed), 5);
+    assert_eq!(pt_line(&mut i), 6, "point stays put -- still visible");
+    goto_line_evil(&mut i, 10);
+    feed(&mut i, &ed, "C-y");
+    assert_eq!(ws_line(&ed), 4);
+    assert_eq!(pt_line(&mut i), 10);
+    feed(&mut i, &ed, "C-y");
+    assert_eq!(ws_line(&ed), 3);
+    assert_eq!(pt_line(&mut i), 10);
+}
+
+#[test]
+fn c_y_lands_on_last_visible_row_keeping_column_when_point_leaves() {
+    // Indented fixture, matching `dev/vim-scroll/vimprobe2.out`'s "3
+    // C-d (scroll=3)" -> "C-y after (cur?)" pair: cur=53 (line 53, odd,
+    // col 5) leaves the window when window-start moves from 31 to 30
+    // (window covers [30,52]).
+    let (mut i, ed) = setup_scroll(true);
+    goto_line_evil(&mut i, 28);
+    run(&mut i, "(set-window-start nil (point) t)"); // w0=28
+    goto_line_evil(&mut i, 50); // cur=50 (already visible in [28,50]; w0 stays 28)
+    feed(&mut i, &ed, "3 C-d"); // w0=31, cur=53, col=5 (see the C-d test below)
+    assert_eq!(ws_line(&ed), 31);
+    assert_eq!(pt_line(&mut i), 53);
+    assert_eq!(pt_col(&mut i), 4);
+    feed(&mut i, &ed, "C-y");
+    assert_eq!(ws_line(&ed), 30);
+    assert_eq!(
+        pt_line(&mut i),
+        52,
+        "53 no longer fits in [30,52] -- clamped to the last visible row"
+    );
+    assert_eq!(
+        pt_col(&mut i),
+        4,
+        "column 4 (0-based) preserved, not reset to first non-blank"
+    );
+}
+
+// --- C-d (evil-scroll-down) ----------------------------------------------
+
+#[test]
+fn c_d_default_amount_is_half_the_window_text_height() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-d"); // amount = max(1, 23/2) = 11
+    assert_eq!(ws_line(&ed), 12);
+    assert_eq!(pt_line(&mut i), 12);
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(ws_line(&ed), 23);
+    assert_eq!(pt_line(&mut i), 23);
+}
+
+#[test]
+fn c_d_explicit_count_scrolls_and_is_remembered() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "5 C-d");
+    assert_eq!(ws_line(&ed), 6);
+    assert_eq!(pt_line(&mut i), 6);
+    feed(&mut i, &ed, "C-d"); // no count: must reuse the remembered 5, not fall back to 11
+    assert_eq!(
+        ws_line(&ed),
+        11,
+        "the deletion question: without remembering, this would be 6+11=17"
+    );
+    assert_eq!(pt_line(&mut i), 11);
+}
+
+#[test]
+fn c_d_never_scrolls_past_a_full_last_page_but_the_cursor_keeps_moving() {
+    // Real vim (measured directly, `dev/vim-scroll/` -- see the file
+    // header's own comment on `evil-scroll-down`): from window-start 74
+    // with the last line at 100 (h=23), a plain C-d (amount 11) does
+    // NOT land window-start at 74+11=85; it clamps to 78 (last line
+    // minus (h-1)), even though the cursor moves the full 11 lines.
+    let (mut i, ed) = setup_scroll(false);
+    goto_line_evil(&mut i, 74);
+    run(&mut i, "(set-window-start nil (point) t)");
+    goto_line_evil(&mut i, 85);
+    assert_eq!(ws_line(&ed), 74);
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(
+        ws_line(&ed),
+        78,
+        "clamped to last-line(100) - (h-1) = 78, not 74+11=85"
+    );
+    assert_eq!(
+        pt_line(&mut i),
+        96,
+        "the cursor itself is NOT clamped here: 85+11=96"
+    );
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(
+        ws_line(&ed),
+        78,
+        "already at the ceiling -- window-start does not move"
+    );
+    assert_eq!(
+        pt_line(&mut i),
+        100,
+        "cursor clamps to the last line: min(96+11,100)=100"
+    );
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(ws_line(&ed), 78);
+    assert_eq!(pt_line(&mut i), 100, "no error, no further movement");
+}
+
+// --- C-u (evil-scroll-up) -------------------------------------------------
+
+#[test]
+fn c_u_mirrors_c_d() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-d");
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(ws_line(&ed), 23);
+    feed(&mut i, &ed, "C-u");
+    assert_eq!(ws_line(&ed), 12);
+    assert_eq!(pt_line(&mut i), 12);
+}
+
+#[test]
+fn c_u_at_window_start_zero_moves_only_the_cursor_clamped_to_line_1() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "C-u"); // arms evil-scroll-count = 11 (the default, remembered)
+    assert_eq!(ws_line(&ed), 1);
+    assert_eq!(pt_line(&mut i), 1);
+    goto_line_evil(&mut i, 3);
+    feed(&mut i, &ed, "C-u");
+    assert_eq!(ws_line(&ed), 1, "window-start cannot go below point-min");
+    assert_eq!(
+        pt_line(&mut i),
+        1,
+        "cursor still moves, clamped to line 1 (max(3-11,1))"
+    );
+}
+
+// --- z-family --------------------------------------------------------
+
+#[test]
+fn zz_centers_and_clamps_at_both_ends() {
+    let (mut i, ed) = setup_scroll(false);
+    goto_line_evil(&mut i, 50);
+    feed(&mut i, &ed, "z z");
+    assert_eq!(ws_line(&ed), 39);
+    assert_eq!(pt_line(&mut i), 50);
+    goto_line_evil(&mut i, 3);
+    feed(&mut i, &ed, "z z");
+    assert_eq!(ws_line(&ed), 1);
+    goto_line_evil(&mut i, 98);
+    feed(&mut i, &ed, "z z");
+    assert_eq!(ws_line(&ed), 87);
+}
+
+#[test]
+fn count_before_zz_jumps_to_that_line_first() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "2 0 z z");
+    assert_eq!(pt_line(&mut i), 20);
+    assert_eq!(ws_line(&ed), 9);
+}
+
+#[test]
+fn zt_puts_the_line_at_the_very_top() {
+    let (mut i, ed) = setup_scroll(false);
+    goto_line_evil(&mut i, 50);
+    feed(&mut i, &ed, "z t");
+    assert_eq!(ws_line(&ed), 50);
+    assert_eq!(pt_line(&mut i), 50);
+    feed(&mut i, &ed, "3 0 z t");
+    assert_eq!(pt_line(&mut i), 30);
+    assert_eq!(ws_line(&ed), 30);
+}
+
+#[test]
+fn zb_puts_the_line_at_the_very_bottom() {
+    let (mut i, ed) = setup_scroll(false);
+    goto_line_evil(&mut i, 50);
+    feed(&mut i, &ed, "z b");
+    assert_eq!(ws_line(&ed), 28);
+    assert_eq!(pt_line(&mut i), 50);
+}
+
+#[test]
+fn z_ret_z_dot_z_dash_add_first_non_blank_on_top_of_zt_zz_zb() {
+    // Indented fixture: line 51 is odd (indented, first-non-blank at
+    // column 4); line 50 is even (unindented). `dev/vim-scroll/
+    // vimprobe2.out`'s own "z<CR> indented"/"z. unindented" tags turned
+    // out to be SWAPPED against the actual sequence of `normal NG`
+    // calls that precede them (the indented line is the one `z.` runs
+    // on, not `z<CR>`) -- verified by re-reading the script, not just
+    // the tags; asserted here against the real per-line indentation
+    // instead of the mislabeled tag names.
+    //
+    // Fix round: the z RET sub-case must ALSO use an indented line --
+    // it originally used line 50 (unindented), where first-non-blank
+    // and `line-beginning-position' are the SAME column (0), so
+    // deleting `evil-scroll-line-to-top-first-non-blank''s
+    // first-non-blank step changed nothing observable here. No real
+    // vim number is needed for this specific column (`evil--pos-first-
+    // non-blank' is exercised and pinned generically elsewhere in this
+    // file already) -- this sub-case exists only to make the wiring
+    // itself deletable-and-observable.
+    let (mut i, ed) = setup_scroll(true);
+    goto_line_evil(&mut i, 51);
+    run(&mut i, "(goto-char (line-beginning-position))");
+    feed(&mut i, &ed, "z RET");
+    assert_eq!(ws_line(&ed), 51);
+    assert_eq!(pt_line(&mut i), 51);
+    assert_eq!(
+        pt_col(&mut i),
+        4,
+        "line 51 is indented by 4 spaces -- discriminates the deletion"
+    );
+
+    goto_line_evil(&mut i, 51);
+    run(&mut i, "(goto-char (line-beginning-position))");
+    feed(&mut i, &ed, "z .");
+    assert_eq!(ws_line(&ed), 40);
+    assert_eq!(pt_line(&mut i), 51);
+    assert_eq!(pt_col(&mut i), 4, "line 51 is indented by 4 spaces");
+
+    goto_line_evil(&mut i, 50);
+    run(&mut i, "(end-of-line)"); // vim's `$`
+    feed(&mut i, &ed, "z -");
+    assert_eq!(ws_line(&ed), 28);
+    assert_eq!(pt_line(&mut i), 50);
+    assert_eq!(pt_col(&mut i), 0, "line 50 is unindented");
+}
+
+// --- Operator-pending / visual interaction, count consumption -----------
+
+#[test]
+fn d_c_d_cancels_the_operator_and_touches_nothing() {
+    let (mut i, ed) = setup_scroll(false);
+    let before = bs(&mut i);
+    feed(&mut i, &ed, "d C-d");
+    assert_eq!(
+        bs(&mut i),
+        before,
+        "the whole family is not a motion -- no operator target"
+    );
+    assert_eq!(run(&mut i, "evil--pending-operator"), "nil");
+    assert_eq!(run(&mut i, "evil--state"), "normal");
+    assert_eq!(ws_line(&ed), 1, "the window must not have scrolled either");
+}
+
+#[test]
+fn capital_v_then_c_d_extends_the_linewise_selection_through_line_12() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "V");
+    feed(&mut i, &ed, "C-d");
+    assert_eq!(run(&mut i, "evil--state"), "visual");
+    assert_eq!(pt_line(&mut i), 12);
+    feed(&mut i, &ed, "d");
+    assert_eq!(
+        bs(&mut i).lines().next().unwrap(),
+        "line 13",
+        "V C-d must have extended the linewise selection through line 12"
+    );
+}
+
+#[test]
+fn three_c_e_then_j_moves_only_one_line_the_count_does_not_leak() {
+    let (mut i, ed) = setup_scroll(false);
+    feed(&mut i, &ed, "3 C-e");
+    let after_ce = pt_line(&mut i);
+    feed(&mut i, &ed, "j");
+    assert_eq!(pt_line(&mut i), after_ce + 1);
+}
+
+#[test]
+fn c_e_over_inline_diagnostic_block_rows_skips_the_whole_block() {
+    // Two single-line diagnostics under line 1 (0-based line 0): row 0
+    // is line 1's own row, rows 1-2 are its two block rows, row 3 is
+    // line 2's own row. A block row has no addressable window-start
+    // position of its own (it's decoration attached to the line above
+    // it, not a distinct buffer position) -- so a single C-e from the
+    // top must skip the whole block in one step, landing on line 2, not
+    // on some intermediate "row 1".
+    let (mut i, ed) = setup_scroll(false);
+    run(&mut i, "(setq inline-diagnostics t)");
+    set_diags(&mut i, &[(0, 1, "one"), (0, 2, "two")]);
+    render(&i, &ed);
+    feed(&mut i, &ed, "C-e");
+    assert_eq!(ws_line(&ed), 2, "the deletion question: without the block-row-aware walk, this would be some row INSIDE the block, not line 2");
+}
+
+// --- Fix round: wrap-continuation rows (evil--goto-row-keep-column's
+// NEXT-ROW-START clamp, evil--first-non-blank-unless-continuation) ------
+
+#[test]
+fn c_e_keep_column_clamps_within_the_landing_wrap_continuation_row() {
+    // A single 500-character line (13 visual rows at cols=40) is what
+    // makes this discriminate: `current-column' is a RAW character
+    // offset from the logical line's start, completely independent of
+    // wrapping, so point sitting near the line's own end (column 480)
+    // gives a huge "col" to preserve. window-start moves to row 1 (a
+    // MIDDLE row of this same long line -- far from the line's own end,
+    // unlike a shorter fixture where the landing row would coincide
+    // with the line's LAST row and the pre-existing line-end clamp
+    // would coincidentally already produce the right answer). Without
+    // the NEXT-ROW-START clamp, `(+ target col)' = 40 + 480 = 520,
+    // clamped only by line-end-position (500) -- landing far past row
+    // 1's own end (80) and, with a 3-row-tall window, off-screen again.
+    let (mut i, ed) = setup_long_line_fixture();
+    run(&mut i, "(goto-char (+ (point-min) 480))");
+    assert_eq!(
+        pt_col(&mut i),
+        480,
+        "setup: point starts deep in the long line's own later row"
+    );
+    run(&mut i, "(set-window-start nil (point-min) t)");
+    feed(&mut i, &ed, "C-e");
+    let ws = pos_i64(&mut i, "(window-start)");
+    let next_row = pos_i64(&mut i, "(window-row-start 1)");
+    let point = pt(&mut i);
+    assert!(
+        !run(&mut i, "(save-excursion (goto-char (window-start)) (= (point) (line-beginning-position)))")
+            .starts_with('t'),
+        "setup: window-start ({}) must be a genuine wrap-continuation row (a MIDDLE row of the long line), not a logical line start",
+        ws
+    );
+    assert!(
+        point >= ws,
+        "point {} must not be above window-start {}",
+        point,
+        ws
+    );
+    assert!(
+        point < next_row,
+        "point {} must land strictly within the landing row [{}, {}), not overshoot into a later wrapped row",
+        point,
+        ws,
+        next_row
+    );
+    assert_eq!(
+        run(&mut i, "(pos-visible-in-window-p (point))"),
+        "t",
+        "point must be visible after C-e"
+    );
+}
+
+// --- Second fix round: TARGET itself is the buffer's true first/last
+// row -- `window-row-start' clamps NEXT-ROW-START back onto TARGET, and
+// the naive ceiling landed BEFORE the window start entirely -------------
+
+#[test]
+fn c_e_onto_the_true_last_row_keeps_point_at_or_after_the_window_start() {
+    // 100 lines, no trailing newline, frame 80x25 (text_rows=23):
+    // window-start pinned to line 99 -- ONE ROW BEFORE line 100, the
+    // buffer's true LAST row (not line 99 itself; line 99 is where the
+    // window-start is placed so that a single C-e's target becomes line
+    // 100). `(window-row-start 1)` from line 100 has nowhere further to
+    // go and clamps back to TARGET itself (line 100), so a naive
+    // `(1- next-row-start)' ceiling would be `target - 1' -- one
+    // character BEFORE the window start.
+    //
+    // Third fix round: no C-y mirror of this test exists, and none can.
+    // C-y's equality case would need its landing (BOTTOM) row to be the
+    // buffer's true last row while point sits BELOW that row (off-
+    // screen, which is what makes `evil--goto-row-keep-column' run at
+    // all) -- but nothing exists below the buffer's last row, so point
+    // can never be positioned there. The `next-row-start > target'
+    // guard this fix round added is dead code for C-y as a result: it
+    // can still receive `next-row-start == target' in principle (if the
+    // window is taller than the buffer, e.g. a 3-line buffer in a
+    // 25-row frame), but in that shape the buffer is ALSO too short to
+    // ever scroll point off-screen in the first place, so the branch
+    // that calls this function is simply never reached -- confirmed by
+    // writing exactly that scenario as a test and watching it pass with
+    // the whole second-round fix reverted (a test that can't fail is
+    // not a test). C-e's OWN equality case is real because point CAN
+    // sit above window-start's target row while target is the buffer's
+    // true last line (that's exactly this test).
+    let (mut i, ed) = setup_scroll_no_trailing_newline();
+    goto_line_evil(&mut i, 99);
+    run(&mut i, "(set-window-start nil (point) t)");
+    assert_eq!(ws_line(&ed), 99);
+    feed(&mut i, &ed, "C-e");
+    let ws = pos_i64(&mut i, "(window-start)");
+    let point = pt(&mut i);
+    assert!(
+        point >= ws,
+        "point {} must not land before window-start {} (was landing one character before it)",
+        point,
+        ws
+    );
+    assert_eq!(
+        run(&mut i, "(pos-visible-in-window-p (point))"),
+        "t",
+        "point must be visible after C-e"
+    );
+}
+
+#[test]
+fn c_y_keep_column_clamps_within_the_landing_wrap_continuation_row() {
+    // Mirror of the C-e wrap-continuation-row test above, exercising
+    // C-y's OWN NEXT-ROW-START argument (`(window-row-start h)`),
+    // nothing else in this file's test list reaches it. Scroll several
+    // rows down the single 500-char line first so window-start sits
+    // mid-line (a genuine wrap-continuation row, not the buffer's first
+    // row), then put point at a column near the end of the BOTTOM
+    // visible row and press C-y once: point must land within that
+    // bottom row's own span, not overshoot into a LATER wrapped row of
+    // the same line.
+    let (mut i, ed) = setup_long_line_fixture();
+    run(&mut i, "(set-window-start nil (point-min) t)");
+    for _ in 0..4 {
+        feed(&mut i, &ed, "C-e");
+    }
+    let bottom_row_before = pos_i64(&mut i, "(window-row-start (1- (window-text-height)))");
+    // A column deep enough into the bottom row's own logical-line
+    // offset that, when re-applied to an EARLIER row (the row C-y
+    // lands on), it would overshoot without the NEXT-ROW-START clamp --
+    // same idea as the C-e test's column 480 on a 40-wide row.
+    run(&mut i, &format!("(goto-char {})", bottom_row_before + 39));
+    let col_before = pt_col(&mut i);
+    feed(&mut i, &ed, "C-y");
+    // The LANDING row is the window's bottom visible row after the
+    // command (not window-start itself, which is the TOP row) --
+    // recomputed post-command since window-start moved.
+    let landing = pos_i64(&mut i, "(window-row-start (1- (window-text-height)))");
+    let next_row = pos_i64(&mut i, "(window-row-start (window-text-height))");
+    let point = pt(&mut i);
+    assert!(
+        !run(
+            &mut i,
+            "(save-excursion (goto-char (window-row-start (1- (window-text-height)))) (= (point) (line-beginning-position)))"
+        )
+        .starts_with('t'),
+        "setup: the landing row ({}) must be a genuine wrap-continuation row",
+        landing
+    );
+    assert!(
+        point >= landing,
+        "point {} (col {} before) must not be above the landing row {}",
+        point,
+        col_before,
+        landing
+    );
+    assert!(
+        point < next_row,
+        "point {} must land strictly within the landing (bottom) row [{}, {}), not overshoot into a later wrapped row",
+        point,
+        landing,
+        next_row
+    );
+    assert_eq!(
+        run(&mut i, "(pos-visible-in-window-p (point))"),
+        "t",
+        "point must be visible after C-y"
+    );
+}
+
+#[test]
+fn c_f_from_a_mid_line_window_start_never_lands_above_it() {
+    // Same wrap fixture: get window-start onto one of line 2's wrap-
+    // continuation rows via C-e first (the open question the review
+    // flagged: real vim's window-start can never BE a continuation row
+    // in the first place, so this scenario has no vim reference at
+    // all), then press C-f and check the general invariant every key in
+    // this family must uphold: point never ends up above window-start,
+    // and stays visible.
+    let (mut i, ed) = setup_wrap_fixture();
+    run(&mut i, "(goto-char (+ (point-min) 30))");
+    for _ in 0..3 {
+        feed(&mut i, &ed, "C-e");
+    }
+    assert!(
+        !run(
+            &mut i,
+            "(save-excursion (goto-char (window-start)) (= (point) (line-beginning-position)))"
+        )
+        .starts_with('t'),
+        "setup: window-start must be mid-line before C-f runs"
+    );
+    feed(&mut i, &ed, "C-f");
+    let ws = pos_i64(&mut i, "(window-start)");
+    let point = pt(&mut i);
+    assert!(
+        point >= ws,
+        "point {} must not land above window-start {} after C-f",
+        point,
+        ws
+    );
+    assert_eq!(run(&mut i, "(pos-visible-in-window-p (point))"), "t");
+}
+
+// --- Fix round: `?z' in `evil--op-pending-claimed' actually matters -----
+
+#[test]
+fn d_z_z_cancels_the_operator_the_z_prefix_survives_the_op_pending_catchall() {
+    // The observable claim `?z' in `evil--op-pending-claimed' actually
+    // makes: a SINGLE "z" after "d" must NOT cancel the operator yet --
+    // it is a PREFIX key (leading into "z z"/"z t"/etc, each already
+    // bound straight to `evil--op-invalid' at the LEAF), not itself a
+    // leaf bound to `evil--op-invalid'. Without `?z' in the list, the
+    // catchall overwrites the WHOLE "z" prefix keymap with a bare
+    // `evil--op-invalid' binding, which would fire immediately on this
+    // single "z" -- one keystroke too early. Final buffer/window state
+    // after the SECOND "z" is identical either way (both cancel), which
+    // is exactly why that alone wouldn't discriminate the bug.
+    let (mut i, ed) = setup_scroll(false);
+    let before = bs(&mut i);
+    feed(&mut i, &ed, "d");
+    assert_eq!(run(&mut i, "evil--state"), "operator-pending");
+    feed(&mut i, &ed, "z");
+    assert_eq!(
+        run(&mut i, "evil--pending-operator"),
+        "delete",
+        "a single \"z\" must not have cancelled the operator -- it is a prefix, not a leaf"
+    );
+    assert_eq!(run(&mut i, "evil--state"), "operator-pending");
+    feed(&mut i, &ed, "z");
+    assert_eq!(
+        bs(&mut i),
+        before,
+        "d z z must cancel the pending operator and touch nothing"
+    );
+    assert_eq!(run(&mut i, "evil--pending-operator"), "nil");
+    assert_eq!(run(&mut i, "evil--state"), "normal");
+    assert_eq!(
+        ws_line(&ed),
+        1,
+        "the window must not have scrolled -- z z never ran as a motion"
+    );
+}
+
+// --- Fix round: a fixture with NO trailing newline, and visual C-e -----
+
+#[test]
+fn c_f_on_a_buffer_with_no_trailing_newline_lands_on_the_true_last_line() {
+    // `evil--last-line-start''s OTHER branch: `point-max' is already
+    // INSIDE the last real line here (no synthetic empty line after
+    // it), unlike every other test in this file's 100-line fixture.
+    let (mut i, ed) = setup_scroll_no_trailing_newline();
+    // `G's own window-start algorithm is a separate, pre-existing
+    // concern outside this milestone's scope (same reasoning as the
+    // trailing-newline C-f clamp test above) -- set window-start
+    // directly instead of depending on it.
+    goto_line_evil(&mut i, 78);
+    run(&mut i, "(set-window-start nil (point) t)");
+    goto_line_evil(&mut i, 100);
+    assert_eq!(ws_line(&ed), 78);
+    assert_eq!(pt_line(&mut i), 100);
+    feed(&mut i, &ed, "C-f");
+    assert_eq!(
+        ws_line(&ed),
+        100,
+        "window-start must land exactly on the last line, same rule as the trailing-newline fixture"
+    );
+    assert_eq!(pt_line(&mut i), 100);
+}
+
+#[test]
+fn visual_c_e_extends_the_selection_only_when_point_actually_moves() {
+    let (mut i, ed) = setup_scroll(false);
+    // Point on line 1 (the window's own top row) leaves the window on
+    // the VERY FIRST C-e (measured elsewhere in this file) -- start
+    // deeper in the buffer instead, so the first press has room to
+    // leave point in place.
+    goto_line_evil(&mut i, 10);
+    feed(&mut i, &ed, "v");
+    assert_eq!(run(&mut i, "evil--state"), "visual");
+    let mark_before = pos_i64(&mut i, "(mark)");
+    let point_before = pt(&mut i);
+    // Point is still well within the window -- C-e leaves it in place
+    // (still visible), so the selection's bounds must be unchanged.
+    feed(&mut i, &ed, "C-e");
+    assert_eq!(pos_i64(&mut i, "(mark)"), mark_before);
+    assert_eq!(pt(&mut i), point_before, "point stays put -- still visible");
+
+    // Enough more C-e presses that point is forced to leave the window:
+    // the selection's END (point) must have moved with it, while the
+    // mark (selection start) stays where `v' set it. Window-start is at
+    // line 2 after the single C-e above; line 10 (point's own line)
+    // stays visible until window-start passes it, so 9 more rows (count
+    // 9, digits "9") pushes window-start to line 11, well past it.
+    feed(&mut i, &ed, "9 C-e");
+    assert_eq!(
+        pos_i64(&mut i, "(mark)"),
+        mark_before,
+        "mark/selection-start must not move"
+    );
+    assert!(
+        pt(&mut i) > point_before,
+        "point must have moved forward once it left the window -- selection end follows it"
     );
 }

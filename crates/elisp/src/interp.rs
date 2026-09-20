@@ -476,9 +476,22 @@ impl Interp {
         match flow {
             Flow::Signal { error_symbol, data } => {
                 let msg = if let Some(id) = self.as_sym(error_symbol) {
-                    match self.plist_get(id, self.syms.error_message) {
-                        Value::Str(s) => s.to_string(),
-                        _ => self.sym_name(id).to_string(),
+                    // M138: `scroll-up-command`/`scroll-down-command` signal
+                    // these two symbols (builtins/ui.rs) without going
+                    // through `define_error` -- they aren't registered as
+                    // full standard errors (see the milestone spec), so a
+                    // plist lookup would fall through to the raw symbol
+                    // name (`end-of-buffer`/`beginning-of-buffer` with a
+                    // hyphen) instead of GNU's own `error-message` text
+                    // ("End of buffer" / "Beginning of buffer"). Every
+                    // other symbol's rendering is unchanged.
+                    match self.sym_name(id) {
+                        "end-of-buffer" => "End of buffer".to_string(),
+                        "beginning-of-buffer" => "Beginning of buffer".to_string(),
+                        _ => match self.plist_get(id, self.syms.error_message) {
+                            Value::Str(s) => s.to_string(),
+                            _ => self.sym_name(id).to_string(),
+                        },
                     }
                 } else {
                     crate::printer::prin1_to_string(self, error_symbol)

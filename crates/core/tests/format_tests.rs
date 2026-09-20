@@ -12,10 +12,15 @@
 //!     mirroring `lsp_format_tests.rs`'s convention.
 //!
 //! Item 13 (three Verilog styles genuinely producing different output)
-//! is gated on `verible-verilog-format` actually being on PATH, same
-//! `have_on_path` technique as `lsp_format_tests.rs`/`lsp_mode_tests.rs`
-//! (this file keeps its own copy, per this repo's no-shared-test-helpers
-//! convention).
+//! and the clang-format style-file e2e test are gated on the real
+//! binary actually being on PATH, same `have_on_path` technique as
+//! `lsp_format_tests.rs`/`lsp_mode_tests.rs` (this file keeps its own
+//! copy, per this repo's no-shared-test-helpers convention). **M145:
+//! both FAIL, not skip, when the binary is missing** -- see
+//! `require_tool`'s own doc comment below. Set
+//! `RETICLE_ALLOW_MISSING_CLANG_FORMAT=1` / `RETICLE_ALLOW_MISSING_
+//! VERIBLE_FORMAT=1` to deliberately opt out on a machine that
+//! genuinely lacks the tool.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -64,6 +69,127 @@ fn stub_message(i: &mut Interp) {
         i,
         "(defun message (fmt &rest args) (push (apply 'format fmt args) test--messages) fmt)",
     );
+}
+
+/// M145: decides whether a test needing PROGRAM should run. Split out
+/// from its thin per-tool wrapper below so the decision itself --
+/// present/absent x opt-out-env-value -- is testable without touching
+/// real process environment or PATH (see `require_tool_tests` below).
+/// Returns true if the caller should proceed; false if the caller
+/// should `return` early because a deliberate, visible opt-out was set
+/// (ENV_VALUE is exactly "1"/"true"/"yes" -- anything else, including
+/// "0", means "no, don't skip", so a leftover boolean-style "false" or
+/// an accidental "0" cannot silently disable the check). Panics -- does
+/// not return -- when PROGRAM is absent and no opt-out was given: these
+/// two tests used to `eprintln!` and silently `return`, which `cargo
+/// test --workspace --no-fail-fast` (this project's own definition of
+/// done, no `--nocapture`) discards for a PASSING test, so a green gate
+/// could mean neither ever ran at all.
+fn require_tool(program: &str, present: bool, env_name: &str, env_value: Option<&str>) -> bool {
+    if present {
+        return true;
+    }
+    let opted_out = matches!(env_value, Some("1") | Some("true") | Some("yes"));
+    if opted_out {
+        // Opt-out convention for this project: RETICLE_ALLOW_MISSING_*
+        // / RETICLE_SKIP_* env vars (see `test_source_hygiene_tests.rs`).
+        eprintln!(
+            "skipping (opted out via {}): {} is not on PATH",
+            env_name, program
+        );
+        return false;
+    }
+    panic!(
+        "{} is not on PATH -- this e2e test was not run. Failing by default so a \
+         missing dependency cannot silently pass as a green gate. Install {}, or set \
+         {}=1 to deliberately skip on a machine that genuinely lacks it.",
+        program, program, env_name
+    );
+}
+
+const CLANG_FORMAT_SKIP_ENV: &str = "RETICLE_ALLOW_MISSING_CLANG_FORMAT";
+
+fn require_clang_format() -> bool {
+    let env_value = std::env::var(CLANG_FORMAT_SKIP_ENV).ok();
+    require_tool(
+        "clang-format",
+        have_on_path("clang-format"),
+        CLANG_FORMAT_SKIP_ENV,
+        env_value.as_deref(),
+    )
+}
+
+/// Same env var `demo_smoke_tests.rs:509` already uses for the same
+/// tool -- one variable per tool, not per call site.
+const VERIBLE_FORMAT_SKIP_ENV: &str = "RETICLE_ALLOW_MISSING_VERIBLE_FORMAT";
+
+fn require_verible_verilog_format() -> bool {
+    let env_value = std::env::var(VERIBLE_FORMAT_SKIP_ENV).ok();
+    require_tool(
+        "verible-verilog-format",
+        have_on_path("verible-verilog-format"),
+        VERIBLE_FORMAT_SKIP_ENV,
+        env_value.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod require_tool_tests {
+    use super::require_tool;
+
+    /// M145 deletion question: if `require_tool` silently returned
+    /// `false` on an absent tool with no opt-out set (instead of
+    /// panicking), this is the test that would have to go red to catch
+    /// it -- so it must actually observe the panic, not just call the
+    /// function.
+    #[test]
+    fn absent_and_no_opt_out_panics_naming_the_env_var() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", None)
+        });
+        let payload = result.expect_err("expected require_tool to panic when absent, no opt-out");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("RETICLE_ALLOW_MISSING_FAKE"),
+            "panic message should name the env var: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn absent_and_opted_out_with_1_returns_false() {
+        assert!(!require_tool(
+            "fake-tool",
+            false,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            Some("1")
+        ));
+    }
+
+    /// `FOO=0` must NOT mean "yes, skip" -- an environment left over
+    /// from some other boolean convention must not silently disable
+    /// this check.
+    #[test]
+    fn absent_and_env_set_to_0_still_panics() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", Some("0"))
+        });
+        assert!(result.is_err(), "FOO=0 must not opt out of the check");
+    }
+
+    #[test]
+    fn present_returns_true_regardless_of_env() {
+        assert!(require_tool(
+            "fake-tool",
+            true,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            None
+        ));
+    }
 }
 
 /// Whether CMD resolves to a real executable on PATH -- same technique
@@ -825,8 +951,7 @@ const MESSY_SV: &str = "module m #(parameter int W = 4, parameter int Depth = 16
 /// unrelated directory" without needing to chdir anything.
 #[test]
 fn manual_e2e_clang_format_style_file_finds_the_projects_own_clang_format() {
-    if !have_on_path("clang-format") {
-        eprintln!("skipping: clang-format not on PATH");
+    if !require_clang_format() {
         return;
     }
     let (mut i, _ed) = setup();
@@ -884,8 +1009,7 @@ return 0;
 
 #[test]
 fn manual_e2e_three_verible_styles_produce_pairwise_different_output() {
-    if !have_on_path("verible-verilog-format") {
-        eprintln!("skipping: verible-verilog-format not on PATH");
+    if !require_verible_verilog_format() {
         return;
     }
     let (mut i, _ed) = setup();

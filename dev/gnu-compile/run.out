@@ -1,0 +1,61 @@
+GNU Make 3.81
+GNU Make 4.4.1
+GNU Emacs 30.2
+---- make.out
+/Applications/Xcode.app/Contents/Developer/usr/bin/make -C sim
+iverilog -o /dev/null bad.v
+bad.v:3: syntax error
+I give up.
+make[1]: *** [all] Error 2
+make: *** [all] Error 2
+---- makew.out
+make: Entering directory `<P>'
+/Applications/Xcode.app/Contents/Developer/usr/bin/make -C sim
+make[1]: Entering directory `<P>/sim'
+iverilog -o /dev/null bad.v
+bad.v:3: syntax error
+I give up.
+make[1]: *** [all] Error 2
+make[1]: Leaving directory `<P>/sim'
+make: *** [all] Error 2
+make: Leaving directory `<P>'
+---- gmake.out
+gmake -C sim
+gmake[1]: Entering directory '<P>/sim'
+iverilog -o /dev/null bad.v
+bad.v:3: syntax error
+I give up.
+gmake[1]: *** [Makefile:2: all] Error 2
+gmake[1]: Leaving directory '<P>/sim'
+gmake: *** [Makefile:2: all] Error 2
+---- nested.out
+make: Entering directory '<P>'
+top.v:1: error: A
+make[1]: Entering directory '<P>/sim'
+s.v:1: error: B
+make[2]: Entering directory 'deep'
+d.v:1: error: C
+make[2]: Leaving directory 'deep'
+s.v:1: error: D
+make[1]: Leaving directory '<P>/sim'
+top.v:1: error: E
+make: Leaving directory '<P>'
+top.v:1: error: F
+compilation-directory-matcher=("\\(?:Entering\\|Leavin\\(g\\)\\) directory [`']\\(.+\\)'$" (2 . 1))
+== make.out
+bad.v:3: syntax error  dir=nil exists=nil
+END: (user-error "Past last error")
+== makew.out
+bad.v:3: syntax error  dir="<P>/sim" exists=t
+END: (user-error "Past last error")
+== gmake.out
+bad.v:3: syntax error  dir="<P>/sim" exists=t
+END: (user-error "Past last error")
+== nested.out
+top.v:1: error: A  dir="<P>" exists=t
+s.v:1: error: B  dir="<P>/sim" exists=t
+d.v:1: error: C  dir="<P>/deep" exists=nil
+s.v:1: error: D  dir="<P>/sim" exists=t
+top.v:1: error: E  dir="<P>" exists=t
+top.v:1: error: F  dir=nil exists=t
+END: (user-error "Past last error")

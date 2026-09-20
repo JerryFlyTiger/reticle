@@ -20,8 +20,24 @@
 ;;     of being bare anonymous tokens the way c/rust/java's keywords are:
 ;;     `module`->`module_keyword`, `always`/`always_ff`/`always_comb`/
 ;;     `always_latch`->`always_keyword`, `case`(/`casex`/`casez`)->
-;;     `case_keyword`, `input`/`output`/`inout`->`port_direction`,
-;;     `posedge`/`negedge`->`edge_identifier`. Each of these wrapper nodes
+;;     `case_keyword`, an ANSI `input`/`output`/`inout`/`ref` port ->
+;;     `port_direction`, `posedge`/`negedge`->`edge_identifier`.
+;;     CORRECTION (M142): the `input`/`output`/`inout`->`port_direction`
+;;     claim above is only true for an ANSI port. In a non-ANSI module body
+;;     (`module m(a); input a; endmodule`), `input_declaration`/
+;;     `output_declaration`/`inout_declaration` hold the keyword as a bare
+;;     anonymous token with NO `port_direction` wrapper at all -- dump-
+;;     verified against `module m(a,b,c); input a; output b; inout c;
+;;     endmodule`, which parses as `(port_declaration (input_declaration
+;;     (list_of_port_identifiers ...)))` etc., no `port_direction` node
+;;     anywhere. M142 added bare `"input"`/`"output"`/`"inout"` (and
+;;     `"ref"`) literal rules below to cover this; a bare string pattern
+;;     matches the token by content wherever it is an anonymous leaf,
+;;     regardless of which named node (if any) wraps it, so the same bare
+;;     rule ALSO matches the token nested one level inside `port_direction`
+;;     -- a harmless same-span double capture, same face either way, kept
+;;     deliberately (see the M142 section below) rather than special-cased
+;;     away. Each of these wrapper nodes
 ;;     contains ONLY its one keyword token (dump-verified -- no other
 ;;     children), so capturing the wrapper node and capturing its bare
 ;;     token would produce byte-identical spans; this file captures the
@@ -491,6 +507,236 @@
 
 (interface_port_header interface_name: (simple_identifier) @type)
 (interface_port_header modport_name: (simple_identifier) @constant)
+
+;; --- M142: completing keyword coverage for Verilog/SystemVerilog -----------
+;; A census of the grammar's Annex B reserved-word list (248 words,
+;; `tree-sitter-systemverilog` 0.4.0 `grammar.js:4779-4818`) against a real
+;; parse tree (never `to_sexp()` or `node-types.json` alone -- both hide
+;; some anonymous children, see the file-level note at the top) found 171
+;; unfaced words, plus the non-ANSI port defect documented in the
+;; correction above. This section closes that gap. Every literal and node
+;; kind below was confirmed to exist in the grammar by compiling it as a
+;; real `tree_sitter::Query` against `tree_sitter_systemverilog::LANGUAGE`
+;; (a throwaway probe test, removed after use, same "dump, verify, delete"
+;; convention as the rest of this file) -- not assumed from the reserved
+;; word spelling.
+;;
+;; A bare string pattern (`"word" @face`) matches an anonymous leaf by
+;; content ANYWHERE it occurs in the tree, regardless of which named node
+;; (if any) wraps it -- unlike named-node nesting, which requires a strict
+;; parent/child relationship. That means most of the words below need no
+;; wrapper at all. The exception is any word the grammar reuses for a
+;; second, non-keyword role: those are anchored to their wrapper node so
+;; only the keyword role gets a face, and the reused role stays plain.
+;;
+;; Two such reuses were found and drove the anchoring choices below:
+;;   * `and`/`or`/`not` are simultaneously (a) a gate-instantiation TYPE
+;;     keyword (`and g1(y, a, b);`) and (b) an SVA/property operator
+;;     (`a and b` inside a `property_expr`/`sequence_expr`, dump-verified
+;;     as a bare token directly under those nodes) -- `and`/`or` are ALSO,
+;;     separately, an `array_method_name` (`arr.and()`, `grammar.js:3773`,
+;;     a real SV builtin array-reduction method call). A bare rule would
+;;     wrongly face the operator and the method-call name too, so these
+;;     (and every other gate-primitive word, for consistency: `nand`/
+;;     `nor`/`xor`/`xnor`/`buf`/`bufif0`/`bufif1`/`notif0`/`notif1` and the
+;;     switch-type words) are captured ONLY through their gate-type wrapper
+;;     node -- `n_input_gatetype` (`and`/`nand`/`or`/`nor`/`xor`/`xnor`),
+;;     `n_output_gatetype` (`buf`/`not`), `enable_gatetype` (`bufif0`/
+;;     `bufif1`/`notif0`/`notif1`), `cmos_switchtype` (`cmos`/`rcmos`),
+;;     `mos_switchtype` (`nmos`/`pmos`/`rnmos`/`rpmos`), `pass_switchtype`
+;;     (`tran`/`rtran`), `pass_en_switchtype` (`tranif0`/`tranif1`/
+;;     `rtranif0`/`rtranif1`) -- `grammar.js:2302-2314` dump-verified each
+;;     choice list. `pulldown`/`pullup` have no wrapper of their own
+;;     (`grammar.js:2200-2201`, bare literals directly in `gate_instantiation`)
+;;     and are not reused elsewhere, so they get plain bare-literal rules.
+;;   * `unique` is simultaneously (a) the `unique case`/`unique if`
+;;     qualifier and (b) an `array_method_name` (`arr.unique()`,
+;;     `grammar.js:3765`) -- `unique0`/`priority` share the same
+;;     `unique_priority` wrapper node (`grammar.js:2838`) even though only
+;;     `unique` itself is reused, so all three are captured through
+;;     `(unique_priority)` for consistency and to avoid ever coloring
+;;     `arr.unique()`'s call name.
+;; Every other word below was checked against the grammar and found to
+;; have no second role, so it is a plain bare-literal rule.
+;;
+;; Known inconsistency, left as-is: the pre-existing M121 bare `"iff"
+;; @keyword` rule faces `iff` in its dominant role, the `disable iff (...)`
+;; guard keyword, but it ALSO faces `iff` in its other grammar role as a
+;; property connective (`property_expr 'iff' property_expr`,
+;; `grammar.js:1835`) -- the same operator/connective shape this section
+;; deliberately cuts for `and`/`or`/`intersect`/etc. below. `disable iff
+;; (...)` is overwhelmingly the common use, so the rule is kept rather than
+;; anchored to a wrapper that would also suppress it.
+;;
+;; Face-class decisions (fixed by the M142 spec, not re-derived here):
+;;   - `input`/`output`/`inout`/`ref` -> @keyword in every context (stays
+;;     with the existing `port_direction` convention above; does NOT
+;;     follow GNU's `font-lock-type-face` for the ANSI case).
+;;   - `signed`/`unsigned`/`enum`/`struct`/`union`/`packed`/`tagged`/`void`,
+;;     plus every gate/switch-primitive TYPE word above -> @type.
+;;   - Everything else reachable as a bare leaf -> @keyword.
+;;
+;; Deliberately left PLAIN (extending the existing sensitivity-list-`or`
+;; cut above, M38 lines 89-92): every SVA/property operator or connective
+;; -- `and`/`or`/`not` (see above), `intersect`, `throughout`, `within`,
+;; `implies`, `until`, `s_until`, `until_with`, `s_until_with`, `inside`, `dist`, `with` in
+;; expression position, `iff` (already faced by the M121 rule above, for a
+;; DIFFERENT role -- the `disable iff (...)` guard keyword -- left as-is,
+;; not touched here). These are structurally operators/connectives
+;; joining two expressions, not keywords introducing a construct, matching
+;; this file's own established cut for sensitivity-list `or`. This is a
+;; deliberate divergence from GNU Emacs 30.2's verilog-mode, which does
+;; face some of these.
+;;
+;; Not reached by anything in this file, and left uncolored (same
+;; "disclosed scope cut" convention as the header's own list): gate/net
+;; charge-strength and drive-strength words (`highz0`/`highz1`/`large`/
+;; `medium`/`small`/`scalared`/`vectored`/`strong0`/`strong1`/`weak0`/
+;; `weak1`/`pull0`/`pull1`/`noshowcancelled`/`showcancelled`) -- gate-level
+;; timing/charge modeling, no `demo/` material motivates them and none was
+;; dump-verified against a real parse; `alias` (procedural continuous-assign
+;; alias word) was left out for the same reason: no representative snippet
+;; was built and dump-verified for it in this milestone's time budget, so
+;; adding a bare rule for it would be a guess this file's own house style
+;; (dump, verify, then write the rule) forbids.
+
+;; -- non-ANSI port directions (the corrected header claim above) --------
+"input" @keyword
+"output" @keyword
+"inout" @keyword
+"ref" @keyword
+
+;; -- gate/switch instantiation TYPE words -> @type (wrapper-anchored) ----
+(n_input_gatetype) @type
+(n_output_gatetype) @type
+(enable_gatetype) @type
+(cmos_switchtype) @type
+(mos_switchtype) @type
+(pass_switchtype) @type
+(pass_en_switchtype) @type
+"pulldown" @type
+"pullup" @type
+
+;; -- type keywords, no second role, plain bare literals -> @type --------
+"signed" @type
+"unsigned" @type
+"enum" @type
+"struct" @type
+"union" @type
+"packed" @type
+"tagged" @type
+"void" @type
+
+;; -- unique/unique0/priority (wrapper-anchored, see note above) -> @keyword
+(unique_priority) @keyword
+
+;; -- everything else reachable as a bare leaf, no second role -> @keyword
+"accept_on" @keyword
+"before" @keyword
+"bind" @keyword
+"bins" @keyword
+"binsof" @keyword
+"break" @keyword
+"cell" @keyword
+"checker" @keyword
+"endchecker" @keyword
+"clocking" @keyword
+"endclocking" @keyword
+"config" @keyword
+"endconfig" @keyword
+"const" @keyword
+"constraint" @keyword
+"context" @keyword
+"continue" @keyword
+"cross" @keyword
+"deassign" @keyword
+"defparam" @keyword
+"design" @keyword
+"do" @keyword
+"edge" @keyword
+"endprimitive" @keyword
+"endproperty" @keyword
+"endsequence" @keyword
+"endspecify" @keyword
+"endtable" @keyword
+"eventually" @keyword
+"expect" @keyword
+"export" @keyword
+"extends" @keyword
+"extern" @keyword
+"final" @keyword
+"first_match" @keyword
+"force" @keyword
+"foreach" @keyword
+"forever" @keyword
+"fork" @keyword
+"forkjoin" @keyword
+"global" @keyword
+"ifnone" @keyword
+"ignore_bins" @keyword
+"illegal_bins" @keyword
+"implements" @keyword
+"import" @keyword
+"incdir" @keyword
+"include" @keyword
+"instance" @keyword
+"interconnect" @keyword
+"join" @keyword
+"join_any" @keyword
+"join_none" @keyword
+"let" @keyword
+"liblist" @keyword
+"library" @keyword
+"local" @keyword
+"macromodule" @keyword
+"matches" @keyword
+"negedge" @keyword
+"nettype" @keyword
+"null" @keyword
+"package" @keyword
+"endpackage" @keyword
+"posedge" @keyword
+"primitive" @keyword
+"protected" @keyword
+"pulsestyle_ondetect" @keyword
+"pulsestyle_onevent" @keyword
+"pure" @keyword
+"rand" @keyword
+"randc" @keyword
+"randcase" @keyword
+"randsequence" @keyword
+"reject_on" @keyword
+"release" @keyword
+"repeat" @keyword
+"restrict" @keyword
+"s_always" @keyword
+"s_eventually" @keyword
+"s_nexttime" @keyword
+"sequence" @keyword
+"soft" @keyword
+"solve" @keyword
+"specify" @keyword
+"specparam" @keyword
+"static" @keyword
+"strong" @keyword
+"super" @keyword
+"sync_accept_on" @keyword
+"sync_reject_on" @keyword
+"table" @keyword
+"this" @keyword
+"timeprecision" @keyword
+"timeunit" @keyword
+"type" @keyword
+"typedef" @keyword
+"untyped" @keyword
+"use" @keyword
+"var" @keyword
+"virtual" @keyword
+"wait" @keyword
+"wait_order" @keyword
+"weak" @keyword
+"while" @keyword
+"wildcard" @keyword
 
 ;; --- comments / strings ------------------------------------------------------
 

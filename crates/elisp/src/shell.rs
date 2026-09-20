@@ -36,6 +36,21 @@
 //!   caller. It can migrate to `separate` later if that turns out to be
 //!   useful there too.
 //!
+//! M141: `Merged` mode gives the child ONE pipe (`std::io::pipe()`) and
+//! passes it as both stdout and stderr (the writer half for stdout, a
+//! `try_clone()` of it for stderr), with a single reader thread draining
+//! it. Order in that mode is
+//! therefore exactly the order the child wrote to its (now-shared)
+//! stdout/stderr file descriptor — the same guarantee a terminal or GNU
+//! Emacs's own process connection gives, and one that two independent
+//! pipes with two independent reader threads structurally cannot give (see the
+//! false claim this replaced, and the measured failure counts, in the
+//! M141 milestone record). The remaining caveat is the child's own stdio
+//! buffering, which this module has no control over: a program whose
+//! stdout is fully buffered because it isn't talking to a tty can still
+//! reorder its own writes relative to unbuffered stderr writes, same as
+//! it would on a real terminal.
+//!
 //! Deliberately NOT here: any timeout or output-size cap. Both belong to
 //! the M79 elisp pump (the second half of this milestone, not yet
 //! written) because only it knows which buffer output is landing in and
@@ -70,9 +85,12 @@ enum Streams {
 
 enum ShellEvent {
     /// A chunk of output, tagged with which pipe it came from. In
-    /// `Merged` mode the tag is ignored and chunks are concatenated in
-    /// arrival order — the same interleaving the old untagged design
-    /// produced, since both reader threads always shared one channel.
+    /// `Merged` mode there is only one pipe and one reader thread (both
+    /// stdout and stderr are dup'd ends of the same `std::io::pipe()`),
+    /// so the tag is redundant there and chunks arrive in the child's own
+    /// write order. In `Separate` mode there are two independent pipes
+    /// and two independent reader threads, and the tag is what tells
+    /// `poll()` which accumulator to append to.
     Chunk(StreamKind, String),
     /// One reader stream reached EOF (internal bookkeeping).
     Eof,
@@ -189,26 +207,67 @@ impl ShellProc {
         stdin_data: Option<&str>,
         streams: Streams,
     ) -> std::io::Result<ShellProc> {
-        let mut child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(cmdline)
             .current_dir(dir)
             .stdin(if stdin_data.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        // Two reader threads share one channel: chunks arrive tagged by
-        // origin, so `Merged` and `Separate` mode can both be served
-        // from the same event stream without re-spawning readers.
+            });
+        // `Merged`: one OS pipe, given to the child as BOTH stdout and
+        // stderr (via a `try_clone()`'d writer), so the child's own
+        // writes to what it sees as two file descriptors land on one
+        // pipe in the order it made them -- the ordering guarantee
+        // described in the file-level doc comment above. `Separate`:
+        // two independent pipes, unchanged from before M141.
+        let merged_pipe = match streams {
+            Streams::Merged => {
+                let (reader, writer) = std::io::pipe()?;
+                let writer_clone = writer.try_clone()?;
+                cmd.stdout(Stdio::from(writer));
+                cmd.stderr(Stdio::from(writer_clone));
+                Some(reader)
+            }
+            Streams::Separate => {
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+                None
+            }
+        };
+        let mut child = cmd.spawn()?;
+        // `spawn` borrows `cmd`, so `cmd` (and, in `Merged` mode, the two
+        // `PipeWriter` handles it holds) stays alive until this function
+        // returns -- a `let` binding drops at the end of its block, not
+        // after its last use. That drop is load-bearing: the pipe's read
+        // end sees EOF only once ALL writer-end descriptors, in every
+        // process, are closed. It is safe here only because nothing in
+        // this function reads the pipe: the reader is handed to its own
+        // thread below, which reads output as the child writes it and
+        // whose final read (the one returning EOF) cannot complete until
+        // `cmd` has dropped at the return.
+        // A synchronous read on `reader` added inside this function would
+        // deadlock (measured by the M141 cold read with a standalone
+        // probe); drop `cmd` explicitly first if one is ever needed.
         let (tx, rx) = std::sync::mpsc::channel();
-        reader_thread(stdout, StreamKind::Stdout, tx.clone());
-        reader_thread(stderr, StreamKind::Stderr, tx);
+        let open_streams = match merged_pipe {
+            Some(reader) => {
+                // One reader thread: `Merged` mode has exactly one pipe.
+                // The `StreamKind` tag is irrelevant in this mode (see
+                // `ShellEvent::Chunk`'s doc comment) but `reader_thread`
+                // needs one; `Stdout` is as good as `Stderr` here.
+                reader_thread(reader, StreamKind::Stdout, tx);
+                1
+            }
+            None => {
+                let stdout = child.stdout.take().expect("piped stdout");
+                let stderr = child.stderr.take().expect("piped stderr");
+                reader_thread(stdout, StreamKind::Stdout, tx.clone());
+                reader_thread(stderr, StreamKind::Stderr, tx);
+                2
+            }
+        };
 
         let stdin_thread = stdin_data.map(|data| {
             let data = data.as_bytes().to_vec();
@@ -233,7 +292,7 @@ impl ShellProc {
         Ok(ShellProc {
             child,
             events: rx,
-            open_streams: 2,
+            open_streams,
             exit_code: None,
             exit_reported: false,
             streams,

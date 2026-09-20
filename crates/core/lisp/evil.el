@@ -85,10 +85,13 @@
 ;; - `u'/C-r don't consume a count (`u' is bound straight to simple.el's
 ;;   `undo' -- see the redo section below for why that identity
 ;;   matters).
-;; - C-d/C-u move point by half the SELECTED WINDOW's own text height
-;;   (`window-height' minus its mode-line row, halved -- see
-;;   `evil--halfpage'), not the frame's; they do not scroll the window
-;;   viewport (no elisp-level window-start control is exposed here).
+;; - C-d/C-u's half-page amount is half of the SELECTED WINDOW's own text
+;;   height (`window-height' minus its mode-line row, halved -- see
+;;   `evil--halfpage'), not the frame's. As of M139 they DO scroll the
+;;   window viewport (`window-row-start', backed by `crate::redisplay'
+;;   `RowCtx' -- see that milestone's section below) -- this bullet used
+;;   to say they didn't, back when M138 hadn't yet exposed window-start
+;;   control to elisp at all.
 ;; - Ex commands (`:', M30): a small, fixed, case-sensitive command set
 ;;   (:w/:q/:q!/:wq/:x/:e PATH/:N/:$), plus M42-II's `:s' substitute
 ;;   (its own range/pattern/replacement grammar -- see the "M42-II: :s
@@ -230,6 +233,35 @@
 ;;   -- see `evil-visual-swap' (`o', pre-M45) instead; `gv' itself
 ;;   (M45) is strictly "reselect the last selection", never an endpoint
 ;;   swap.
+;; - M139 viewport family (C-f/C-b/C-e/C-y/C-d/C-u, `zz'/`zt'/`zb'/
+;;   `z RET'/`z .'/`z -'): insert state leaves C-e/C-y/C-d alone -- they
+;;   are unbound in `evil--insert-map' (only ESC/C-n/C-p are) and fall
+;;   through to whatever the global keymap does with them; vim's OWN
+;;   insert-mode meanings for these three (delete-to-eol, insert the
+;;   character above/below, delete-word-back) are a deliberate non-goal.
+;;   This editor's renderer draws nothing past end-of-buffer (no `~'
+;;   filler rows the way a real terminal vim shows), so wherever the
+;;   vim reference scrolls such that blank rows appear below the last
+;;   line (a real, measured vim behaviour for C-f/C-b specifically --
+;;   see the "M139: viewport family" section below), this editor's
+;;   window-start still lands on the same buffer position; the rows
+;;   below it are simply blank, not distinguishable from "nothing drawn
+;;   yet" by the row-drawing loop. Accepted as cosmetic, not a numeric
+;;   mismatch.
+;; - M139 fix round: real vim's window-start is ALWAYS a logical line
+;;   start (vim has no concept of a visual "row" independent of a
+;;   line), so "the landing row is a wrap-continuation row" cannot arise
+;;   there at all -- an open question the review could not settle
+;;   against real vim for exactly that reason. This editor's rows CAN be
+;;   wrap-continuations (a long line wraps across several), so C-f/C-b/
+;;   C-d/C-u's first-non-blank step (`evil--first-non-blank-unless-
+;;   continuation') only fires when the landing position is already at
+;;   its own logical line's start; on a continuation row it leaves point
+;;   at the row start instead of jumping to the line's first non-blank
+;;   (which could be scrolled ABOVE the window, off-screen, undoing the
+;;   very scroll that just ran). A judgment call, not a vim-measured
+;;   number, made the same direction as the "never leave point off-
+;;   screen" spirit every other rule in this family follows.
 ;;
 ;; --- Redo, and why `u' is bound to the bare `undo' symbol -------------
 ;; `undo-internal' (editing.rs) only continues its backward undo chain
@@ -1986,12 +2018,326 @@ return a number)."
   (let ((wh (window-height)))
     (max 1 (/ (if wh (max 1 (1- wh)) (frame-height)) 2))))
 
-(defun evil-scroll-down ()
+;; --- M139: viewport family (C-f/C-b/C-e/C-y/C-d/C-u, z-family) --------
+;;
+;; Every numeric rule below is quoted from a real vim run (`/usr/bin/vim
+;; -u NONE -N', 23 text rows, `dev/vim-scroll/'; see its README for the
+;; exact command) against a 100-line buffer ("line 1".."line 100", a
+;; second fixture with odd lines indented by four spaces). All six of
+;; C-f/C-b/C-e/C-y/C-d/C-u and the six z-family keys consume the count
+;; exactly once via `evil--total-count', even when unused, so a count
+;; typed before one of these never leaks into whatever runs next.
+;;
+;; None of these are motions: `evil--bind-scroll' (keymap population
+;; section below) binds each one straight to `evil--op-invalid' in
+;; `evil--op-pending-map', so e.g. `d C-d' cancels the pending operator
+;; and touches nothing -- real vim does not treat "half a page" as an
+;; operator target either.
+;;
+;; C-f/C-b (`evil-scroll-page-down'/`-up') walk `window-row-start' by
+;; h-2 rows (h = `window-text-height'), the standard 2-row overlap for
+;; context. C-f's own end-of-buffer clamp is NOT simply "cap the target
+;; at the last line": measured against real vim (`G' to line 78 of 100,
+;; h=23, so the window already shows the last line 100 at its bottom
+;; row) a further C-f jumps straight to window-start = 100 (skipping the
+;; usual -1 overlap entirely, showing 22 blank rows below -- vim is
+;; willing to run the viewport past EOF for a full-page command), and
+;; every C-f after that is a no-op. That is why `evil-scroll-page-down'
+;; computes an old-bottom/last-line comparison every repetition instead
+;; of a single arithmetic clamp. C-b needs no equivalent special case: 0
+;; (`point-min') has no analogous "phantom line before it" the way EOF's
+;; trailing empty line does, so `window-row-start's own floor-at-0 is
+;; already the correct stopping point (measured: repeated C-b at
+;; window-start 0 is a plain no-op, no cursor movement either).
+;;
+;; C-e/C-y (`evil-scroll-line-down'/`-up') scroll by count rows (default
+;; 1) WITHOUT moving point, unless point would leave the window, in
+;; which case point lands on the new edge row keeping its column (NOT
+;; first-non-blank, unlike every other key in this family) --
+;; `evil--goto-row-keep-column'.
+;;
+;; C-d/C-u (`evil-scroll-down'/`-up', replacing the M29-M120 point-only
+;; bodies) use vim's 'scroll' option semantics: an explicit count both
+;; scrolls by that amount AND is remembered in `evil-scroll-count' for
+;; every later count-less press, until the next explicit count; with no
+;; count ever given, the amount is freshly `evil--halfpage' every press
+;; (so it stays responsive to window resizes vim's own default would
+;; also track). `evil-scroll-count' is BUFFER-LOCAL (via `setq-local'),
+;; same approximation this file already makes for every other piece of
+;; per-buffer evil state (`evil--count' etc.) -- real vim's 'scroll' is
+;; WINDOW-local (`:help 'scroll''), so two windows on the SAME buffer
+;; would keep separate remembered amounts in real vim but share one
+;; here. Not fixed: this editor's evil state generally follows the
+;; buffer, not the window, everywhere else too (see `evil--state'
+;; itself), so this one variable being buffer-local is consistent with
+;; the rest of the file, just not bit-for-bit vim. Measured end-of-buffer
+;; behaviour is UNLIKE C-f/C-b: vim
+;; never scrolls C-d's window-start such that fewer than a full window
+;; of real content would remain on screen (no blank filler, ever) --
+;; from window-start 74 with the last line at 100 and h=23, a `C-d'
+;; with amount 11 does NOT land at 74+11=85; it clamps to 78 (= last
+;; line 100 minus (h-1) = the tightest start that still puts line 100 at
+;; the very bottom row), even though the CURSOR moves the full,
+;; unclamped 11 lines (clamped only to the last line itself if that's
+;; less). `evil-scroll-down' computes this ceiling by briefly anchoring
+;; window-start at the last line and reading `window-row-start' backward
+;; from there, then uses whichever of (old-start + amount) or that
+;; ceiling is smaller -- one formula that turned out to already cover
+;; both "still mid-buffer" and "already pinned at the ceiling" (see the
+;; function's own comment for why no separate branch was needed once
+;; this was worked out against real vim). C-u has no analogous ceiling
+;; on the top side, symmetric to C-b above.
+;;
+;; z z/t/b (`evil-scroll-line-to-center'/`-top'/`-bottom') are thin
+;; wrappers over the EXISTING `(recenter ARG)' primitive (M138): `(recenter
+;; (/ (1- h) 2))', `(recenter 0)', `(recenter -1)' respectively -- its
+;; own rows_above formula already matches every measured number here
+;; with no new arithmetic needed. A count first jumps to that line's
+;; first non-blank (vim's "NG first" -- `evil--z-goto-count', the same
+;; `evil--pos-goto-line' helper `G' itself uses) before the recenter
+;; runs. `z RET'/`z .'/`z -' are the same three plus a `goto-char' to `evil--pos-first-non-blank'
+;; on top.
+(defvar evil-scroll-count nil
+  "Vim's 'scroll' option: the C-d/C-u amount an explicit count last set,
+remembered across count-less presses until the next explicit count
+\(M139 -- see `evil--scroll-amount'). nil means \"no explicit count has
+ever been given\", NOT \"use 0\" -- `evil--scroll-amount' falls back to
+a freshly computed `evil--halfpage' in that case, every time, so it
+stays responsive to window-height changes the way vim's own unset
+'scroll' does.
+
+BUFFER-local (every write goes through `setq-local'), not global and
+not window-local -- real vim's 'scroll' is a WINDOW-local option, so
+two windows onto the same buffer remember amounts separately there.
+This variable follows the buffer instead, the same approximation this
+file already makes for `evil--count' and friends; see the M139 file
+header section for the full reasoning.")
+
+(defun evil--scroll-amount ()
+  "Effective C-d/C-u amount for THIS press, per vim's 'scroll' option:
+an explicit count both returns AND remembers itself in
+`evil-scroll-count'; no count reuses the last remembered value, or
+`evil--halfpage' if none has ever been given. Consumes the count via
+`evil--total-count' exactly once, like every other command in this
+family, even when the fallback is used."
+  (let* ((has-count evil--count)
+         (n (evil--total-count)))
+    (when has-count
+      (setq-local evil-scroll-count n))
+    (or evil-scroll-count (evil--halfpage))))
+
+(defun evil--last-line-start ()
+  "Start of the buffer's LAST line, in vim's sense -- for a
+trailing-newline buffer this is NOT `point-max' itself (which begins
+the empty line after that final newline, this editor's own line-
+counting convention, see viewport_tests.rs's `hundred_lines') but the
+line the final newline belongs to. Robust to a buffer with no trailing
+newline too, where `point-max' already sits inside the last real line."
+  (save-excursion
+    (goto-char (max (point-min) (1- (point-max))))
+    (line-beginning-position)))
+
+(defun evil--goto-row-keep-column (target &optional next-row-start)
+  "Move point to TARGET (a row-start position), preserving the current
+column the way GNU's own vertical motions do -- clamped to TARGET's own
+logical line end so a short line doesn't overrun. Backs C-e/C-y's
+\"cursor keeps its column\" rule (M139) -- unlike every other key in
+this family, which lands on the first non-blank column instead.
+
+Fix round: when TARGET is itself a WRAP-CONTINUATION row (mid-line,
+e.g. C-e landed the window-start in the middle of a long line), the
+line-end clamp alone is not enough -- `(+ target col)` can still land
+on a LATER visual row of that same logical line, possibly one that is
+off-screen again (defeating the very reason this function moved point
+here in the first place). NEXT-ROW-START, when given, is the position
+where the FOLLOWING visual row starts -- callers already have it on
+hand (`window-row-start' relative to whatever row TARGET is): the top
+row's next row is `(window-row-start 1)` (after `set-window-start' has
+already moved window-start to TARGET); the bottom row's next row is
+`(window-row-start h)', h = `window-text-height', one past
+`(window-row-start (1- h))'. `(1- next-row-start)' is used as an
+additional clamp ceiling alongside the logical line-end one.
+
+Second fix round: when TARGET is the buffer's true LAST row (C-e's
+case -- point can genuinely sit above a last-row TARGET, off-screen,
+which is what makes this function run at all), `window-row-start'
+itself has nowhere further to go and clamps back to TARGET -- so
+NEXT-ROW-START == TARGET, and the naive `(1- next-row-start)' ceiling
+becomes `target - 1', ONE CHARACTER BEFORE the window start, worse
+than not clamping at all. (The C-e last-row test in evil_tests.rs
+has the full reasoning for why C-y has no equivalent real-world case:
+its landing row would need to be the buffer's FIRST row while point
+sits ABOVE it, off-screen -- impossible, since nothing precedes the
+first row.)
+NEXT-ROW-START only means anything as a ceiling when it is actually
+AFTER target (a real following row exists); when it isn't, this falls
+back to the plain line-end clamp.
+
+The trailing `(max target ...)' is belt-and-braces, not doing
+independent work today: given the guard above, `limit' is always
+>= TARGET already (the clamped branch guarantees it algebraically --
+`next-row-start > target' means `(1- next-row-start) >= target' --
+and the un-clamped branch's `line-end-position' is trivially >= TARGET
+since TARGET sits on that same line), and `(+ target col)' is always
+>= TARGET since COL (`current-column') is never negative. The floor
+only starts doing real work if some future caller ever passes a
+NEXT-ROW-START that is not actually >= TARGET (violating the
+assumption every current caller upholds)."
+  (let ((col (current-column)))
+    (goto-char target)
+    (let ((limit (line-end-position)))
+      (when (and next-row-start (> next-row-start target) (< (1- next-row-start) limit))
+        (setq limit (1- next-row-start)))
+      (goto-char (max target (min (+ (point) col) limit))))))
+
+(defun evil--first-non-blank-unless-continuation ()
+  "Move point to its logical line's first non-blank -- but ONLY when
+point is already sitting at that line's OWN start
+\(`(= (point) (line-beginning-position))'). Fix round: C-f/C-b/C-d/C-u
+can land point on a WRAP-CONTINUATION row (mid-line) when the target
+row itself is one -- real vim's window-start is always a logical LINE
+start, so this case cannot arise there, but this editor's rows can be
+wrap-continuations (see the file header's divergence list). Jumping to
+the line's first non-blank in that case would move point ABOVE the
+just-computed window-start/landing row (possibly off-screen again),
+which is worse than doing nothing -- so a continuation row is left
+exactly where it landed instead."
+  (when (= (point) (line-beginning-position))
+    (goto-char (evil--pos-first-non-blank))))
+
+(defun evil--z-goto-count ()
+  "Vim's \"NG first\" rule for the z-family: if a count was given, jump
+to that line's first non-blank BEFORE the recenter runs (measured:
+`20zz' lands on line 20, THEN centers -- see the file header)."
+  (let ((has-count evil--count)
+        (n (evil--total-count)))
+    (when has-count (goto-char (evil--pos-goto-line n)))))
+
+(defun evil-scroll-page-down ()  ; C-f
   (interactive)
-  (next-line (evil--halfpage)))
-(defun evil-scroll-up ()
+  (let* ((n (max 1 (evil--total-count)))
+         (h (or (window-text-height) 1))
+         (step (max 1 (- h 2)))
+         (last-line (evil--last-line-start)))
+    (dotimes (_ n)
+      (let ((old-bottom (window-row-start (1- h))))
+        (set-window-start nil
+                           (if (>= old-bottom last-line)
+                               last-line
+                             (window-row-start step))
+                           t)))
+    (goto-char (window-start))
+    (evil--first-non-blank-unless-continuation)))
+
+(defun evil-scroll-page-up ()  ; C-b
   (interactive)
-  (previous-line (evil--halfpage)))
+  (let* ((n (max 1 (evil--total-count)))
+         (h (or (window-text-height) 1))
+         (step (max 1 (- h 2)))
+         (start0 (window-start)))
+    ;; Measured: at window-start 0, C-b is a total no-op -- no error, and
+    ;; the cursor does not move either (unlike C-d's analogous end-of-
+    ;; buffer case, where the cursor still moves even when the window
+    ;; can't scroll further).
+    (unless (= start0 (point-min))
+      (dotimes (_ n)
+        (set-window-start nil (window-row-start (- step)) t))
+      (goto-char (window-row-start (1- h)))
+      (evil--first-non-blank-unless-continuation))))
+
+(defun evil-scroll-line-down ()  ; C-e
+  (interactive)
+  (let* ((n (max 1 (evil--total-count)))
+         (new-start (window-row-start n)))
+    (set-window-start nil new-start t)
+    (unless (pos-visible-in-window-p (point) nil)
+      ;; Point lands on the WINDOW's new top row -- the row right after
+      ;; it (needed so `evil--goto-row-keep-column' can't overshoot past
+      ;; it when the top row is itself a wrap-continuation row) is one
+      ;; row forward from the start `set-window-start' just installed.
+      (evil--goto-row-keep-column new-start (window-row-start 1)))))
+
+(defun evil-scroll-line-up ()  ; C-y
+  (interactive)
+  (let* ((n (max 1 (evil--total-count)))
+         (new-start (window-row-start (- n))))
+    (set-window-start nil new-start t)
+    (unless (pos-visible-in-window-p (point) nil)
+      (let ((h (or (window-text-height) 1)))
+        ;; Point lands on the window's LAST visible row -- the row after
+        ;; it is one row further still.
+        (evil--goto-row-keep-column (window-row-start (1- h)) (window-row-start h))))))
+
+(defun evil-scroll-down ()  ; C-d
+  (interactive)
+  (let* ((amount (evil--scroll-amount))
+         (h (or (window-text-height) 1))
+         ;; Computed BEFORE the probe below touches window-start: "old
+         ;; window-start advanced by AMOUNT rows", clamped to EOB by
+         ;; `window-row-start' itself.
+         (candidate (window-row-start amount))
+         (last-line (evil--last-line-start))
+         ;; Also computed before window-start moves: point advanced by
+         ;; AMOUNT logical lines (vim's 'scroll' is a line count, not a
+         ;; row count -- irrelevant here since none of this family's
+         ;; fixtures wrap), clamped to the last line.
+         (new-point (min (save-excursion (forward-line amount) (point))
+                          last-line)))
+    ;; Probe: temporarily anchor window-start at the last line so
+    ;; `window-row-start' can answer "the greatest start that still
+    ;; keeps the last line at the very bottom row" -- vim's real ceiling
+    ;; for C-d, measured to be LOWER than a plain (old-start + amount)
+    ;; near EOF (see the file header). Harmless: NOFORCE t never moves
+    ;; point, and the very next line overwrites window-start with the
+    ;; real target before anything renders.
+    (set-window-start nil last-line t)
+    (let ((max-start (window-row-start (- (1- h)))))
+      (set-window-start nil (min candidate max-start) t))
+    (goto-char new-point)
+    (evil--first-non-blank-unless-continuation)))
+
+(defun evil-scroll-up ()  ; C-u
+  (interactive)
+  (let* ((amount (evil--scroll-amount))
+         (new-start (window-row-start (- amount)))
+         (new-point (max (save-excursion (forward-line (- amount)) (point))
+                          (point-min))))
+    (set-window-start nil new-start t)
+    (goto-char new-point)
+    (evil--first-non-blank-unless-continuation)))
+
+(defun evil-scroll-line-to-center ()  ; zz
+  (interactive)
+  (evil--z-goto-count)
+  (recenter (/ (1- (or (window-text-height) 1)) 2)))
+
+(defun evil-scroll-line-to-top ()  ; zt
+  (interactive)
+  (evil--z-goto-count)
+  (recenter 0))
+
+(defun evil-scroll-line-to-bottom ()  ; zb
+  (interactive)
+  (evil--z-goto-count)
+  (recenter -1))
+
+(defun evil-scroll-line-to-top-first-non-blank ()  ; z RET
+  (interactive)
+  (evil--z-goto-count)
+  (recenter 0)
+  (goto-char (evil--pos-first-non-blank)))
+
+(defun evil-scroll-line-to-center-first-non-blank ()  ; z .
+  (interactive)
+  (evil--z-goto-count)
+  (recenter (/ (1- (or (window-text-height) 1)) 2))
+  (goto-char (evil--pos-first-non-blank)))
+
+(defun evil-scroll-line-to-bottom-first-non-blank ()  ; z -
+  (interactive)
+  (evil--z-goto-count)
+  (recenter -1)
+  (goto-char (evil--pos-first-non-blank)))
 
 ;; --- Digit arguments (normal + visual + operator-pending) --------------
 
@@ -3479,6 +3825,20 @@ checks `evil--pending-operator' to know which)."
   (define-key evil--visual-map key cmd)
   (define-key evil--op-pending-map key cmd))
 
+(defun evil--bind-scroll (key cmd)
+  "Bind KEY to CMD in normal and visual state only (M139's viewport
+family: C-f/C-b/C-e/C-y/C-d/C-u and the z-family). These move point and
+so extend a visual selection like any other point-moving key, exactly
+like `evil--bind-motion''s bindings do -- but unlike those, none of
+them are motions: binding one into `evil--op-pending-map' the way
+`evil--bind-motion' does would let e.g. `d C-d' treat half a page as an
+operator target, which real vim does not allow. `evil--op-pending-map'
+gets `evil--op-invalid' instead, cancelling any pending operator
+exactly like any other unclaimed key there."
+  (define-key evil--normal-map key cmd)
+  (define-key evil--visual-map key cmd)
+  (define-key evil--op-pending-map key 'evil--op-invalid))
+
 (evil--bind-motion "h" 'evil-backward-char)
 (evil--bind-motion "l" 'evil-forward-char)
 (evil--bind-motion "j" 'evil-next-line)
@@ -3502,8 +3862,22 @@ checks `evil--pending-operator' to know which)."
 (evil--bind-motion "T" 'evil-till-char-backward)
 (evil--bind-motion ";" 'evil-repeat-find)
 (evil--bind-motion "," 'evil-repeat-find-reverse)
-(evil--bind-motion "C-d" 'evil-scroll-down)
-(evil--bind-motion "C-u" 'evil-scroll-up)
+;; M139: C-d/C-u are now real viewport scrolls, not motions -- see
+;; `evil--bind-scroll''s own doc comment for why they moved off
+;; `evil--bind-motion' (their previous binder, back when they only moved
+;; point).
+(evil--bind-scroll "C-d" 'evil-scroll-down)
+(evil--bind-scroll "C-u" 'evil-scroll-up)
+(evil--bind-scroll "C-f" 'evil-scroll-page-down)
+(evil--bind-scroll "C-b" 'evil-scroll-page-up)
+(evil--bind-scroll "C-e" 'evil-scroll-line-down)
+(evil--bind-scroll "C-y" 'evil-scroll-line-up)
+(evil--bind-scroll "z z" 'evil-scroll-line-to-center)
+(evil--bind-scroll "z t" 'evil-scroll-line-to-top)
+(evil--bind-scroll "z b" 'evil-scroll-line-to-bottom)
+(evil--bind-scroll "z RET" 'evil-scroll-line-to-top-first-non-blank)
+(evil--bind-scroll "z ." 'evil-scroll-line-to-center-first-non-blank)
+(evil--bind-scroll "z -" 'evil-scroll-line-to-bottom-first-non-blank)
 (evil--bind-motion "1" 'evil-digit-1)
 (evil--bind-motion "2" 'evil-digit-2)
 (evil--bind-motion "3" 'evil-digit-3)
@@ -3739,7 +4113,7 @@ checks `evil--pending-operator' to know which)."
 ;; runs post-command-hook except via self-insert.
 (defconst evil--op-pending-claimed
   (list ?h ?l ?j ?k ?w ?b ?e ?W ?B ?E ?0 ?^ ?$ ?f ?F ?t ?T ?\; ?,
-        ?1 ?2 ?3 ?4 ?5 ?6 ?7 ?8 ?9 ?d ?c ?y ?i ?a ?\` ?\' ?g ?u ?U ?~)
+        ?1 ?2 ?3 ?4 ?5 ?6 ?7 ?8 ?9 ?d ?c ?y ?i ?a ?\` ?\' ?g ?u ?U ?~ ?z)
   "Printable ASCII characters already meaningfully bound at the TOP
 LEVEL of `evil--op-pending-map' by this file's own bindings above:
 motions, same-key doubling, and the i/a text-object prefixes (the
@@ -3774,7 +4148,20 @@ protection for the M45 entries under the same prefix). `u'/`U'/`~' are
 listed because M45 bound them directly (see `evil--case-doubled''s own
 comment above) -- without this, the catchall would immediately
 overwrite that binding with `evil--op-invalid' right after this file
-just set it, the same failure mode as every other entry in this list.")
+just set it, the same failure mode as every other entry in this list.
+
+M139: `z' is listed for the IDENTICAL prefix-preservation reason as
+`g' just above -- `evil--bind-scroll' bound `\"z z\"'/`\"z t\"'/etc.,
+each of which made `z' itself a top-level PREFIX entry of
+`evil--op-pending-map' (each leaf already correctly points at
+`evil--op-invalid', per `evil--bind-scroll''s own doc comment, but the
+PREFIX keymap they live inside does not itself appear in this list
+without this entry). Without `z' here, the catchall below would
+overwrite that whole prefix keymap with a bare `evil--op-invalid'
+binding, which is actually harmless for `d z z' et al (either way
+cancels the operator) but would make `evil--op-pending-map' silently
+disagree with what `evil--normal-map'/`evil--visual-map' show for the
+SAME key sequence -- not worth leaving as a latent inconsistency.")
 
 (defun evil--op-invalid ()
   (interactive)

@@ -3353,6 +3353,16 @@ fn verilog_every_demo_rtl_file_reindents_to_its_own_on_disk_columns_except_named
             15,
             "module header-line quirk",
         ),
+        // M143: the same pre-existing header-line quirk again, for the
+        // `.*' wrapper this milestone added. Not a new defect and not a
+        // reshaping of the file to dodge one: `sram_bank_4k.sv' is
+        // byte-for-byte what `verible-verilog-format
+        // --indentation_spaces=2' produces (`--verify' exits 0), and the
+        // module BODY and the instantiation inside it both reindent
+        // correctly -- it is only the `module sram_bank_4k (' header line
+        // itself that computes col 2 where verible says col 0, exactly
+        // like every other top-level module header already listed here.
+        ("rtl/mem/sram_bank_4k.sv", 10, "module header-line quirk"),
         // M127: the ninth instance of the already-documented "tree-sitter
         // parses a block comment as ONE leaf node" limitation --
         // `soc_top.sv' lines 106-113 above are the first eight. The

@@ -14,8 +14,12 @@
 //! - `m_comma_returns_from_alu_back_to_the_instantiation` -- `M-,`
 //!   jumps back (not separately claimed in the README table, but the
 //!   natural round trip of the row above).
-//! - `regfile_instantiation_offers_all_nine_port_names` -- "port
-//!   completion engages inside `u_regfile`'s port list".
+//! - `regfile_instantiation_excludes_the_eight_already_connected_ports`
+//!   -- "port completion engages inside `u_regfile`'s port list". M143
+//!   renamed this from `..._offers_all_nine_port_names`: `u_regfile`
+//!   connects all nine of regfile's ports, so completion now offers
+//!   only the connection under the cursor (every other name is already
+//!   spoken for on that instance).
 //! - `arbiter_autoinst_expands_then_deletes` -- `C-c C-a` / `C-c C-k`
 //!   on `u_arbiter`.
 //!
@@ -147,7 +151,7 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 38] = [
+    const TABLE: [(&str, &str); 39] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
@@ -167,6 +171,7 @@ fn every_file_under_demo_opens_in_its_expected_major_mode() {
         ("rtl/core/status_regs_stub.sv", "verilog-mode"),
         ("rtl/include/soc_defs.svh", "verilog-mode"),
         ("rtl/mem/sram_bank.sv", "verilog-mode"),
+        ("rtl/mem/sram_bank_4k.sv", "verilog-mode"),
         ("rtl/mem/sram_dual_channel.sv", "verilog-mode"),
         ("rtl/mem/sram_wrapper.sv", "verilog-mode"),
         ("rtl/pkg/soc_pkg.sv", "verilog-mode"),
@@ -341,7 +346,24 @@ fn insert_names(ed: &Rc<RefCell<Editor>>) -> Option<Vec<String>> {
 }
 
 #[test]
-fn regfile_instantiation_offers_all_nine_port_names() {
+fn regfile_instantiation_excludes_the_eight_already_connected_ports() {
+    // M143 Part B renamed and re-pinned this test. It was
+    // `regfile_instantiation_offers_all_nine_port_names' and asserted
+    // exactly that: all nine of `demo/rtl/core/regfile.sv's ports.
+    //
+    // Completion now excludes ports already connected on the SAME
+    // instance, and `u_regfile' in `rtl/top/soc_top.sv' connects all
+    // nine. So the only name left is the one under the cursor, which is
+    // never excluded from its own popup -- the self-skip. The old name
+    // would now be a false statement about what the code does.
+    //
+    // This is the real-RTL evidence for Part B that a hand-typed fixture
+    // cannot supply: a genuine 9-port instantiation, resolved across
+    // files via `rtl/verible.filelist' (M56), where the pre-M143
+    // behaviour made the user re-scan all nine already-spoken-for names
+    // on every completion. It is also how the change was caught at all --
+    // Part B's own test census covered `verilog_complete_tests.rs' and
+    // missed that a test in THIS file pinned the old behaviour.
     let (mut i, ed) = setup();
     let soc_top = demo_root().join("rtl/top/soc_top.sv");
     ok(
@@ -354,26 +376,15 @@ fn regfile_instantiation_offers_all_nine_port_names() {
     let r = run(&mut i, "(completion-at-point)");
     assert_eq!(r, "t", "port context must be handled (t): {}", r);
 
-    let mut names = insert_names(&ed).expect("popup must open");
-    names.sort();
+    let names = insert_names(&ed).expect("popup must open");
 
-    // The complete port list of demo/rtl/core/regfile.sv -- completion
-    // sees it from a DIFFERENT file (rtl/top/soc_top.sv) because it
-    // resolves modules across rtl/verible.filelist and recursive
-    // library search (M56), not just the current buffer.
-    let mut expected = vec![
-        "clk_i",
-        "rst_ni",
-        "raddr_a_i",
-        "rdata_a_o",
-        "raddr_b_i",
-        "rdata_b_o",
-        "we_i",
-        "waddr_i",
-        "wdata_i",
-    ];
-    expected.sort();
-    assert_eq!(names, expected);
+    assert_eq!(
+        names,
+        vec!["raddr_a_i".to_string()],
+        "u_regfile connects all nine regfile ports, so only the connection under \
+         the cursor survives exclusion (self-skip): {:?}",
+        names
+    );
 }
 
 // ============================================================
@@ -806,7 +817,7 @@ fn demo_rtl_sram_dual_channel_autoinst_matches_editor_output() {
 #[test]
 fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
     let root = demo_root();
-    let verilog_files: [(&str, Option<i64>); 21] = [
+    let verilog_files: [(&str, Option<i64>); 22] = [
         ("rtl-verilog2001/fifo_gray_top.v", Some(2)),
         ("rtl-verilog2001/fifo_gray_top_tb.v", Some(2)),
         ("rtl-verilog2001/fifo_sync.v", Some(2)),
@@ -828,6 +839,7 @@ fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
         // case that exercises it, not a synthetic one.
         ("rtl/include/soc_defs.svh", None),
         ("rtl/mem/sram_bank.sv", Some(2)),
+        ("rtl/mem/sram_bank_4k.sv", Some(2)),
         ("rtl/mem/sram_dual_channel.sv", Some(2)),
         ("rtl/mem/sram_wrapper.sv", Some(2)),
         ("rtl/pkg/soc_pkg.sv", Some(2)),

@@ -90,10 +90,33 @@ optional, and they are checked on every pull request:
     cargo build --workspace
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    cargo test --workspace --no-fail-fast
 
 Note the non-default clippy flags: `--all-targets` and `-D warnings`. Warnings
-are errors here.
+are errors here. `--no-fail-fast` on the test step is not optional either:
+`cargo test` otherwise stops at the first failing test *binary* and never runs
+the rest, so a partial run can look identical to a complete one in the output.
+
+Some tests exercise a real external tool (a formatter, a language server,
+`rust-analyzer`, `rg`, `make`) and fail by default if that tool is missing --
+this is deliberate, so a green run always means the check actually ran rather
+than silently skipping. On a machine that genuinely lacks one of these tools,
+opt out explicitly with the matching environment variable, set to exactly the
+lowercase `1`, `true`, or `yes` (any other value -- including `0`, or a
+different case such as `True` -- means the test still fails when the tool is
+missing):
+
+| Variable | Tool |
+|---|---|
+| `RETICLE_ALLOW_MISSING_PILLOW` | Python's Pillow (image diffing, `dev/pixdiff.py`) |
+| `RETICLE_ALLOW_MISSING_PYTHON3` | `python3` (`dev/gate.py`) |
+| `RETICLE_ALLOW_MISSING_VERIBLE_FORMAT` | `verible-verilog-format` |
+| `RETICLE_ALLOW_MISSING_VERIBLE_LS` | `verible-verilog-ls` |
+| `RETICLE_ALLOW_MISSING_CLANG_FORMAT` | `clang-format` |
+| `RETICLE_ALLOW_MISSING_SLANG_SERVER` | `slang-server` |
+| `RETICLE_ALLOW_MISSING_RUST_ANALYZER` | `rust-analyzer` |
+| `RETICLE_ALLOW_MISSING_RG` | `rg` (ripgrep) |
+| `RETICLE_SKIP_MAKE_TESTS` | `make` |
 
 The `cargo build --workspace` step is not redundant. `crates/demo-module` is a
 `cdylib`, and the module-loading tests in `crates/elisp/tests/module_tests.rs`

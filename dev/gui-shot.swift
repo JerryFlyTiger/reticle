@@ -1,5 +1,10 @@
 // Print "<windowID> <x> <y> <width> <height>" for the first on-screen window
 // belonging to a process whose name contains the argument, case-insensitively.
+// An optional second argument restricts the match to that owner PID: without
+// it, a developer's own long-running editor window is found before the one
+// the script just launched (2026-09-13: two "before/after" captures of a
+// driven run came back with 0 differing pixels because both were of the
+// user's idle window, and the driven instance was never photographed).
 //
 // Used by dev/gui-shot.sh. This exists because the obvious route -- asking
 // System Events for `window 1 of process "reticle"` -- needs Accessibility
@@ -12,8 +17,9 @@ import CoreGraphics
 import Foundation
 
 let target = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
-if target.isEmpty {
-    FileHandle.standardError.write(Data("usage: gui-shot <process-name-substring>\n".utf8))
+let wantPid: Int? = CommandLine.arguments.count > 2 ? Int(CommandLine.arguments[2]) : nil
+if target.isEmpty || (CommandLine.arguments.count > 2 && wantPid == nil) {
+    FileHandle.standardError.write(Data("usage: gui-shot <process-name-substring> [pid]\n".utf8))
     exit(2)
 }
 
@@ -28,6 +34,7 @@ else {
 for window in list {
     guard let owner = window[kCGWindowOwnerName as String] as? String,
         owner.lowercased().contains(target.lowercased()),
+        wantPid == nil || (window[kCGWindowOwnerPID as String] as? Int) == wantPid,
         let id = window[kCGWindowNumber as String] as? Int,
         let bounds = window[kCGWindowBounds as String] as? [String: Any],
         let x = bounds["X"] as? Double,

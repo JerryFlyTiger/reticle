@@ -106,3 +106,114 @@ fn dev_pixdiff_tests_pass() {
         );
     }
 }
+
+/// M140: puts `dev/gate.py` (the resumable, segmented test gate) under the
+/// gate. Unlike `dev/test_pixdiff.py` this needs no Pillow, only python3 and
+/// git (`dev/gate.py`'s stamp computation shells out to `git ls-files`), so
+/// there is no separate availability probe -- see `SKIP_ENV_PYTHON3` below
+/// for the one dependency this test can still lack.
+const SKIP_ENV_PYTHON3: &str = "RETICLE_ALLOW_MISSING_PYTHON3";
+
+fn python3_available() -> bool {
+    match Command::new("python3")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn dev_gate_tests_pass() {
+    if !python3_available() {
+        // Same "only an affirmative value opts out" convention as
+        // dev_pixdiff_tests_pass above -- an empty or "0" value must not
+        // silently disable the check this milestone exists to make
+        // un-disableable by accident.
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_PYTHON3).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): python3 is not available, \
+                 dev/test_gate.py was not run",
+                SKIP_ENV_PYTHON3
+            );
+            return;
+        }
+        panic!(
+            "python3 is not available -- dev/test_gate.py was not run, \
+             including its resumable-gate regression tests. Failing by \
+             default so a missing dependency cannot silently pass as a \
+             green gate. Install python3, or set {}=1 to deliberately skip \
+             on a machine that genuinely lacks it.",
+            SKIP_ENV_PYTHON3
+        );
+    }
+
+    let output = Command::new("python3")
+        .arg("dev/test_gate.py")
+        .current_dir(repo_root())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 dev/test_gate.py: {}", e));
+
+    if !output.status.success() {
+        println!("stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "dev/test_gate.py exited with status {:?}",
+            output.status.code()
+        );
+    }
+}
+
+/// M146: puts `dev/mutate.py`'s crash-recovery journal and preflight under
+/// the gate, mirroring `dev_gate_tests_pass` above -- same
+/// python3-availability probe and the same opt-out variable (both tools
+/// need only python3, no other dependency, so one probe function and one
+/// skip variable cover both).
+#[test]
+fn dev_mutate_tests_pass() {
+    if !python3_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_PYTHON3).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): python3 is not available, \
+                 dev/test_mutate.py was not run",
+                SKIP_ENV_PYTHON3
+            );
+            return;
+        }
+        panic!(
+            "python3 is not available -- dev/test_mutate.py was not run, \
+             including its crash-recovery journal and preflight regression \
+             tests. Failing by default so a missing dependency cannot \
+             silently pass as a green gate. Install python3, or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_PYTHON3
+        );
+    }
+
+    let output = Command::new("python3")
+        .arg("dev/test_mutate.py")
+        .current_dir(repo_root())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3 dev/test_mutate.py: {}", e));
+
+    if !output.status.success() {
+        println!("stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "dev/test_mutate.py exited with status {:?}",
+            output.status.code()
+        );
+    }
+}

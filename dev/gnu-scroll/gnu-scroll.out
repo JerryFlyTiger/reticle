@@ -1,0 +1,40 @@
+vars: next-screen-context-lines=2 recenter-positions=(middle top bottom) scroll-error-top-bottom=nil scroll-preserve-screen-position=nil scroll-margin=0
+start                        ws-line=  1 pt-line=  1 win-h=24 text-lines=23
+C-v #1                       ws-line= 22 pt-line= 22 win-h=24 text-lines=23
+C-v #2                       ws-line= 32 pt-line= 32 win-h=24 text-lines=23
+C-v arg 3                    ws-line= 24 pt-line= 32 win-h=24 text-lines=23
+M-v #1                       ws-line=  1 pt-line= 23 win-h=24 text-lines=23
+M-v arg 3                    ws-line=  9 pt-line= 23 win-h=24 text-lines=23
+M-v at top                   SIGNAL: (beginning-of-buffer)
+after M-> (no redisplay)     ws-line=  1 pt-line=101 win-h=24 text-lines=23
+C-v near end                 SIGNAL: (end-of-buffer)
+C-v at end again             SIGNAL: (end-of-buffer)
+line 50, ws 1                ws-line=  1 pt-line= 50 win-h=24 text-lines=23
+recenter nil                 ws-line= 39 pt-line= 50 win-h=24 text-lines=23
+recenter 0                   ws-line= 50 pt-line= 50 win-h=24 text-lines=23
+recenter -1                  ws-line= 28 pt-line= 50 win-h=24 text-lines=23
+recenter 3                   ws-line= 47 pt-line= 50 win-h=24 text-lines=23
+C-l #1                       ws-line= 39 pt-line= 50 win-h=24 text-lines=23
+C-l #2                       ws-line= 39 pt-line= 50 win-h=24 text-lines=23
+C-l #3                       ws-line= 39 pt-line= 50 win-h=24 text-lines=23
+C-l #4                       ws-line= 39 pt-line= 50 win-h=24 text-lines=23
+C-l arg 2                    ws-line= 48 pt-line= 50 win-h=24 text-lines=23
+C-v from line 1              ws-line= 22 pt-line= 22 win-h=24 text-lines=23
+pos-visible-p point=nil  point-min=nil
+C-v from line 6              ws-line= 22 pt-line= 22 win-h=24 text-lines=23
+C-v from line 9              ws-line= 22 pt-line= 22 win-h=24 text-lines=23
+point on last visible line   ws-line= 32 pt-line=100 win-h=24 text-lines=23
+M-v then                     ws-line= 68 pt-line= 90 win-h=24 text-lines=23
+C-v loop #9 SIGNAL: (end-of-buffer)
+C-v loop #10 SIGNAL: (end-of-buffer)
+C-v loop #11 SIGNAL: (end-of-buffer)
+C-v loop #12 SIGNAL: (end-of-buffer)
+C-v loop #13 SIGNAL: (end-of-buffer)
+C-v loop #14 SIGNAL: (end-of-buffer)
+C-v loop #15 SIGNAL: (end-of-buffer)
+C-v loop #16 SIGNAL: (end-of-buffer)
+C-v loop #17 SIGNAL: (end-of-buffer)
+C-v loop #18 SIGNAL: (end-of-buffer)
+C-v loop #19 SIGNAL: (end-of-buffer)
+C-v loop #20 SIGNAL: (end-of-buffer)
+after C-v loop               ws-line= 92 pt-line= 92 win-h=24 text-lines=23

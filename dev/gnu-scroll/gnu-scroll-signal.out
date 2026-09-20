@@ -1,0 +1,8 @@
+ws 70 pt 71                        ws= 70 pt= 71 wend=101 h=22
+C-v arg 50 from ws70               SIGNAL: (end-of-buffer)
+C-v arg 50 from ws70 -> after signal ws= 70 pt= 71 wend=101 h=22
+ws 82                              ws= 82 pt= 82 wend=101 h=22
+C-v from 82                        ws= 91 pt= 91 wend=101 h=22
+ws 1 pt 6                          ws=  1 pt=  6 wend=101 h=22
+M-v at top                         SIGNAL: (beginning-of-buffer)
+M-v at top -> after signal         ws=  1 pt=  6 wend=101 h=22

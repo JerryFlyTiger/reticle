@@ -81,16 +81,28 @@
 ;;   dabbrev exactly as if this file didn't exist -- dabbrev's own
 ;;   current-buffer word list is a perfectly fine source for ordinary
 ;;   identifiers, and this file has no ambition to replace it.
-;; - Already-connected ports are NOT excluded from the candidate list
-;;   (unlike `verilog-auto--expand-autoinst-site', which does exclude
-;;   them for AUTOINST). Completing a port name doesn't insert a
-;;   connection -- the user still fills in `(EXPR)' or leaves it as an
-;;   implicit `.NAME' -- so offering an already-connected name again is
-;;   harmless, and skipping it would mean tracking which of this SAME
-;;   instance's ports are already spoken for (a fair bit of extra work,
-;;   see `verilog-auto--expand-autoinst-site's own `connected' list) for
-;;   a v1 whose whole job is just "don't make the user go read the
-;;   submodule's port list by hand".
+;; - M143 Part B: already-connected ports ARE now excluded from the
+;;   candidate list (this note used to say the opposite -- v1 offered
+;;   every port regardless, on the reasoning that completing a name
+;;   doesn't itself insert a connection, so an already-connected name
+;;   showing up again was merely redundant, not wrong). Real RTL changed
+;;   that calculus: `demo/rtl/mem/sram_bank.sv' (19 ports) and
+;;   `demo/rtl/top/soc_top.sv' (45 port connections) are exactly the
+;;   shape a real engineer meets on every instantiation, and re-offering
+;;   ports already spoken for on THIS SAME instance turns a short,
+;;   useful list into a long one the user has to scan past every time.
+;;   Completing a port name still doesn't insert a connection -- the
+;;   user still fills in `(EXPR)' or leaves it as an implicit `.NAME' --
+;;   that observation is unchanged, it just no longer implies
+;;   "so don't bother excluding". `verilog-complete--handle-port-context'
+;;   (below) calls `verilog-auto--explicitly-connected-port-names'
+;;   (verilog-auto.el, M143 Part A, EXCLUDE-NODE parameter added M144)
+;;   directly -- that helper now takes an optional connection node to
+;;   leave out of its own walk, so the connection under the cursor
+;;   itself is never excluded from its own popup -- see
+;;   `verilog-complete--port-context' and
+;;   `verilog-complete--handle-port-context' for how the self-skip
+;;   works.
 ;; - `INCOMPLETE'/requery semantics: `show-completion-popup' is always
 ;;   called with exactly two arguments here -- NO third (INCOMPLETE)
 ;;   argument, ever. This is a deliberate, permanent property of every
@@ -248,21 +260,45 @@
 ;;           for the popup, same cost as before Y1. This is the price
 ;;           of correctness on the path that's ABOUT to show something
 ;;           anyway, not the common no-op keystroke.
-;; - This file has no notion of SystemVerilog's `.*' wildcard port
-;;   connection (`fifo u_fifo (.*);', auto-connecting every port by
-;;   matching signal name -- distinct from the `.NAME' explicit-
-;;   connection shape this file targets). `verilog-complete--port-
-;;   context' was never probed against that shape's own treesit parse,
-;;   so its behavior there (silently mismatch and return nil, fall
-;;   through correctly, or something else) is UNTESTED. Recorded here
-;;   as a known v1 gap, not attempted.
+;; - M143 Part B: `.*' (SystemVerilog's wildcard port connection,
+;;   `fifo u_fifo (.*, .clk_i(c));', auto-connecting every port not
+;;   otherwise named -- distinct from the `.NAME' explicit-connection
+;;   shape this file targets at a DIFFERENT `.') no longer needs this
+;;   file's own `--port-context' to recognize it as a position. TWO
+;;   different questions live here, and an earlier draft of this note
+;;   answered the second while appearing to answer the first:
+;;
+;;   (a) cursor at the wildcard's OWN dot (`.*|'). Tested M144 by
+;;   `cursor_at_the_wildcards_own_dot_offers_nothing' in
+;;   `verilog_complete_tests.rs': `--port-context' never reaches
+;;   treesit there, because the character immediately before point is
+;;   `*' rather than `.', so its own `(eq before ?.)' check fails and
+;;   it returns nil -- `verilog-complete-at-point' returns nil too, and
+;;   no signal is shown.
+;;
+;;   (b) a `.*' sitting ELSEWHERE in the same instance while the user
+;;   completes a real `.NAME' connection. THIS is the one that is
+;;   answered and tested: `.*' parses as its own
+;;   `named_port_connection' with no `port_name' field, and
+;;   `verilog-auto--explicitly-connected-port-names' (verilog-auto.el,
+;;   M143 Part A, EXCLUDE-NODE parameter added M144 and called directly
+;;   by `verilog-complete--handle-port-context' -- one accessor, one
+;;   walk, no reimplementation)
+;;   already skips exactly that shape -- a `.*' contributes zero names
+;;   to the exclusion set, so every port not EXPLICITLY connected is
+;;   still offered, same as if the `.*' weren't there. Confirmed by
+;;   `wildcard_connection_does_not_suppress_unconnected_ports' in
+;;   `verilog_complete_tests.rs', not just inferred from the M143 Part A
+;;   docstring.
 ;;
 ;; --- Reused from verilog-auto.el (M39) -----------------------------------
 ;;
 ;; `verilog-auto--parse-current-buffer'/`--parse-string',
 ;; `--top-level-modules', `--module-name', `--find-module-in-buffer',
 ;; `--library-files', `--ports-of-module', `--filter',
-;; `--enclosing-of-type' -- all pure functions of their own explicit
+;; `--enclosing-of-type', `--explicitly-connected-port-names' (M144:
+;; called directly with its EXCLUDE-NODE argument, see the M143 Part B
+;; note above) -- all pure functions of their own explicit
 ;; arguments, none of them reading or writing ANY of verilog-auto.el's
 ;; own dynamically-scoped, invocation-lifetime state
 ;; (`verilog-auto--module-cache'/`--missing-modules'/
@@ -571,11 +607,37 @@ reason to share dabbrev's own internal state."
     p))
 
 (defun verilog-complete--port-context (prefix-start)
-  "The enclosing `module_instantiation' treesit node if PREFIX-START
-(see `verilog-complete--prefix-start') sits immediately after a
-port-connecting `.' -- i.e. point is at `.NAME|' (NAME possibly empty,
-the user just typed the dot) inside some instantiation's own
+  "A list (MODULE-INSTANTIATION HIERARCHICAL-INSTANCE SELF-CONNECTION)
+if PREFIX-START (see `verilog-complete--prefix-start') sits immediately
+after a port-connecting `.' -- i.e. point is at `.NAME|' (NAME possibly
+empty, the user just typed the dot) inside some instantiation's own
 `( ... )' connection list -- else nil.
+
+MODULE-INSTANTIATION is what this function used to return on its own
+(M54); HIERARCHICAL-INSTANCE and SELF-CONNECTION are new as of M143
+Part B, added so `verilog-complete--handle-port-context' can build an
+already-connected-ports exclusion set scoped to the right instance
+without a second tree-sitter parse (see this file's header's own
+per-code-path parse-count accounting -- unchanged by this addition,
+since every node returned here comes from the SAME `treesit-node-at'
+call already paid for below, not a fresh walk).
+
+HIERARCHICAL-INSTANCE is the `hierarchical_instance' node that owns
+the `.' -- narrower than MODULE-INSTANTIATION, and deliberately so: one
+`module_instantiation' can hold several comma-separated
+`hierarchical_instance' children (`sram_bank u_a (.clk_i(c)), u_b
+(.);'), and scoping the exclusion set on the wider
+MODULE-INSTANTIATION node would leak `u_a''s own connections into
+`u_b''s popup (the same trap recorded in verilog-auto.el's own \"M92
+review fix\" comment at `:3936-3944', inside
+`verilog-auto--expand-autowire-site'; an earlier draft of this
+docstring cited `:3896-3916', which is a different function's
+docstring entirely). SELF-CONNECTION is the dot's own immediate parent when
+that parent is a `named_port_connection' (the connection the user is
+IN THE MIDDLE OF re-editing), so the handler can skip excluding it from
+its own popup; nil in the bare-first-dot ERROR shape below, where by
+construction there is no other connection in the instance yet, so
+self-skip is moot.
 
 Probed (M54, `verible-verilog-ls' grammar, `tree-sitter-systemverilog')
 against three shapes a `.' can parse into at this exact spot:
@@ -611,12 +673,18 @@ somewhere\", is the actual discriminator here)."
             (let ((parent (treesit-node-parent dot-node)))
               (cond
                ((and parent (string= (treesit-node-type parent) "named_port_connection"))
-                (verilog-auto--enclosing-of-type parent "module_instantiation"))
+                (let ((hier (verilog-auto--enclosing-of-type parent "hierarchical_instance")))
+                  (when hier
+                    (let ((mi (verilog-auto--enclosing-of-type hier "module_instantiation")))
+                      (when mi
+                        (list mi hier parent))))))
                ((and parent (string= (treesit-node-type parent) "ERROR"))
                 (let ((grandparent (treesit-node-parent parent)))
                   (when (and grandparent
                              (string= (treesit-node-type grandparent) "hierarchical_instance"))
-                    (verilog-auto--enclosing-of-type grandparent "module_instantiation"))))
+                    (let ((mi (verilog-auto--enclosing-of-type grandparent "module_instantiation")))
+                      (when mi
+                        (list mi grandparent nil))))))
                (t nil)))))))))
 
 (defun verilog-complete--param-context (prefix-start)
@@ -1007,28 +1075,58 @@ convention as `verilog-complete--port-item': the bare NAME, no leading
 modules (SOURCE nil) and every reachable `verilog-auto--library-files'
 entry (SOURCE that file's own `file-name-nondirectory'), buffer first
 -- matches `verilog-complete--module-ports''s own buffer-before-library
-precedence. NOT de-duplicated by name: a module declared more than
-once (buffer + library, or two different library files) is a
-legitimate SEPARATE candidate per occurrence, since the engineer needs
-to know WHICH file each one is, not just that a name matches. Every
-reachable library file is visited (unlike `verilog-complete--library-
-entry''s own first-match-wins early exit) -- module-name completion
-has to answer \"every name starting with this prefix\", not \"the one
-module named exactly this\", so there is no way to stop early; see
-this file's header's own \"M91 measured cost\" section, below the M56
-port-path numbers, for what this specifically costs (both the
-instantiation case this function is on the path for, and the far more
-common keyword-prefix-rejection case that `verilog-complete--
-instantiation-type-context' answers WITHOUT ever calling this
-function at all -- see that function's own docstring)."
-  (append
-   (mapcar (lambda (m) (cons (verilog-auto--module-name m) nil))
-           (verilog-auto--top-level-modules (verilog-auto--parse-current-buffer)))
-   (apply #'append
-          (mapcar (lambda (path)
-                    (let ((alist (verilog-complete--library-file-modules path)))
-                      (mapcar (lambda (e) (cons (car e) (file-name-nondirectory path))) alist)))
-                  (verilog-auto--library-files)))))
+precedence. DE-DUPLICATED BY NAME, first occurrence wins (M147): an
+engineer's real library directories routinely hold same-named files
+(`fifo.sv' in more than one library dir is ordinary, not exceptional),
+and every consumer below this function -- `verilog-complete--module-
+item', `--items-for-entry', `--library-entry', `--module-ports',
+`--instantiate-item', and `M-.' -- resolves by BARE NAME and re-picks
+the first match anyway, so a second, third, ... occurrence in this
+list is not a second choice: picking it inserts exactly what the
+first would have. Showing it in the popup as if it were a distinct,
+actionable candidate is the M147 defect -- 4 popup items where 2 are
+meaningful, two of them character-for-character identical. The buffer
+entry (SOURCE nil) is appended first and therefore always wins over
+any library file, which is what makes its label bare rather than a
+redundant \"(this buffer)\" annotation. Among library files, the
+winner is the first file in `verilog-auto--library-files' order --
+the SAME file every other consumer above resolves to -- so the
+surviving SOURCE always names the file that will actually be used.
+Every reachable library file is still VISITED (unlike `verilog-
+complete--library-entry''s own first-match-wins early exit) --
+module-name completion has to answer \"every name starting with this
+prefix\", not \"the one module named exactly this\", so there is no
+way to stop scanning early; see this file's header's own \"M91
+measured cost\" section, below the M56 port-path numbers, for what
+this specifically costs (both the instantiation case this function is
+on the path for, and the far more common keyword-prefix-rejection case
+that `verilog-complete--instantiation-type-context' answers WITHOUT
+ever calling this function at all -- see that function's own
+docstring). Those M91 numbers were measured BEFORE this function
+de-duplicated anything and have NOT been re-measured since; the dedupe
+adds one hash table, one `gethash' per candidate, and one `puthash'
+per DISTINCT name (a repeat pays only the `gethash'), which is linear
+in the candidate count and expected to disappear against the file I/O
+those numbers are dominated by --
+expected, not measured, and said here rather than left for a reader to
+assume the figures still describe this code exactly. `seen' is a hash
+table, not repeated `assoc' over a growing list, for the same reason
+`verilog-auto--library-files' itself uses one (see that function) --
+this function is on a keystroke path."
+  (let ((seen (make-hash-table :test 'equal))
+        (result nil))
+    (dolist (entry (append
+                    (mapcar (lambda (m) (cons (verilog-auto--module-name m) nil))
+                            (verilog-auto--top-level-modules (verilog-auto--parse-current-buffer)))
+                    (apply #'append
+                           (mapcar (lambda (path)
+                                     (let ((alist (verilog-complete--library-file-modules path)))
+                                       (mapcar (lambda (e) (cons (car e) (file-name-nondirectory path))) alist)))
+                                   (verilog-auto--library-files)))))
+      (unless (gethash (car entry) seen)
+        (puthash (car entry) t seen)
+        (push entry result)))
+    (nreverse result)))
 
 (defun verilog-complete--module-item (entry prefix-start)
   "One `show-completion-popup' ITEMS element for ENTRY (a
@@ -1313,9 +1411,9 @@ treesit; `--instantiation-type-context' has no such cheap early exit,
 so it goes last)."
   (let* ((point (point))
          (prefix-start (verilog-complete--prefix-start point))
-         (mi (verilog-complete--port-context prefix-start)))
-    (if mi
-        (verilog-complete--handle-port-context mi prefix-start point)
+         (port-ctx (verilog-complete--port-context prefix-start)))
+    (if port-ctx
+        (verilog-complete--handle-port-context port-ctx prefix-start point)
       (let ((param-type-name (verilog-complete--param-context prefix-start)))
         (if param-type-name
             (verilog-complete--handle-param-context param-type-name prefix-start point)
@@ -1323,12 +1421,17 @@ so it goes last)."
               (verilog-complete--handle-instantiation-type-context prefix-start point)
             nil))))))
 
-(defun verilog-complete--handle-port-context (mi prefix-start point)
+(defun verilog-complete--handle-port-context (ctx prefix-start point)
   "Body of the port-connection branch of `verilog-complete-at-point' --
 see that function's own docstring for the full behavior contract (the
 message-vs-popup cases, the never-nil-once-confirmed rule, and the
-`instance_type'-missing black-box guard)."
-  (let ((type-node (treesit-node-child-by-field-name mi "instance_type")))
+`instance_type'-missing black-box guard). CTX is `verilog-complete--
+port-context''s own (MODULE-INSTANTIATION HIERARCHICAL-INSTANCE
+SELF-CONNECTION) return value (M143 Part B)."
+  (let* ((mi (nth 0 ctx))
+         (hier (nth 1 ctx))
+         (self-conn (nth 2 ctx))
+         (type-node (treesit-node-child-by-field-name mi "instance_type")))
     (if (not type-node)
         ;; See `verilog-complete-at-point's docstring's nil-guard note --
         ;; black box, no repro found despite trying, kept as a
@@ -1338,10 +1441,22 @@ message-vs-popup cases, the never-nil-once-confirmed rule, and the
           t)
       (let* ((type-name (treesit-node-text type-node))
              (ports (verilog-complete--module-ports type-name))
+             (excluded (verilog-auto--explicitly-connected-port-names hier self-conn))
+             ;; M143 Part B: REMAINING is PORTS minus every port
+             ;; already explicitly connected on THIS instance (except
+             ;; the connection under the cursor itself, see
+             ;; `verilog-auto--explicitly-connected-port-names''s
+             ;; EXCLUDE-NODE argument, M144). Filtered
+             ;; BEFORE the typed-prefix narrowing below so the three
+             ;; `cond' branches beneath can tell "prefix matched
+             ;; nothing" apart from "every port is already connected".
+             (remaining (verilog-auto--filter
+                         (lambda (p) (not (member (nth 0 p) excluded)))
+                         ports))
              (typed (buffer-substring-no-properties prefix-start point))
              (candidates (verilog-auto--filter
                           (lambda (p) (string-prefix-p typed (nth 0 p)))
-                          ports))
+                          remaining))
              (items (mapcar (lambda (p) (verilog-complete--port-item p prefix-start))
                              candidates)))
         (cond
@@ -1349,16 +1464,24 @@ message-vs-popup cases, the never-nil-once-confirmed rule, and the
           ;; No INCOMPLETE (third) argument -- ever, see this file's
           ;; header's "INCOMPLETE/requery semantics" note.
           (show-completion-popup items prefix-start))
-         (ports
-          ;; PORTS non-nil here already proves the module resolved
-          ;; (that's exactly where PORTS came from) -- calling
-          ;; `verilog-complete--module-found-p' on this branch would
-          ;; be a zero-information re-lookup that pays a second full
-          ;; buffer reparse (and possibly a library rescan) for an
-          ;; answer already known. See this file's header on why
-          ;; `--module-found-p' is only worth its cost on the
-          ;; genuinely-ambiguous branch below.
+         (remaining
+          ;; REMAINING non-nil here already proves at least one
+          ;; not-yet-connected port exists -- the typed prefix just
+          ;; didn't match any of them. Same reasoning as the old
+          ;; PORTS-non-nil branch: no need to re-derive "module
+          ;; resolved", that's exactly where REMAINING came from.
           (message "Verilog port completion: no port of `%s' starts with `%s'" type-name typed))
+         (ports
+          ;; PORTS non-nil but REMAINING nil: every port of this
+          ;; module IS explicitly connected somewhere on this same
+          ;; instance (self-connection excepted, but that one's own
+          ;; name is still in PORTS -- if it were the only port, it
+          ;; would have survived into REMAINING via the self-skip
+          ;; above, so reaching this branch means it wasn't the only
+          ;; one). Distinct from the "no port starts with" message
+          ;; above: there is nothing left to type toward at all here,
+          ;; not just nothing matching what's already been typed.
+          (message "Verilog port completion: every port of `%s' is already connected on this instance" type-name))
          ((verilog-complete--module-found-p type-name)
           (message "Verilog port completion: module `%s' has no ports" type-name))
          (t

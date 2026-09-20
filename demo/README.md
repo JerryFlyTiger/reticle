@@ -233,7 +233,7 @@ Verified on macOS (arm64) when this directory was written:
   `/*AUTOUNUSED*/` block and `LSP: autostarted slang-server`. **What has not
   been exercised: pressing the keys.** The `C-c C-a` / `C-c C-k` round trip is
   covered by the test suite, not by this script.
-- `./tools/lint_rtl.sh` — **all three checks pass** across all 20 Verilog
+- `./tools/lint_rtl.sh` — **all three checks pass** across all 22 Verilog
   and SystemVerilog files (`verible-verilog-syntax`, `-lint`, `-format
   --verify`).
 - `./tools/run_sim.sh` — **all four simulations actually run and pass**:
@@ -264,7 +264,7 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 38 files open in the correct major mode** — 32 in a
+- **All 39 files open in the correct major mode** — 33 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
   `emacs-lisp-mode`, `org-mode`) and 6 in `fundamental-mode`
@@ -273,13 +273,20 @@ And, driving the editor itself rather than the external toolchains:
   `tools/sample_sim.log`). (M124: `gray_ctr.v`/`gray_ctr_tb.v` added to
   `rtl-verilog2001/`, both dump-verified to open in `verilog-mode`. M125:
   `fifo_gray_top.v`/`fifo_gray_top_tb.v` added the same way. M127:
-  `rtl/mem/sram_dual_channel.sv` added the same way.)
+  `rtl/mem/sram_dual_channel.sv` added the same way. M143:
+  `rtl/mem/sram_bank_4k.sv` added the same way — a parameter-fixing
+  wrapper that instantiates `sram_bank` with a `.*` wildcard port
+  connection, dump-verified to open in `verilog-mode`.)
 - From `rtl/top/soc_top.sv`, **`M-.` on `alu` lands in
   `rtl/core/alu.sv`** and port completion engages inside `u_regfile`'s
   port list — the two table rows above are measured, not asserted.
-- That file sees **9 library files** even though `rtl/top/` contains
-  only `soc_top.sv` itself: all nine arrive via `rtl/verible.filelist`.
-- Open any of the 20 files under `rtl/`, `rtl-verilog2001/` and
+- That file sees **11 library files** even though `rtl/top/` contains
+  only `soc_top.sv` itself: all eleven arrive via `rtl/verible.filelist`
+  (measured 2026-09-17 by counting that file's non-comment,
+  non-`+incdir+` lines excluding `top/soc_top.sv` itself — M143 added
+  `mem/sram_bank_4k.sv` to the list, and the sentence had already drifted
+  to "nine" before that: the true count was ten).
+- Open any of the 21 files under `rtl/`, `rtl-verilog2001/` and
   `verif/` that have enough indented lines to go on, and the editor's
   indent step
   **follows that file's own 2-space style** instead of `verilog-mode`'s
@@ -322,7 +329,7 @@ And, driving the editor itself rather than the external toolchains:
 
 The four editor claims above, plus the `C-c C-a` / `C-c C-k` rows of
 the keybinding table, are the ones a test now re-checks on every run:
-`crates/core/tests/demo_smoke_tests.rs`. The "9 library files" count is
+`crates/core/tests/demo_smoke_tests.rs`. The "11 library files" count is
 not asserted directly — the cross-file jump and completion tests only
 prove that resolution reaches other directories at all. Add or remove a
 file under `demo/` and that test fails until its expected-mode table and
@@ -359,7 +366,8 @@ declaration was changed from `output reg [WIDTH-1:0]` to a bare, untyped
 supplies the `reg` declaration that used to be hand-written. The same
 `PASS: gray_ctr WIDTH=4` and `PASS: fifo_gray_top 8 x 32, GRAY_WIDTH=4`
 lines above were re-observed after that change (`./tools/run_sim.sh`),
-and `./tools/lint_rtl.sh` re-run clean across all 20 files. `rtl/core/
+and `./tools/lint_rtl.sh` re-run clean across all 22 files (M143 added a
+22nd, `rtl/mem/sram_bank_4k.sv`). `rtl/core/
 status_regs_stub.sv` is new material for `/*AUTOTIEOFF*/` on a real ANSI
 SystemVerilog module (a bring-up stub whose outputs are declared but not
 yet driven, ordinary early-stage RTL practice) — lint/format-clean under
@@ -393,6 +401,19 @@ deliberately not instantiated anywhere in `rtl/top/soc_top.sv` for the
 same reason `status_regs_stub.sv` isn't — that file's exact line numbers
 and instance count are pinned by other tests, and this module's own job
 is demonstrating AUTO_TEMPLATE, not integration.
+
+M143 added `rtl/mem/sram_bank_4k.sv`: a parameter-fixing wrapper that
+declares the same port list as `sram_bank` and instantiates it with a
+`.*` wildcard port connection — the one shape where `.*` is defensible
+in real RTL, because the wrapper's port names match the instantiated
+module's by construction. It is the first `.*` connection anywhere
+under `demo/` (`sram_dual_channel.sv`'s two `@`/`[]` uses are
+AUTO_TEMPLATE regexes, not wildcard connections). Added to
+`rtl/verible.filelist` so the editor and `verible-verilog-ls` agree on
+what the design contains; dump-verified with `./tools/lint_rtl.sh`
+(syntax/lint/format, zero waivers). Like `status_regs_stub.sv`, it is
+deliberately not instantiated anywhere — it exists as material, not
+integration.
 
 ### Checked by Verible, never simulated
 

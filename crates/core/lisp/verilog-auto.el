@@ -917,6 +917,56 @@ no-op."
       (setq n (treesit-node-parent n)))
     n))
 
+(defun verilog-auto--connection-port-name (conn)
+  "Port name string of CONN, a `named_port_connection' node, or nil
+when there is no name to connect -- M144. Two distinct shapes both
+land here:
+
+- CONN has no `port_name' field at all: the `.*' wildcard connection
+  (measured: `treesit-node-child-by-field-name' on it returns nil).
+- CONN's `port_name' field IS present but its own text is empty: a
+  zero-width MISSING node tree-sitter's error recovery synthesizes for
+  a bare `.' -- measured (M144 fact 1): `u0 ( .clk_i(c), . )' -> the
+  2nd connection's `port_name' is a real, non-nil node with text \"\"
+  and a zero-width span. ONLY this bare-`.' shape is measured to
+  produce it (M144 fix round, cold-review correction): `.(sig' with no
+  content after it and no closing paren produces no
+  `hierarchical_instance' at all (a different, unrelated failure mode,
+  see `verilog-auto--orphaned-connection-autoinst-markers'), and
+  `.(sig)'/`.(sig ' (an OPEN paren with content, closed or not) always
+  parses `port_name' as a real, non-empty `sig' node -- there is no
+  measured shape where `.(...)' itself produces a MISSING `port_name'.
+
+Both of the two shapes above collapse to the same nil answer because
+GNU Emacs 30.2 treats a connection with no name as connecting nothing
+at all (M144 fact 2: `.,' produces AUTOINST/AUTOWIRE/AUTOOUTPUT output
+byte-identical to omitting the connection outright, apart from the
+literal `<CONN>' text)."
+  (let* ((pn (treesit-node-child-by-field-name conn "port_name"))
+         (text (and pn (treesit-node-text pn))))
+    (and text (> (length text) 0) text)))
+
+(defun verilog-auto--explicitly-connected-port-names (hier &optional exclude-node)
+  "Names of every port explicitly connected on HIER, a
+`hierarchical_instance' node -- M143, EXCLUDE-NODE added M144. Uses
+`verilog-auto--connection-port-name' on every `named_port_connection'
+under HIER, silently skipping any connection that names no port (a
+`.*' wildcard, or a MISSING port name from a bare `.' -- see that
+function's own docstring). EXCLUDE-NODE, when
+non-nil, is a `named_port_connection' node compared by
+`treesit-node-eq' (never position arithmetic) and left out of the walk
+entirely -- reused by `verilog-complete--handle-port-context' so the
+connection currently under the cursor is never excluded from its own
+popup."
+  (verilog-auto--filter
+   #'identity
+   (mapcar #'verilog-auto--connection-port-name
+           (let ((conns (verilog-auto--find-all-of-type hier "named_port_connection")))
+             (if exclude-node
+                 (verilog-auto--filter
+                  (lambda (c) (not (treesit-node-eq c exclude-node))) conns)
+               conns)))))
+
 (defun verilog-auto--last-child (node)
   "NODE's own last child (by raw child index, so this includes
 anonymous tokens -- in particular, the closing paren of an
@@ -3320,7 +3370,9 @@ alone and excluded from the generated set; if that leaves nothing to add
 (every port already connected), nothing at all is inserted. Returns 1 if
 the instantiated module was found (whether or not anything was actually
 inserted), 0 if it couldn't be resolved (GNU warn-and-skip; see
-`verilog-auto--module-ports').
+`verilog-auto--module-ports') OR if COMMENT has no `hierarchical_instance'
+ancestor (M144 -- see the M144 comment on this function's own nil `hier'
+guard, below).
 
 M127: also computes this instantiation's own `@' number
 (`verilog-auto--instance-number', section 2.1/2.2 -- `@' has meaning
@@ -3335,13 +3387,47 @@ correspondingly (`verilog-auto--trailing-templated-annotation-range')
 so this stays a clean round trip."
   (let* ((type-name (treesit-node-text
                      (treesit-node-child-by-field-name module-instantiation "instance_type")))
-         (ports (verilog-auto--module-ports type-name)))
-    (if (member type-name verilog-auto--missing-modules)
+         (ports (verilog-auto--module-ports type-name))
+         ;; M144: COMMENT can be a descendant of MODULE-INSTANTIATION
+         ;; that tree-sitter's own GLR recovery nonetheless failed to
+         ;; nest under a `hierarchical_instance' -- see
+         ;; `verilog-auto--orphaned-connection-autoinst-markers's own
+         ;; doc string for the measured shape (a valid `.clk_i(clk),'
+         ;; connection followed by `.(sig),' then the marker). Computed
+         ;; here, once, and reused below rather than re-walked.
+         (hier (verilog-auto--enclosing-of-type comment "hierarchical_instance")))
+    (if (or (member type-name verilog-auto--missing-modules)
+            ;; M144 fix round: skip this site exactly like the
+            ;; `missing-modules' case above: return 0, insert nothing,
+            ;; leave the marker untouched. The skip itself is already
+            ;; counted and echoed by `verilog-auto--orphaned-connection-
+            ;; autoinst-markers', folded into `verilog-auto''s own final
+            ;; message via `verilog-delete-auto''s own ORPHANED-
+            ;; CONNECTION-COUNT return value -- `verilog-auto' always
+            ;; runs `verilog-delete-auto' (which computes that count)
+            ;; before this function ever runs, so nothing new needs
+            ;; wiring here. (An EARLIER version of this fix folded this
+            ;; case into `verilog-auto--unreachable-autoinst-markers'
+            ;; instead, which fed it into that function's own M129
+            ;; text-based fallback DELETION path -- safe for THAT
+            ;; function's own known causes, where GENERATED text broke
+            ;; the parse and deleting it is the actual recovery, but
+            ;; unsafe here, where the user's OWN malformed connection
+            ;; broke it: a cold review caught that this silently deleted
+            ;; previously-generated connections on a second run with
+            ;; nothing left to regenerate them. See `verilog-auto--
+            ;; orphaned-connection-autoinst-markers's own doc string.)
+            ;; GNU Emacs 30.2 (measured, main conversation) expands
+            ;; `sub u0 (.clk_i(clk), .(sig),
+            ;; /*AUTOINST*/);' NORMALLY (`.rd(rd[7:0])'/`.wr(wr)' both
+            ;; connected) -- this file deliberately diverges rather than
+            ;; attempting to recover an AUTOINST site tree-sitter itself
+            ;; could not parse into the expected shape, the same
+            ;; divergence already documented for the OTHER two known
+            ;; unreachable-marker causes.
+            (not hier))
         0
-      (let* ((hier (verilog-auto--enclosing-of-type comment "hierarchical_instance"))
-             (connected
-              (mapcar (lambda (c) (treesit-node-text (treesit-node-child-by-field-name c "port_name")))
-                      (verilog-auto--find-all-of-type hier "named_port_connection")))
+      (let* ((connected (verilog-auto--explicitly-connected-port-names hier))
              (overrides (verilog-auto--instance-param-overrides module-instantiation))
              (template (verilog-auto--find-template
                         template-comments type-name (treesit-node-start module-instantiation)))
@@ -3546,10 +3632,17 @@ verilog-mode does."
               (let ((inst-name (treesit-node-text
                                  (verilog-auto--find-first-of-type hier "name_of_instance"))))
                 (dolist (conn (verilog-auto--find-all-of-type hier "named_port_connection"))
-                  (let* ((pname (treesit-node-text (treesit-node-child-by-field-name conn "port_name")))
-                         (cnode (treesit-node-child-by-field-name conn "connection"))
+                  (let* (;; M143/M144: a `.*' wildcard connection or a
+                         ;; MISSING port name (bare `.') both make
+                         ;; `verilog-auto--connection-port-name'
+                         ;; return nil, and this connection contributes no
+                         ;; candidate at all (see that function's own
+                         ;; docstring, and `verilog-auto--explicitly-
+                         ;; connected-port-names').
+                         (pname (verilog-auto--connection-port-name conn))
+                         (cnode (and pname (treesit-node-child-by-field-name conn "connection")))
                          (ctext (and cnode (string-trim (treesit-node-text cnode))))
-                         (pinfo (assoc pname ports))
+                         (pinfo (and pname (assoc pname ports)))
                          (cand (and pinfo ctext (verilog-auto--connection-candidate-name ctext))))
                     (when (and cand (not (eq (nth 1 pinfo) 'interface)))
                       (let* ((dir (nth 1 pinfo))
@@ -3916,11 +4009,18 @@ Beginning/End markers are inserted in that case, GNU style)."
              (hiers (verilog-auto--find-all-of-type mi "hierarchical_instance")))
         (dolist (hier hiers)
           (dolist (conn (verilog-auto--find-all-of-type hier "named_port_connection"))
-            (let* ((pname (treesit-node-text (treesit-node-child-by-field-name conn "port_name")))
-                   (cnode (treesit-node-child-by-field-name conn "connection"))
-                   (ctext (string-trim (treesit-node-text cnode)))
-                   (pinfo (assoc pname ports)))
+            ;; M143/M144: a `.*' wildcard connection or a MISSING port
+            ;; name (bare `.') both make
+            ;; `verilog-auto--connection-port-name' return nil -- skip
+            ;; entirely rather than reading it (see that function's own
+            ;; docstring, and `verilog-auto--explicitly-connected-port-
+            ;; names').
+            (let* ((pname (verilog-auto--connection-port-name conn))
+                   (cnode (and pname (treesit-node-child-by-field-name conn "connection")))
+                   (ctext (and cnode (string-trim (treesit-node-text cnode))))
+                   (pinfo (and pname (assoc pname ports))))
               (when (and pinfo
+                         ctext
                          (eq (nth 1 pinfo) 'output)
                          (verilog-auto--bare-identifier-p ctext)
                          (not (member ctext declared))
@@ -5493,16 +5593,129 @@ comment before the enclosing pair's own close), no enclosing paren
 pair exists for the marker at all, or `verilog-auto--instantiation-
 shaped-p' refuses the enclosing pair's own preceding tokens. See this
 file's own M129 top-of-file header correction for why that fallback is
-this file's one documented exception to searching by node KIND."
+this file's one documented exception to searching by node KIND.
+
+M144 second fix round (cold-review Finding 1): REACHABLE-STARTS is
+walked per `hierarchical_instance', not per `module_instantiation' --
+the M92 comma-separated multi-instance shape (`sub u_a (...), u_b
+(...);', ONE `module_instantiation' with TWO `hierarchical_instance'
+children, each carrying its OWN `/*AUTOINST*/' marker) made the
+earlier per-`module_instantiation', `verilog-auto--find-comment'
+\(singular, FIRST match only) walk find only U_A's own marker, leaving
+U_B's own -- even a perfectly WELL-FORMED one -- wrongly excluded from
+REACHABLE-STARTS and therefore wrongly named by this function as
+having no enclosing instantiation at all, which is false: its
+`hierarchical_instance' plainly exists, right next to U_A's. Walking
+every `hierarchical_instance' under each `module_instantiation'
+individually (M92's own established shape, already used elsewhere in
+this file, e.g. `verilog-auto--expand-autowire-site') finds EACH one's
+own marker, fixing this for both single- and multi-instance statements
+alike -- confirmed unchanged for every existing M128/M129 test, all of
+which use single-instance statements where \"first comment under the
+module_instantiation\" and \"first comment under the sole
+hierarchical_instance\" are the same node.
+
+ALSO explicitly excludes every marker `verilog-auto--orphaned-
+connection-autoinst-markers' names (same fix round, same Finding 1): a
+marker with a `module_instantiation' ancestor but a MALFORMED
+CONNECTION of its own (not generated text) breaking its own
+`hierarchical_instance' ancestor must never reach the unreachable set
+here, because `verilog-delete-auto''s own M129 text-based fallback
+scan is unsafe for that category (see that function's own doc string
+for why) -- before this fix round, that category was told apart from a
+GENUINELY unreachable marker only by the M129 shape whitelist
+happening to reject the surrounding text, an accident of the
+whitelist's own design, not a guarantee. Excluding it here BY
+CONSTRUCTION means the whitelist accident is no longer load-bearing."
   (let ((reachable-starts
          (let (acc)
            (dolist (mi (verilog-auto--find-all-of-type root "module_instantiation"))
-             (let ((c (verilog-auto--find-comment mi "/*AUTOINST*/")))
-               (when c (push (treesit-node-start c) acc))))
-           acc)))
+             (dolist (hier (verilog-auto--find-all-of-type mi "hierarchical_instance"))
+               (let ((c (verilog-auto--find-comment hier "/*AUTOINST*/")))
+                 (when c (push (treesit-node-start c) acc)))))
+           acc))
+        (orphaned-starts
+         (mapcar #'treesit-node-start
+                 (verilog-auto--orphaned-connection-autoinst-markers root))))
     (verilog-auto--filter
-     (lambda (c) (not (member (treesit-node-start c) reachable-starts)))
+     (lambda (c) (and (not (member (treesit-node-start c) reachable-starts))
+                       (not (member (treesit-node-start c) orphaned-starts))))
      (verilog-auto--find-comments root "/*AUTOINST*/"))))
+
+(defun verilog-auto--orphaned-connection-autoinst-markers (root)
+  "Every `/*AUTOINST*/' marker `block_comment' in ROOT that HAS a
+`module_instantiation' ancestor but has no `hierarchical_instance'
+ancestor of its own (so `verilog-auto--unreachable-autoinst-markers'
+excludes it -- see that function's own doc string) -- M144 fix round,
+HIGH-severity cold-review finding.
+
+M144 SECOND fix round correction: the first version of this function
+walked `(verilog-auto--find-comment mi \"/*AUTOINST*/\")' -- singular,
+FIRST descendant match only -- once per `module_instantiation', which
+missed every marker but the first under the M92 comma-separated
+multi-instance shape (`sub u_a (...), u_b (...);', ONE
+`module_instantiation' with TWO `hierarchical_instance' children, each
+with its OWN marker): if U_A's own connection was well-formed and
+U_B's was malformed, U_B's marker was simply never visited by that
+mi-scoped `find-comment' call at all, so this function never named it,
+and `verilog-auto--unreachable-autoinst-markers' swept it into the
+GENUINELY-unreachable bucket instead -- reported with the wrong,
+inaccurate \"no enclosing instantiation\" wording, and (before this
+fix round already narrowed that bucket's own fallback-deletion risk)
+one accidental step from the exact data-loss shape this function
+exists to prevent, saved only by the M129 shape whitelist happening to
+reject the surrounding `, u_b (' text. Checking EVERY `/*AUTOINST*/'
+comment in ROOT individually against its own two ancestor tests
+(below) finds every marker in this category BY CONSTRUCTION,
+regardless of how many `hierarchical_instance' siblings its own
+`module_instantiation' has or which position among them it occupies.
+
+Measured cause (scratch `treesit-node-string' dump): a MALFORMED
+connection the user typed themselves -- not generated text, unlike
+every cause `verilog-auto--unreachable-autoinst-markers' documents --
+can make tree-sitter's GLR recovery route the marker comment to a
+position that is a SIBLING of `hierarchical_instance' rather than a
+descendant of it, while `hierarchical_instance' itself is still present
+in the tree for that same instantiation (`module_instantiation'
+DOES exist; only the specific ancestor `verilog-auto--expand-autoinst-
+site' needs is missing). Repro: a valid `.clk_i(clk),' connection
+followed by `.(sig),' then the marker.
+
+Deliberately kept SEPARATE from `verilog-auto--unreachable-autoinst-
+markers' rather than folded into it, because the two categories need
+OPPOSITE treatment from `verilog-delete-auto': that function's own
+M129 text-based fallback scan is safe ONLY when the thing that broke
+the parse is the GENERATED text itself (M128's own narrow, measured
+cause) -- deleting it is the actual recovery, since the site reparses
+cleanly once the offending generated text is gone. Here the thing that
+broke the parse is the USER'S OWN malformed connection, which the
+fallback scan cannot delete (deleting past the marker would delete the
+user's own unclosed edit, not this file's own generated text) and does
+not even try to -- but before this fix round, `verilog-auto--
+unreachable-autoinst-markers' briefly (informal, so-far-uncommitted
+tightening) called markers in THIS category unreachable too, which fed
+them into that same fallback scan. The fallback found a plausible
+enclosing paren pair anyway (the OUTER instantiation's own parens, not
+this connection's own broken one) and deleted every PREVIOUSLY
+GENERATED connection there on a re-run, with nothing to ever
+regenerate them again (`verilog-auto--expand-autoinst-site' skips this
+category on every subsequent run too, precisely because there is still
+no `hierarchical_instance' to resolve) -- silent, permanent data loss.
+This function exists so `verilog-delete-auto' can name this category
+and route it OFF the fallback-deletion path entirely, onto a
+leave-completely-untouched path with its own accurately-worded report.
+
+Diverges from GNU (re-measured, cold review): GNU Emacs 30.2 does NOT
+leave a site like this untouched at all -- it expands it normally,
+because tree-sitter places the marker OUTSIDE the instance while GNU's
+own regex-based scan never does; see `verilog-auto--expand-autoinst-
+site's own comment on its `hier' nil guard for the exact GNU output
+this file chose not to replicate."
+  (verilog-auto--filter
+   (lambda (c)
+     (and (verilog-auto--enclosing-of-type c "module_instantiation")
+          (not (verilog-auto--enclosing-of-type c "hierarchical_instance"))))
+   (verilog-auto--find-comments root "/*AUTOINST*/")))
 
 ;; --- M129: text-based fallback scanner for tree-unreachable AUTOINST ----
 ;;
@@ -5955,10 +6168,11 @@ leaving the AUTO comments themselves untouched:
   M126: widened to six).
 Always ends the whole deletion as one undo group (`undo-amalgamate-
 boundary'). Returns (DELETED-COUNT OVERLAP-SKIPPED-COUNT UNREACHABLE-
-AUTOINST-UNRECOVERED-COUNT TEXT-RECOVERED-COUNT) -- a 4-element list
-\(M129 WIDENED this from M128's 3-element shape; every pre-M129 caller
-only ever inspected it via `nth'/`cdr'/`car', never destructured a
-fixed-length tuple, so this too is additive):
+AUTOINST-UNRECOVERED-COUNT TEXT-RECOVERED-COUNT ORPHANED-CONNECTION-
+COUNT) -- a 5-element list (M129 WIDENED M128's 3-element shape to 4;
+M144 fix round WIDENS it again to 5, same additive reasoning: every
+earlier caller only ever inspected this via `nth'/`cdr'/`car', never
+destructured a fixed-length tuple):
 - OVERLAP-SKIPPED-COUNT counts ranges withheld because they overlapped
   another (`verilog-auto--overlapping-ranges' -- normal operation never
   produces this).
@@ -5995,14 +6209,41 @@ fixed-length tuple, so this too is additive):
   by the text-based fallback scan -- see this file's own M129
   top-of-file header correction for why this scan exists at all and
   what it is confined to.
-Echoes a warning when any of the three non-DELETED-COUNT counts is
-nonzero; when called from `verilog-auto' all three get folded into its
+- ORPHANED-CONNECTION-COUNT (M144 fix round, new) counts `/*AUTOINST*/'
+  markers `verilog-auto--orphaned-connection-autoinst-markers' names --
+  a DIFFERENT category from UNREACHABLE-AUTOINST-UNRECOVERED-COUNT and
+  TEXT-RECOVERED-COUNT above, deliberately never routed through the
+  text-based fallback scan at all (see that function's own doc string
+  for why: the fallback scan is only safe when GENERATED text broke the
+  parse, and here it is the user's OWN malformed connection that did,
+  which the fallback cannot see or delete -- running it anyway silently
+  deletes previously-generated connections with nothing left to ever
+  regenerate them, a real data-loss bug this count exists to prevent).
+  These sites are left COMPLETELY untouched: no text changes, not even
+  an attempted deletion -- diverging from GNU Emacs 30.2, which
+  expands a site like this normally (re-measured, cold review) because
+  tree-sitter places the marker OUTSIDE the instance while GNU's own
+  regex-based scan never does; see `verilog-auto--expand-autoinst-
+  site's own comment on its `hier' nil guard for the exact GNU output.
+  ALWAYS present in the returned list (0 when there are no orphaned
+  markers), the same unconditional-widening convention M129 used when
+  it added TEXT-RECOVERED-COUNT -- never omitted, so no caller needs to
+  treat a short list as a special case.
+Echoes a warning when any of the four non-DELETED-COUNT counts is
+nonzero; when called from `verilog-auto' all four get folded into its
 own final message instead \(this one would otherwise just be invisibly
 clobbered by the phases that run afterward)."
   (interactive)
   (let* ((root (verilog-auto--parse-current-buffer))
          (ranges nil)
          (unreachable (verilog-auto--unreachable-autoinst-markers root))
+         ;; M144 fix round: computed BEFORE the fallback-lex pass below,
+         ;; but deliberately never fed into it -- see
+         ;; `verilog-auto--orphaned-connection-autoinst-markers's own
+         ;; doc string for why running the text-based fallback on this
+         ;; category is unsafe (silent, permanent data loss), not merely
+         ;; unnecessary.
+         (orphaned (verilog-auto--orphaned-connection-autoinst-markers root))
          ;; M129: the lexical pass is the only part of this whole
          ;; function that costs anything beyond the tree walk, so it
          ;; runs AT MOST ONCE, and only when there is actually an
@@ -6028,6 +6269,12 @@ clobbered by the phases that run afterward)."
     (dolist (mi (verilog-auto--find-all-of-type root "module_instantiation"))
       (let ((c (verilog-auto--find-comment mi "/*AUTOINST*/")))
         (when c
+          ;; M144 fix round: a marker named by `verilog-auto--orphaned-
+          ;; connection-autoinst-markers' has no `hierarchical_instance'
+          ;; ancestor, so HIER is nil here and CLOSE stays nil too --
+          ;; this loop already leaves such a marker's region untouched
+          ;; without any special-casing, which is exactly what that
+          ;; function's own doc string requires.
           (let* ((hier (verilog-auto--enclosing-of-type c "hierarchical_instance"))
                  (close (and hier (verilog-auto--last-child hier))))
             (when close
@@ -6084,7 +6331,22 @@ clobbered by the phases that run afterward)."
       (when (> text-recovered 0)
         (message "verilog-delete-auto: %d /*AUTOINST*/ marker(s) recovered and deleted by a text-based fallback scan (a parse error hid them from the tree)"
                   text-recovered))
-      (list (length good) (length bad) (length unrecovered) text-recovered))))
+      (when orphaned
+        (message "verilog-delete-auto: %d /*AUTOINST*/ marker(s) sit past a malformed connection in the same instantiation, left untouched (not deleted, not regenerated)"
+                  (length orphaned)))
+      ;; M144 fix round: the 5th element is ALWAYS present (0 when
+      ;; ORPHANED is empty), the SAME unconditional-widening convention
+      ;; M129 already used for its own 3-to-4 widening -- a return shape
+      ;; whose LENGTH depends on content would force every caller to
+      ;; handle two shapes forever. An earlier version of this function
+      ;; appended the 5th element only when non-empty specifically to
+      ;; avoid touching the 38 existing M128/M129 tests' own
+      ;; hand-written 4-element `prin1-to-string' literals (`"(1 0 0
+      ;; 1)"' etc); those literals are updated to their 5-element form
+      ;; instead (`"(1 0 0 1 0)"'), matching M129's own precedent of
+      ;; updating tests alongside a widening rather than special-casing
+      ;; the function to avoid updating them.
+      (list (length good) (length bad) (length unrecovered) text-recovered (length orphaned)))))
 
 ;; --- verilog-auto -------------------------------------------------------------
 
@@ -6110,7 +6372,12 @@ second time. The whole command is one undo group."
   (let* ((delete-result (verilog-delete-auto))
          (overlap-skipped (nth 1 delete-result))
          (unreachable-autoinst-skipped (nth 2 delete-result))
-         (text-recovered-autoinst (nth 3 delete-result)))
+         (text-recovered-autoinst (nth 3 delete-result))
+         ;; M144 fix round: `verilog-delete-auto' always returns a
+         ;; 5-element list (0 here when there are no orphaned markers),
+         ;; the same unconditional-widening convention M129 used for
+         ;; its own 3-to-4 widening -- no `nil'-normalization needed.
+         (orphaned-connection-autoinst (nth 4 delete-result)))
     (let ((verilog-auto--module-cache (make-hash-table :test 'equal))
           (verilog-auto--module-full-ports (make-hash-table :test 'equal))
           (verilog-auto--module-port-dims (make-hash-table :test 'equal))
@@ -6220,6 +6487,27 @@ second time. The whole command is one undo group."
               (if (> text-recovered-autoinst 0)
                   (format "; %d /*AUTOINST*/ marker(s) recovered by a text-based fallback scan"
                           text-recovered-autoinst)
+                "")
+              ;; M144 fix round: see `verilog-auto--orphaned-connection-
+              ;; autoinst-markers's own doc string for why this is a
+              ;; DIFFERENT wording from both branches above, and why it
+              ;; is deliberately never routed through the text-based
+              ;; fallback scan those two describe -- the marker's own
+              ;; instantiation exists, but a MALFORMED CONNECTION the
+              ;; user typed (not generated text) makes it unreachable
+              ;; from `hierarchical_instance', and the site is left
+              ;; completely untouched rather than attempting a recovery
+              ;; that would silently delete previously-generated
+              ;; connections with nothing left to regenerate them. This
+              ;; diverges from GNU Emacs 30.2, which expands a site like
+              ;; this normally (re-measured, cold review) because
+              ;; tree-sitter places the marker OUTSIDE the instance
+              ;; while GNU's own regex-based scan never does -- see
+              ;; `verilog-auto--expand-autoinst-site's own comment on
+              ;; its `hier' nil guard for the exact GNU output.
+              (if (> orphaned-connection-autoinst 0)
+                  (format "; %d /*AUTOINST*/ marker(s) sit past a malformed connection in the same instantiation, left untouched (not deleted, not regenerated)"
+                          orphaned-connection-autoinst)
                 "")
               (if verilog-auto--multi-autowire-modules
                   (format "; module %s has multiple /*AUTOWIRE*/ (only the first expanded)%s"

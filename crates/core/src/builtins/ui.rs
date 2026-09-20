@@ -1263,6 +1263,140 @@ pub fn register(interp: &mut Interp) {
             None => Value::Nil,
         })
     });
+
+    // M138: viewport primitives / Emacs paging commands
+    // (`crate::redisplay`'s `RowCtx` + the `set_window_start`/`pos_visible`/
+    // `scroll_up`/`scroll_down`/`recenter_window` ops it backs). Every one
+    // of these resolves WINDOW the same way `window-height` above does:
+    // nil = selected window, otherwise the window id integer.
+    defun(interp, "window-start", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let id = window_id_arg(i, a, 0)?;
+        let editor = ed.borrow();
+        let Some(win) = editor.windows.get(&id) else {
+            return Ok(Value::Nil);
+        };
+        Ok(int_pos(win.window_start))
+    });
+    defun(interp, "set-window-start", 2, Some(3), |i, a| {
+        let ed = ed_handle(i);
+        let id = window_id_arg(i, a, 0)?;
+        let Some(buf) = ed.borrow().windows.get(&id).map(|w| w.buffer.clone()) else {
+            return Ok(Value::Nil);
+        };
+        let pos = get_pos(i, &buf.borrow(), &a[1])?;
+        // Fix round item 2: NOFORCE non-nil means "don't force point onto
+        // the new visible region" -- `set_window_start`'s `move_point` is
+        // that condition inverted.
+        let noforce = opt(a, 2).truthy();
+        crate::redisplay::set_window_start(i, &ed, id, pos, !noforce);
+        Ok(a[1].clone())
+    });
+    defun(interp, "pos-visible-in-window-p", 0, Some(2), |i, a| {
+        let ed = ed_handle(i);
+        let id = window_id_arg(i, a, 1)?;
+        let Some(buf) = ed.borrow().windows.get(&id).map(|w| w.buffer.clone()) else {
+            return Ok(Value::Nil);
+        };
+        // Fix round item 4: a nil POS means "WINDOW's own point", which
+        // for a non-selected window is `win.point`, NOT the buffer's live
+        // point (that's only the same thing for the selected window --
+        // see `window_point`'s doc).
+        let pos = match opt(a, 0) {
+            Value::Nil => crate::redisplay::window_point(&ed.borrow(), id)
+                .ok_or_else(|| i.error("no such window"))?,
+            v => get_pos(i, &buf.borrow(), &v)?,
+        };
+        Ok(Value::bool(
+            crate::redisplay::pos_visible(i, &ed, id, pos),
+            i.syms.t,
+        ))
+    });
+    defun(interp, "window-text-height", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let id = window_id_arg(i, a, 0)?;
+        let editor = ed.borrow();
+        match crate::redisplay::window_text_geometry(i, &editor, id) {
+            Some((_, text_rows, _)) => Ok(Value::Int(text_rows as i64)),
+            None => Ok(Value::Nil),
+        }
+    });
+    defun(interp, "recenter", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let id = ed.borrow().selected_window;
+        let arg = match opt(a, 0) {
+            Value::Nil => None,
+            v => Some(need_int(i, &v)?),
+        };
+        crate::redisplay::recenter_window(i, &ed, id, arg);
+        Ok(Value::Sym(i.syms.t))
+    });
+    defun(interp, "scroll-up-command", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let id = ed.borrow().selected_window;
+        let arg = match opt(a, 0) {
+            Value::Nil => None,
+            v => Some(need_int(i, &v)?),
+        };
+        match crate::redisplay::scroll_up(i, &ed, id, arg) {
+            Ok(()) => Ok(Value::Nil),
+            Err(e) => Err(scroll_error_flow(i, e)),
+        }
+    });
+    defun(interp, "scroll-down-command", 0, Some(1), |i, a| {
+        let ed = ed_handle(i);
+        let id = ed.borrow().selected_window;
+        let arg = match opt(a, 0) {
+            Value::Nil => None,
+            v => Some(need_int(i, &v)?),
+        };
+        match crate::redisplay::scroll_down(i, &ed, id, arg) {
+            Ok(()) => Ok(Value::Nil),
+            Err(e) => Err(scroll_error_flow(i, e)),
+        }
+    });
+    // M139: the only Rust addition the evil viewport family needs -- "the
+    // position N rows below/above WINDOW's window-start", clamped, without
+    // touching point the way `scroll-up-command` does.
+    defun(interp, "window-row-start", 1, Some(2), |i, a| {
+        let ed = ed_handle(i);
+        let n = need_int(i, &a[0])?;
+        let id = window_id_arg(i, a, 1)?;
+        match crate::redisplay::window_row_start(i, &ed, id, n) {
+            Some(pos) => Ok(int_pos(pos)),
+            None => Ok(Value::Nil),
+        }
+    });
+}
+
+/// M138: resolve a `&optional WINDOW` argument at index `idx` the same
+/// way `window-height` does -- nil = selected window, otherwise the
+/// integer window id.
+fn window_id_arg(i: &mut Interp, a: &mut [Value], idx: usize) -> Result<usize, Flow> {
+    let ed = ed_handle(i);
+    match opt(a, idx) {
+        Value::Nil => Ok(ed.borrow().selected_window),
+        v => Ok(need_int(i, &v)? as usize),
+    }
+}
+
+/// M138: turn `redisplay::ScrollError` into the matching GNU Emacs error
+/// symbol (`end-of-buffer`/`beginning-of-buffer`), rendered by
+/// `Interp::describe_flow`'s two-symbol special case (elisp/src/interp.rs).
+///
+/// Known gap: the two symbols are interned here without `error-conditions`,
+/// so `(condition-case e (scroll-up-command) (error ...))` does NOT catch
+/// them -- `condition_matches` walks that plist and finds nothing; only a
+/// `(t ...)` handler does. Registering them as real errors is an interpreter
+/// change (a `define_error` equivalent) left for whoever first needs to catch
+/// them by name.
+fn scroll_error_flow(i: &mut Interp, e: crate::redisplay::ScrollError) -> Flow {
+    let name = match e {
+        crate::redisplay::ScrollError::EndOfBuffer => "end-of-buffer",
+        crate::redisplay::ScrollError::BeginningOfBuffer => "beginning-of-buffer",
+    };
+    let sym = i.intern(name);
+    i.signal(sym, vec![])
 }
 
 /// Shared entry point for `read-from-minibuffer`/`read-string` (M47):

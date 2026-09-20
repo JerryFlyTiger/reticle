@@ -2172,6 +2172,115 @@ fn have_on_path(cmd: &str) -> bool {
     }
 }
 
+/// M145: decides whether a test needing PROGRAM should run. Split out
+/// from its thin per-tool wrapper below so the decision itself --
+/// present/absent x opt-out-env-value -- is testable without touching
+/// real process environment or PATH (see `require_tool_tests` below).
+/// Returns true if the caller should proceed; false if the caller
+/// should `return` early because a deliberate, visible opt-out was set
+/// (ENV_VALUE is exactly "1"/"true"/"yes" -- anything else, including
+/// "0", means "no, don't skip", so a leftover boolean-style "false" or
+/// an accidental "0" cannot silently disable the check). Panics -- does
+/// not return -- when PROGRAM is absent and no opt-out was given. Only
+/// used by the default-run `manual_e2e_verible_verilog_ls_*` test below
+/// -- the `#[ignore]`d tests above this point keep their own silent
+/// `have_on_path` skip since cargo already reports them as ignored, not
+/// as passed.
+fn require_tool(program: &str, present: bool, env_name: &str, env_value: Option<&str>) -> bool {
+    if present {
+        return true;
+    }
+    let opted_out = matches!(env_value, Some("1") | Some("true") | Some("yes"));
+    if opted_out {
+        // Opt-out convention for this project: RETICLE_ALLOW_MISSING_*
+        // / RETICLE_SKIP_* env vars (see `test_source_hygiene_tests.rs`).
+        eprintln!(
+            "skipping (opted out via {}): {} is not on PATH",
+            env_name, program
+        );
+        return false;
+    }
+    panic!(
+        "{} is not on PATH -- this e2e test was not run. Failing by default so a \
+         missing dependency cannot silently pass as a green gate. Install {}, or set \
+         {}=1 to deliberately skip on a machine that genuinely lacks it.",
+        program, program, env_name
+    );
+}
+
+/// Same env var `lsp_format_tests.rs`/`verilog_complete_tests.rs` use
+/// for the same tool -- one variable per tool, not per call site.
+const VERIBLE_LS_SKIP_ENV: &str = "RETICLE_ALLOW_MISSING_VERIBLE_LS";
+
+fn require_verible_verilog_ls() -> bool {
+    let env_value = std::env::var(VERIBLE_LS_SKIP_ENV).ok();
+    require_tool(
+        "verible-verilog-ls",
+        have_on_path("verible-verilog-ls"),
+        VERIBLE_LS_SKIP_ENV,
+        env_value.as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod require_tool_tests {
+    use super::require_tool;
+
+    /// M145 deletion question: if `require_tool` silently returned
+    /// `false` on an absent tool with no opt-out set (instead of
+    /// panicking), this is the test that would have to go red to catch
+    /// it -- so it must actually observe the panic, not just call the
+    /// function.
+    #[test]
+    fn absent_and_no_opt_out_panics_naming_the_env_var() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", None)
+        });
+        let payload = result.expect_err("expected require_tool to panic when absent, no opt-out");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("RETICLE_ALLOW_MISSING_FAKE"),
+            "panic message should name the env var: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn absent_and_opted_out_with_1_returns_false() {
+        assert!(!require_tool(
+            "fake-tool",
+            false,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            Some("1")
+        ));
+    }
+
+    /// `FOO=0` must NOT mean "yes, skip" -- an environment left over
+    /// from some other boolean convention must not silently disable
+    /// this check.
+    #[test]
+    fn absent_and_env_set_to_0_still_panics() {
+        let result = std::panic::catch_unwind(|| {
+            require_tool("fake-tool", false, "RETICLE_ALLOW_MISSING_FAKE", Some("0"))
+        });
+        assert!(result.is_err(), "FOO=0 must not opt out of the check");
+    }
+
+    #[test]
+    fn present_returns_true_regardless_of_env() {
+        assert!(require_tool(
+            "fake-tool",
+            true,
+            "RETICLE_ALLOW_MISSING_FAKE",
+            None
+        ));
+    }
+}
+
 #[test]
 #[ignore]
 fn manual_e2e_rust_analyzer_hover_definition_pop_on_this_repo() {
@@ -2408,7 +2517,10 @@ fn manual_e2e_clangd_hover_definition_pop_on_a_small_c_file() {
 // the Verilog round trip never ran unless someone remembered
 // `-- --ignored`. The PATH check alone is the right gate: machines with
 // verible-verilog-ls installed (the ones whose primary language this
-// editor targets) exercise it every run, everyone else still skips.
+// editor targets) exercise it every run. **M145: everyone else now
+// FAILS this test by default instead of silently skipping** -- see
+// `require_tool`'s own doc comment above; set
+// `RETICLE_ALLOW_MISSING_VERIBLE_LS=1` to opt out deliberately.
 #[test]
 fn manual_e2e_verible_verilog_ls_connects_and_publishes_diagnostics_on_a_small_sv_file() {
     // Unlike the rust-analyzer/clangd/pyright tests above, this doesn't
@@ -2423,8 +2535,7 @@ fn manual_e2e_verible_verilog_ls_connects_and_publishes_diagnostics_on_a_small_s
     // trip, languageId included, worked. Diagnostic content/count is
     // deliberately not asserted -- verible's message wording isn't a
     // contract this test should pin.
-    if !have_on_path("verible-verilog-ls") {
-        eprintln!("skipping: verible-verilog-ls not on PATH");
+    if !require_verible_verilog_ls() {
         return;
     }
     let mut i = setup();

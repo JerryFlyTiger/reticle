@@ -44,7 +44,18 @@
 ;; occasionally stdout, tool-dependent) could come back reordered under
 ;; `separate' in a way that never actually happened on the terminal.
 ;; GNU Emacs's own `compile.el' displays one combined, in-order log for
-;; exactly this reason. Using `merged' here keeps that property.
+;; exactly this reason. Using `merged' here keeps that property -- but
+;; only since M141. Before it, `merged' gave the child two separate pipes
+;; drained by two reader threads, which does NOT preserve write order
+;; either: measured 2026-09-14 with 300 alternating stdout/stderr lines,
+;; 94, 538 and 266 of 600 positions came back out of order on an idle
+;; machine, and a real `make -w -C sub' had its stdout `Entering
+;; directory' land after the compiler's stderr error (2 of 20 runs under
+;; load), so the error was resolved against the wrong directory and
+;; dropped. `merged' now shares ONE pipe between stdout and stderr
+;; (crates/elisp/src/shell.rs), so the order is the order of the child's
+;; writes. The child's own stdio buffering (e.g. stdout fully buffered
+;; when it is not a tty) is still outside this editor's control.
 ;;
 ;; --- Why a separate `compile--procs' / pump, not shell-command.el's ----
 ;; `shell-command--procs' (shell-command.el) is a single-job list by
@@ -200,22 +211,65 @@
 ;;                 buffer gets hand-edited afterward and this drifts.
 ;;
 ;; --- Known gaps (v1, not attempted here) --------------------------------
-;; - A tool that changes ITS OWN working directory mid-run (`make -C
-;;   sub', a wrapper script that `cd's before invoking the real
-;;   compiler -- both routine in real build systems) prints paths
-;;   relative to whatever directory it's actually in, not
-;;   `compile--dir' (captured once, at job start). `compile--parse-
-;;   error-line' always resolves a relative FILE against `compile--dir'
-;;   (`expand-file-name'), so a genuine error from such a tool resolves
-;;   to the WRONG absolute path, the existence check
-;;   (`file-exists-p') fails, and the entire line is silently dropped
-;;   -- with no error message, no indication in `*compilation*', nothing.
-;;   This is the price this file's whole approach (one generic pattern
-;;   plus a disk-existence check, see above) pays for not tracking each
-;;   tool's own cwd changes the way GNU's per-tool regexp table's
-;;   `compilation-directory-matcher' entries can. Much likelier to bite
-;;   in practice than the "file was later deleted/renamed" case already
-;;   called out above.
+;; - (M141) A tool that ANNOUNCES its own directory changes (`make -C
+;;   sub', `make[N]: Entering/Leaving directory ...') is now tracked --
+;;   `compile--parse-buffer-errors' keeps a directory stack
+;;   (`compile--match-directory-line', `compile--directory-regexp',
+;;   mirroring GNU Emacs 30.2's own `compilation-directory-matcher',
+;;   measured directly) and resolves each line against the stack's top
+;;   instead of the single `compile--dir' captured at job start. What
+;;   remains unhandled is a tool that changes directory WITHOUT
+;;   announcing it (plain `cd sub && tool', or `make' invoked without
+;;   `-w' on some platforms -- macOS make 3.81 was measured to print no
+;;   directory line at all in that case): such a line still resolves
+;;   against the wrong directory, `file-exists-p' fails, and the line is
+;;   dropped -- but no longer SILENTLY for every case: `compile--parse-
+;;   buffer-errors' counts a dropped line whose header matched the
+;;   FILE:LINE:COL regexp, whose severity classified as 'error/'warning/
+;;   'sorry (fix round F7 -- 'note stays uncounted), and whose FILE text
+;;   is NOT all-digits (fix round F2 -- excludes a timestamp column like
+;;   \"14:23:01: warning: ...\" from inflating the count); `compile--
+;;   finish'/`compile-process-pending-all''s truncation message both
+;;   report that count (`compile--dropped-suffix'). This is exactly the
+;;   evidence that exists, not \"always visible evidence a line went
+;;   missing\": a 'note-severity line, an all-digits-FILE line, and a
+;;   line that fails the header regexp entirely (so it was never a
+;;   counting candidate at all -- e.g. a tool that reports an error with
+;;   no FILE:LINE:COL shape whatsoever) can all still go missing with no
+;;   count and no message, and which line and where it should have
+;;   resolved are never recoverable from output text alone even when the
+;;   count IS reported.
+;; - (M141) Because the FILE:LINE header is tried before the directory
+;;   regexp (so a real error whose message happens to say "Entering
+;;   directory 'x'" stays an error), a directory line that ITSELF matches
+;;   the header is read as an error and never pushed. That needs no
+;;   `make: '-style prefix (the prefix's colon is followed by a space,
+;;   which the header rejects) and a path with a `:<digits>:' segment,
+;;   e.g. "Entering directory '/tmp/run:2024:5/build'": FILE becomes
+;;   "Entering directory '/tmp/run", the message has no error keyword, so
+;;   the line is neither tracked nor counted. Real make always prints the
+;;   prefix; only a tool imitating the line without one can hit this.
+;; - (M141) Deliberate divergence from GNU: GNU resolves a RELATIVE
+;;   "Entering directory" path against the compilation buffer's own
+;;   directory (`compilation-directory', effectively the job's start
+;;   dir), not against whatever directory is currently on top of the
+;;   stack -- measured directly: a synthetic `make[2]: Entering
+;;   directory 'deep'' three levels into a `make -C sim' run resolves,
+;;   under GNU, to `<job-dir>/deep', NOT `<job-dir>/sim/deep', even
+;;   though the tool that printed it is actually running IN
+;;   `<job-dir>/sim/deep' (that's what "Entering directory 'deep'",
+;;   printed by a process whose cwd is already `<job-dir>/sim', means).
+;;   This file resolves a relative "Entering directory" path against the
+;;   CURRENT stack top instead, because that is where the build really
+;;   is; GNU's own rule produces a path (`<job-dir>/deep') that need not
+;;   exist on disk at all in this scenario, which is a worse answer than
+;;   this file's, not a compatibility feature worth preserving.
+;; - (M141, F9, NOT fixed) A line whose real content is truncated by
+;;   `compile--line-prefix-limit' (see that variable's own doc comment)
+;;   could, by byte-exact coincidence, happen to end in something
+;;   shaped like \"...directory 'x'\" right at the truncation boundary
+;;   and get misread as a directory announcement. Needs the truncated
+;;   bytes to line up exactly with that shape; not attempted here.
 ;; - LINE (an entry's line number) is a plain integer captured once at
 ;;   PARSE time, not a marker -- if the user edits the TARGET SOURCE
 ;;   FILE (adds/removes lines above the error) between a compile
@@ -432,19 +486,97 @@ group 2 = LINE, group 4 = COL (nil if absent). Verified against all
 four real-tool shapes in this file's header comment before being
 written.")
 
-(defun compile--parse-error-line (line offset dir)
-  "Parse one LINE of compile output at character OFFSET within
-`*compilation*' (see the header's BUFFER-POS doc), resolving a relative
-FILE against DIR (the job's own working directory, exactly as the
-compiler itself would have). Returns an error entry vector, or nil if
-the first `compile--line-prefix-limit' characters of LINE don't match
-`compile--error-prefix-regexp' at all (this includes the case where
-LINE's own genuine FILE:LINE:COL header is longer than the limit --
-see `compile--line-prefix-limit''s doc comment for why that's the
-accepted trade, not a total-line-length cutoff), OR if the match
-succeeds but the named FILE doesn't exist on disk (see this file's
-header for why that's the ambiguity guard here instead of a regexp
-table)."
+(defvar compile--directory-regexp
+  "\\(Entering\\|Leaving\\) directory [`']\\(.+\\)'$"
+  "Matches a build tool's directory-change announcement line (M141),
+mirroring GNU Emacs 30.2's own `compilation-directory-matcher'
+(measured directly against real gmake/make output, not written from
+memory -- see this file's header for the GNU-parity rule that requires
+that). Unanchored at the START, same as GNU's own pattern, so any
+\"make[N]: \"/\"gmake[N]: \" prefix a real tool prepends still matches;
+anchored at the END with `$' so a directory path that itself happens to
+contain a quote character doesn't stop the greedy group early. The
+open-quote character class `[`']' matches either quote style measured:
+gmake 4.4.1 opens and closes with a plain apostrophe; macOS make 3.81
+run with `-w' opens with a backquote and closes with an apostrophe.
+Group 1 = \"Entering\" or \"Leaving\" (decides push vs. pop in
+`compile--match-directory-line'); group 2 = the raw, possibly-relative
+directory text.")
+
+(defun compile--strip-trailing-cr (line)
+  "Return LINE with exactly one trailing carriage return (\\r) stripped,
+or LINE unchanged if it doesn't end in one (fix round F8: a build
+running under CRLF line endings, e.g. some `printf'/tool output piped
+through a CRLF-preserving path). `compile--directory-regexp''s trailing
+`$' anchors to end-of-STRING in this regex engine, not \"before a
+trailing \\r\" the way some other engines' `$' does, so an unstripped
+\\r would make a genuine \"Entering directory '...'\\r\" line fail to
+match at all. Only used before matching the directory regexp -- the
+error header regexp (`compile--error-prefix-regexp') has no end-of-line
+anchor, so a trailing \\r there already just becomes the tail of MESSAGE
+harmlessly, same as before this fix."
+  (let ((n (length line)))
+    (if (and (> n 0) (eq (aref line (1- n)) ?\r))
+        (substring line 0 (1- n))
+      line)))
+
+(defun compile--match-directory-line (line)
+  "Return (KIND . DIR-RAW) if LINE is a directory-change announcement
+matching `compile--directory-regexp' (KIND is the string \"Entering\"
+or \"Leaving\", DIR-RAW the raw path text between the quotes), or nil
+otherwise. LINE is stripped of one trailing \\r first (fix round F8,
+`compile--strip-trailing-cr') and then matched against a
+`compile--line-prefix-limit'-bounded PREFIX, same defense
+`compile--parse-error-line-raw' applies to the FILE:LINE header regexp
+(see this file's header, \"Why the match is bounded to a fixed-length
+PREFIX\") -- `compile--directory-regexp''s `.+' is just as unbounded a
+quantifier as that pattern's FILE group, and this function is called on
+every line `compile--parse-buffer-errors' didn't already recognize as an
+error header, so it needs the same crash guard. No real
+directory-announcement line sampled for this milestone comes anywhere
+close to the limit; one that does is silently treated as an ordinary
+output line, the same accepted trade `compile--line-prefix-limit''s own
+doc comment already makes."
+  (let* ((stripped (compile--strip-trailing-cr line))
+         (bound (min compile--line-prefix-limit (length stripped)))
+         (prefix (substring stripped 0 bound)))
+    (when (string-match compile--directory-regexp prefix)
+      (cons (match-string 1 prefix) (match-string 2 prefix)))))
+
+(defun compile--all-digits-p (s)
+  "Non-nil if S is non-empty and every character in it is a decimal
+digit (fix round F2: a timestamp line like \"14:23:01: warning: disk
+usage high\" matches `compile--error-prefix-regexp' with FILE = \"14\",
+which will almost never exist on disk but would otherwise still get
+counted as a dropped error/warning line -- this predicate is how
+`compile--parse-buffer-errors' recognizes and excludes that shape of
+false positive from the count. Does NOT affect entry-parsing itself
+(`compile--parse-error-line' still runs the ordinary `file-exists-p'
+check regardless) -- only the COUNT a nonexistent-FILE header
+contributes to `compile--dropped-suffix'."
+  (and (> (length s) 0)
+       (let ((i 0) (n (length s)) (ok t))
+         (while (and ok (< i n))
+           (unless (and (>= (aref s i) ?0) (<= (aref s i) ?9))
+             (setq ok nil))
+           (setq i (1+ i)))
+         ok)))
+
+(defun compile--parse-error-line-raw (line dir)
+  "Match LINE's FILE:LINE[:COL[-END]]: header against
+`compile--error-prefix-regexp' and resolve FILE against DIR, WITHOUT
+checking whether FILE exists on disk. Returns a vector [FILE LINE-NUM
+COL SEVERITY MSG FILE-RAW] (FILE-RAW is the UNRESOLVED text matched for
+FILE, before `expand-file-name' -- fix round F2 needs it to recognize an
+all-digit timestamp column before it's turned into an absolute path),
+or nil if the (`compile--line-prefix-limit'-bounded) header doesn't
+match at all. Split out of `compile--parse-error-line' by M141, and
+(fix round F5/F6) called EXACTLY ONCE per line by
+`compile--parse-buffer-errors' -- see that function's own doc comment
+for why the earlier version of this docstring's claim (\"without running
+the regexp twice\") was false: `compile--parse-buffer-errors' used to
+call `compile--parse-error-line' (which runs this) and then, on a nil
+result, call this again itself."
   (let* ((bound (min compile--line-prefix-limit (length line)))
          (prefix (substring line 0 bound)))
     (when (string-match compile--error-prefix-regexp prefix)
@@ -460,26 +592,123 @@ table)."
              ;; PREFIX), so an arbitrarily long message survives whole;
              ;; see `compile--line-prefix-limit''s doc comment.
              (msg (substring line (match-end 0) (length line))))
-        (when (file-exists-p file)
-          (vector file line-num col (compile--severity msg) msg offset))))))
+        (vector file line-num col (compile--severity msg) msg file-raw)))))
+
+(defun compile--parse-error-line (line offset dir)
+  "Parse one LINE of compile output at character OFFSET within
+`*compilation*' (see the header's BUFFER-POS doc), resolving a relative
+FILE against DIR (the directory this LINE's own header should be
+resolved against -- the job's own working directory, or, since M141,
+whatever directory a preceding \"Entering directory\" announcement put
+on top of `compile--parse-buffer-errors''s stack). Returns an error
+entry vector, or nil if `compile--parse-error-line-raw' doesn't match
+at all, OR if it matches but the named FILE doesn't exist on disk (see
+this file's header for why that's the ambiguity guard here instead of a
+regexp table). Kept as its own function, with this exact signature and
+behavior, because two tests (`compile_parse_error_line_survives_long_
+colonless_prefix', `compile_colonless_5000_chars_survives_under_
+default_prefix_limit') call it directly -- `compile--parse-buffer-
+errors' itself (fix round F5/F6) no longer calls this function at all,
+to avoid running the header regexp twice per line; it calls
+`compile--parse-error-line-raw' once and does its own `file-exists-p'
+check inline."
+  (let ((raw (compile--parse-error-line-raw line dir)))
+    (when (and raw (file-exists-p (aref raw 0)))
+      (vector (aref raw 0) (aref raw 1) (aref raw 2) (aref raw 3) (aref raw 4) offset))))
+
+(defun compile--dropped-suffix (dropped)
+  "Return a \" (...)\" message suffix reporting DROPPED error/warning
+lines whose FILE:LINE header matched but whose named file doesn't exist
+on disk (M141), or \"\" if DROPPED is 0. Shared by `compile--finish' and
+`compile-process-pending-all''s truncation path so the two messages
+report this consistently without duplicating the wording."
+  (cond
+   ((= dropped 0) "")
+   ((= dropped 1) " (1 error line names a file that does not exist)")
+   (t (format " (%d error lines name files that do not exist)" dropped))))
 
 (defun compile--parse-buffer-errors (dir)
-  "Full single-pass parse of `*compilation*''s current content into a
-list of error entries (see this file's header for why this runs once
-at exit rather than incrementally per streamed chunk). DIR is the
-job's own working directory, threaded through to
-`compile--parse-error-line' for resolving relative FILEs."
+  "Full single-pass parse of `*compilation*''s current content into
+(ENTRIES . DROPPED-COUNT) (see this file's header for why this runs
+once at exit rather than incrementally per streamed chunk). DIR is the
+job's own working directory, used as the resolution directory whenever
+the directory stack described below is empty.
+
+M141: walks a directory stack alongside the lines. For each line, the
+FILE:LINE:COL header regexp is tried FIRST via
+`compile--parse-error-line-raw' (fix round F1) -- ONLY a line that does
+NOT match it is even considered as a directory-change announcement via
+`compile--match-directory-line'. This order matters: a genuine error
+whose MESSAGE happens to contain text shaped like \"Entering directory
+'x'\" (e.g. a compiler literally reporting \"error: while Entering
+directory 'x'\") still matches the header regexp first and is parsed as
+an ordinary error line, never mistaken for a directory announcement and
+never allowed to push/pop the stack. `compile--match-directory-line'
+strips one trailing \\r first (fix round F8, `compile--strip-trailing-
+cr') so CRLF build output still matches.
+
+\"Entering\" pushes its (possibly relative, see this file's header for
+the GNU-divergence rationale) directory, resolved against the CURRENT
+stack top (or DIR if the stack is empty); \"Leaving\" pops. Popping an
+empty stack is a no-op -- and, fix round F4, not merely \"harmless\" but
+UNOBSERVABLE in this interpreter: `(cdr nil)' is `nil'
+(`crates/elisp/src/value.rs:241-246'), so `(setq stack (cdr stack))'
+already does nothing to an empty STACK on its own; the surrounding
+`(when stack ...)' guard changes no behavior and exists only for
+readability (naming the case), not correctness.
+
+DROPPED-COUNT is how many non-directory lines matched
+`compile--parse-error-line-raw''s header, classified as 'error/'warning/
+'sorry severity (fix round F7 added 'sorry -- iverilog's \"sorry:\" is a
+build-stopping unsupported-construct error, not merely a note), and had
+a FILE-RAW that is NOT all-digits (fix round F2, `compile--all-digits-
+p' -- excludes a timestamp column like \"14:23:01: warning: ...\" from
+inflating the count), but were rejected only because their resolved
+FILE doesn't exist -- `compile--finish'/`compile-process-pending-all'
+report this count (`compile--dropped-suffix') instead of silently
+losing the line. This is NOT exhaustive evidence of every dropped line:
+a 'note-severity line, an all-digits-FILE line, and a line that fails
+the header regexp entirely (so it was never a candidate at all) are all
+invisible to this count -- it counts exactly the error/warning/sorry,
+non-timestamp, header-matched-but-file-missing case, covering the
+tool-changes-directory-without-announcing-it gap this file's header
+names as still unhandled, and nothing broader.
+
+Calls `compile--parse-error-line-raw' EXACTLY ONCE per line, directory
+lines included: the FILE:LINE header is tried first and only a line it
+rejects is offered to `compile--match-directory-line' (fix rounds F1,
+F5/F6) -- it does its own `file-exists-p' check and
+builds the final entry vector inline, rather than calling
+`compile--parse-error-line' (which would run the same regexp a second
+time)."
   (let ((buf (get-buffer compile-output-buffer-name)))
     (when buf
       (with-current-buffer buf
         (let ((lines (split-string (buffer-string) "\n" nil))
               (offset (point-min))
-              (out nil))
+              (out nil)
+              (dropped 0)
+              (stack nil))
           (dolist (line lines)
-            (let ((entry (compile--parse-error-line line offset dir)))
-              (when entry (push entry out)))
+            (let* ((cur-dir (if stack (car stack) dir))
+                   (raw (compile--parse-error-line-raw line cur-dir)))
+              (cond
+               (raw
+                (if (file-exists-p (aref raw 0))
+                    (push (vector (aref raw 0) (aref raw 1) (aref raw 2)
+                                  (aref raw 3) (aref raw 4) offset)
+                          out)
+                  (when (and (memq (aref raw 3) '(error warning sorry))
+                             (not (compile--all-digits-p (aref raw 5))))
+                    (setq dropped (1+ dropped)))))
+               (t
+                (let ((dirmatch (compile--match-directory-line line)))
+                  (when dirmatch
+                    (if (string= (car dirmatch) "Entering")
+                        (push (expand-file-name (cdr dirmatch) cur-dir) stack)
+                      (when stack (setq stack (cdr stack)))))))))
             (setq offset (+ offset (length line) 1)))
-          (nreverse out))))))
+          (cons (nreverse out) dropped))))))
 
 ;; --- Column jump: the first place in this codebase that jumps to a
 ;; specific COLUMN, not just a line -----------------------------------
@@ -649,19 +878,25 @@ the index from ever pointing past the end of a since-shrunk list (see
 (defun compile--finish (code dir)
   "Wrap up a finished compile job: parse `*compilation*''s full content
 for error entries (DIR is the job's own working directory, needed to
-resolve relative FILEs the same way the compiler itself would) and
-report the exit status plus how many were found."
-  (setq compile--errors (compile--parse-buffer-errors dir))
-  (setq compile--current-index nil)
-  (message "Compile %s%s"
-           (if (and (integerp code) (= code 0))
-               "finished"
-             (format "exited abnormally with code %s" code))
-           (if compile--errors
-               (format " (%d error%s found)"
-                       (length compile--errors)
-                       (if (= (length compile--errors) 1) "" "s"))
-             "")))
+resolve relative FILEs the same way the compiler itself would, and as
+the base of `compile--parse-buffer-errors''s directory stack) and
+report the exit status, how many were found, and (M141) how many more
+were dropped because their resolved FILE doesn't exist
+(`compile--dropped-suffix')."
+  (let* ((result (compile--parse-buffer-errors dir))
+         (dropped (cdr result)))
+    (setq compile--errors (car result))
+    (setq compile--current-index nil)
+    (message "Compile %s%s%s"
+             (if (and (integerp code) (= code 0))
+                 "finished"
+               (format "exited abnormally with code %s" code))
+             (if compile--errors
+                 (format " (%d error%s found)"
+                         (length compile--errors)
+                         (if (= (length compile--errors) 1) "" "s"))
+               "")
+             (compile--dropped-suffix dropped))))
 
 (defun compile--start (cmd dir)
   "Shared body of `compile'/`recompile': reset any previous job, spawn
@@ -832,9 +1067,12 @@ to interleave, not just less likely to."
                   (when buf
                     (shell-command--insert-output
                      buf "\n*** Output truncated (too large) ***\n")))
-                (setq compile--errors (compile--parse-buffer-errors dir))
-                (setq compile--current-index nil)
-                (message "Compile output truncated (too large); process killed")))))
+                (let* ((result (compile--parse-buffer-errors dir))
+                       (dropped (cdr result)))
+                  (setq compile--errors (car result))
+                  (setq compile--current-index nil)
+                  (message "Compile output truncated (too large); process killed%s"
+                           (compile--dropped-suffix dropped)))))))
         (when keep
           (setq remaining (cons entry remaining))))
       (setq procs (cdr procs)))

@@ -702,6 +702,42 @@ fn compile_output_cap_kills_process_and_reports_truncation() {
     );
 }
 
+// F3 (fix round): the truncation path (`compile-process-pending-all''s
+// output-cap branch) must also report a dropped count, not just
+// `compile--finish' -- drives the same cap as the test above, but with
+// a header-shaped line naming a nonexistent file (error severity)
+// emitted before the cap is crossed.
+#[test]
+fn compile_output_cap_truncation_message_reports_dropped_count() {
+    let (mut i, ed) = setup();
+    run(&mut i, "(get-buffer-create \"*scratch*\")");
+    run(&mut i, "(switch-to-buffer-internal \"*scratch*\")");
+    run(&mut i, "(setq compile-max-output-chars 200)");
+    do_compile(
+        &mut i,
+        &ed,
+        "bash -c 'printf \"missing.v:3: error: gone\\n\"; \
+         while true; do printf 0123456789012345678901234567890123456789; sleep 0.02; done'",
+    );
+    let ok = pump_until(&mut i, Duration::from_secs(10), no_compile_procs_running);
+    assert!(
+        ok,
+        "capped compile job should be killed and reaped promptly"
+    );
+    let echo = ed.borrow().echo.clone().unwrap_or_default();
+    assert!(
+        echo.contains("truncated"),
+        "truncation message must still say truncated: {:?}",
+        echo
+    );
+    assert!(
+        echo.contains("1 error line names a file that does not exist"),
+        "truncation message must ALSO report the dropped count \
+         (missing.v:3 never resolves to a real file): {:?}",
+        echo
+    );
+}
+
 // --- M130: vim-style j/k motion in compilation's local keymap -----------
 
 #[test]
@@ -756,4 +792,424 @@ fn compilation_j_and_k_move_without_inserting() {
         before,
         "G must never insert text into *compilation*"
     );
+}
+
+// --- M141: `M-x compile' follows a build's own directory changes --------
+//
+// T1: gmake-style "Entering directory '...'" / "Leaving directory '...'"
+// (plain apostrophe both ends) around an error line whose FILE only
+// exists under the announced subdirectory.
+
+#[test]
+fn compile_follows_gmake_entering_directory_apostrophe_style() {
+    let scratch = Scratch::new("dirtrack_gmake");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "sub/bad.v", "line1\nline2\nsyntax bad\n");
+    let sub = scratch.join("sub");
+    let sub_str = sub.to_str().unwrap();
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = format!(
+        "printf '%s\\n' \"Entering directory '{0}'\" 'bad.v:3: syntax error' \"Leaving directory '{0}'\"; true",
+        sub_str
+    );
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(
+        n, "1",
+        "expected bad.v:3 to resolve under the announced sub directory: {}",
+        n
+    );
+    let expected_file = format!("\"{}\"", sub.join("bad.v").to_str().unwrap());
+    let file = run(&mut i, "(aref (car compile--errors) 0)");
+    assert_eq!(
+        file, expected_file,
+        "bad.v must resolve against the announced 'Entering directory' path, not the job dir: {}",
+        file
+    );
+
+    feed_keys(&mut i, &ed, "M-x").unwrap();
+    type_str(&mut i, &ed, "compile-next-error");
+    feed_keys(&mut i, &ed, "RET").unwrap();
+    assert_eq!(
+        run(&mut i, "(buffer-name)"),
+        "\"bad.v\"",
+        "M-g n must actually visit sub/bad.v"
+    );
+}
+
+// T2: macOS make 3.81 `-w' style -- backquote-open, apostrophe-close.
+
+#[test]
+fn compile_follows_make_entering_directory_backquote_style() {
+    let scratch = Scratch::new("dirtrack_backquote");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "sub/bad.v", "line1\nline2\nsyntax bad\n");
+    let sub = scratch.join("sub");
+    let sub_str = sub.to_str().unwrap();
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = format!(
+        "printf '%s\\n' \"make[1]: Entering directory \\`{0}'\" 'bad.v:3: syntax error' \"make[1]: Leaving directory \\`{0}'\"; true",
+        sub_str
+    );
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(n, "1", "backquote-open style must also be tracked: {}", n);
+    let expected_file = format!("\"{}\"", sub.join("bad.v").to_str().unwrap());
+    let file = run(&mut i, "(aref (car compile--errors) 0)");
+    assert_eq!(file, expected_file, "wrong resolved file: {}", file);
+}
+
+// T3: nested make -C, real files at each level -- pins reticle's own
+// (GNU-diverging) directory-stack resolution rule for every entry A-F
+// from the task spec's synthetic log.
+
+#[test]
+fn compile_tracks_nested_directory_changes_with_real_files_at_each_level() {
+    let scratch = Scratch::new("dirtrack_nested");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "top.v", "line1\n");
+    write(&scratch, "sim/s.v", "line1\n");
+    write(&scratch, "sim/deep/d.v", "line1\n");
+    let root_str = scratch.to_str().unwrap();
+    let sim = scratch.join("sim");
+    let sim_str = sim.to_str().unwrap();
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = format!(
+        "printf '%s\\n' \
+         \"Entering directory '{root}'\" \
+         'top.v:1: error: A' \
+         \"Entering directory '{sim}'\" \
+         's.v:1: error: B' \
+         \"Entering directory 'deep'\" \
+         'd.v:1: error: C' \
+         \"Leaving directory 'deep'\" \
+         's.v:1: error: D' \
+         \"Leaving directory '{sim}'\" \
+         'top.v:1: error: E' \
+         \"Leaving directory '{root}'\" \
+         'top.v:1: error: F'; true",
+        root = root_str,
+        sim = sim_str,
+    );
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(n, "6", "expected all 6 entries A-F to parse: {}", n);
+
+    let p_top = format!("\"{}\"", scratch.join("top.v").to_str().unwrap());
+    let p_s = format!("\"{}\"", scratch.join("sim/s.v").to_str().unwrap());
+    let p_d = format!("\"{}\"", scratch.join("sim/deep/d.v").to_str().unwrap());
+    let expected = [&p_top, &p_s, &p_d, &p_s, &p_top, &p_top];
+    for (idx, exp) in expected.iter().enumerate() {
+        let got = run(&mut i, &format!("(aref (nth {} compile--errors) 0)", idx));
+        assert_eq!(
+            &got, *exp,
+            "entry {} (A-F, 0-based) resolved to the wrong directory: got {}, want {}",
+            idx, got, exp
+        );
+    }
+}
+
+// T4: `Leaving' with an empty stack is a no-op, not an error, and
+// directory tracking still works afterward -- proven by an `Entering'
+// AFTER the stray `Leaving' whose error's file exists ONLY under the
+// announced subdirectory (fix round F4: the original fixture put its
+// error file in the JOB dir, which an entirely-deleted M141 would also
+// resolve correctly, so it passed with the whole feature removed).
+//
+// The `(when stack (setq stack (cdr stack)))' guard around the pop is
+// not itself observable in this interpreter: `(cdr nil)' is `nil'
+// (`crates/elisp/src/value.rs:241-246'), so removing the `when' guard
+// entirely changes no behavior -- `(setq stack (cdr stack))' against an
+// empty STACK already leaves it `nil'. What this test actually pins is
+// that a stray `Leaving' doesn't error/hang the job and that later
+// `Entering'/error lines are still processed normally.
+
+#[test]
+fn compile_leaving_with_empty_stack_is_a_no_op() {
+    let scratch = Scratch::new("dirtrack_empty_leave");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "sub/a.v", "line1\n");
+    let sub = scratch.join("sub");
+    let sub_str = sub.to_str().unwrap();
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = format!(
+        "printf '%s\\n' \"Leaving directory '/somewhere/else'\" \"Entering directory '{0}'\" 'a.v:1: error: e1'; true",
+        sub_str
+    );
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(
+        ok,
+        "compile job never finished -- a Leaving with empty stack must not error"
+    );
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(n, "1", "the error line after the stray Leaving: {}", n);
+    let expected_file = format!("\"{}\"", sub.join("a.v").to_str().unwrap());
+    let file = run(&mut i, "(aref (car compile--errors) 0)");
+    assert_eq!(
+        file, expected_file,
+        "must resolve under sub/ (the Entering announced AFTER the stray \
+         Leaving) -- proves tracking still works after the empty pop: {}",
+        file
+    );
+}
+
+// F1 (fix round): a real error line whose MESSAGE happens to contain the
+// text "Entering directory '...'" must not be swallowed as a directory
+// announcement -- the error header regexp must be tried FIRST, and only
+// a line that does NOT match it may be treated as a directory line.
+
+#[test]
+fn compile_error_line_containing_entering_directory_text_is_not_swallowed() {
+    let scratch = Scratch::new("f1_header_first");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "bad.v", "l1\nl2\nl3\n");
+    write(&scratch, "a2.v", "l1\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd =
+        "printf '%s\\n' \"bad.v:3: error: while Entering directory 'x'\" 'a2.v:1: error: e2'; true"
+            .to_string();
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(
+        n, "2",
+        "both lines are real errors -- the first must NOT be treated as a \
+         directory-change announcement just because its MESSAGE contains \
+         the words \"Entering directory '...'\": {}",
+        n
+    );
+    let expected_bad = format!("\"{}\"", scratch.join("bad.v").to_str().unwrap());
+    let expected_a2 = format!("\"{}\"", scratch.join("a2.v").to_str().unwrap());
+    assert_eq!(
+        run(&mut i, "(aref (nth 0 compile--errors) 0)"),
+        expected_bad,
+        "first entry must resolve against the job dir"
+    );
+    assert_eq!(
+        run(&mut i, "(aref (nth 1 compile--errors) 0)"),
+        expected_a2,
+        "second entry must ALSO resolve against the job dir -- the false \
+         directory match must not have pushed \"x\" onto the stack"
+    );
+}
+
+// F2 (fix round): a timestamp-shaped line ("14:23:01: warning: ...")
+// matches the FILE:LINE:COL header with FILE="14" -- an all-digit FILE
+// that will (almost) never exist on disk must not inflate the dropped
+// count.
+
+#[test]
+fn compile_timestamp_line_does_not_inflate_dropped_count() {
+    let scratch = Scratch::new("f2_timestamp");
+    write(&scratch, "main.sv", "// nothing\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = "printf '%s\\n' '14:23:01: warning: disk usage high'; true".to_string();
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    assert_eq!(
+        run(&mut i, "(length compile--errors)"),
+        "0",
+        "\"14\" does not exist as a file, so no entry should be created"
+    );
+    let echo = ed.borrow().echo.clone().unwrap_or_default();
+    assert!(
+        !echo.contains("error line") && !echo.contains("error lines"),
+        "a timestamp-shaped line must NOT be counted as a dropped error line: {:?}",
+        echo
+    );
+}
+
+// F7 (fix round): a dropped `sorry:' line (iverilog's unsupported-
+// construct error, which stops the build) must be counted, same as
+// 'error/'warning -- 'note is the only severity that stays uncounted.
+
+#[test]
+fn compile_dropped_sorry_line_is_counted() {
+    let scratch = Scratch::new("f7_sorry");
+    write(&scratch, "main.sv", "// nothing\n");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = "printf '%s\\n' 'missing.sv:35: sorry: not yet supported'; true".to_string();
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    assert_eq!(
+        run(&mut i, "(length compile--errors)"),
+        "0",
+        "missing.sv does not exist, so no entry should be created"
+    );
+    let echo = ed.borrow().echo.clone().unwrap_or_default();
+    assert!(
+        echo.contains("1 error line names a file that does not exist"),
+        "a dropped 'sorry line must be counted just like 'error/'warning: {:?}",
+        echo
+    );
+}
+
+// F8 (fix round): CRLF line endings -- a directory-announcement line
+// ending in \r (before the buffer's own \n split) must still match
+// `compile--directory-regexp''s `$' anchor.
+
+#[test]
+fn compile_follows_directory_change_with_crlf_line_endings() {
+    let scratch = Scratch::new("f8_crlf");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "sub/bad.v", "line1\nline2\nsyntax bad\n");
+    let sub = scratch.join("sub");
+    let sub_str = sub.to_str().unwrap();
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    // `printf' emits a literal \r before each \n on the Entering/Leaving
+    // lines only -- the error line itself stays plain \n, matching a
+    // tool that CRLF-terminates its own directory chatter but not
+    // necessarily every line (the worse case: if it did, the error
+    // header regexp has no end-of-line anchor at all, so \r just joins
+    // MESSAGE harmlessly, already true before this fix).
+    let cmd = format!(
+        "printf 'Entering directory %s\\r\\n' \"'{0}'\" && \
+         printf '%s\\n' 'bad.v:3: syntax error' && \
+         printf 'Leaving directory %s\\r\\n' \"'{0}'\"; true",
+        sub_str
+    );
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(
+        n, "1",
+        "CRLF Entering/Leaving lines must still be tracked: {}",
+        n
+    );
+    let expected_file = format!("\"{}\"", sub.join("bad.v").to_str().unwrap());
+    let file = run(&mut i, "(aref (car compile--errors) 0)");
+    assert_eq!(file, expected_file, "wrong resolved file: {}", file);
+}
+
+// T5: unannounced cd (plain `cd sub && tool', or make without `-w') is
+// still dropped (this file's own header names it as the remaining known
+// gap), but no longer silently -- the finish message must name the
+// count. A second dropped-looking line whose message classifies as
+// NONE of 'error/'warning/'sorry (`compile--severity': checks
+// \berror\b, \bwarning\b, \bsorry\b in order, 'note catch-all) must NOT
+// be counted -- 'sorry IS counted (fix round F7, see the dedicated
+// `compile_dropped_sorry_line_is_counted' test above), only 'note stays
+// uncounted.
+
+#[test]
+fn compile_unannounced_directory_change_is_dropped_but_counted_in_message() {
+    let scratch = Scratch::new("dirtrack_unannounced");
+    write(&scratch, "main.sv", "// nothing\n");
+    // Neither bad.v nor foo.v exists anywhere in the scratch tree --
+    // both header-match but both fail the existence check.
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = "printf '%s\\n' 'bad.v:3: syntax error' 'foo.v:3: note text'; true".to_string();
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(5), no_compile_procs_running);
+    assert!(ok, "compile job never finished");
+
+    assert_eq!(
+        run(&mut i, "(length compile--errors)"),
+        "0",
+        "both lines' files are missing, so compile--errors must be empty"
+    );
+    // Confirm what the classifier actually does with "note text": it
+    // matches none of \berror\b/\bwarning\b/\bsorry\b, so it falls into
+    // the 'note catch-all -- verified directly via compile--severity
+    // rather than assumed, per this milestone's own instructions.
+    assert_eq!(
+        run(&mut i, "(compile--severity \"note text\")"),
+        "note",
+        "\"note text\" must classify as 'note (no error/warning/sorry keyword), \
+         so it must NOT be counted in the dropped total"
+    );
+
+    let echo = ed.borrow().echo.clone().unwrap_or_default();
+    assert!(
+        echo.contains("1 error line names a file that does not exist"),
+        "finish message must report exactly 1 dropped line (bad.v's \
+         \"syntax error\" classifies as 'error; foo.v's \"note text\" \
+         does not count): {:?}",
+        echo
+    );
+}
+
+// T6: a real `make -w -C sub' run -- the directory-tracking fix must
+// also work against a real make binary, not just synthetic printf
+// output shaped like one.
+
+#[test]
+fn compile_follows_real_make_dash_c_directory_change() {
+    let skip_env = std::env::var("RETICLE_SKIP_MAKE_TESTS").unwrap_or_default();
+    let skip_requested = matches!(skip_env.as_str(), "1" | "true" | "yes");
+    let make_available = std::process::Command::new("make")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
+        .unwrap_or(false);
+    if !make_available {
+        assert!(
+            skip_requested,
+            "`make` not found on PATH -- required by \
+             compile_follows_real_make_dash_c_directory_change; set \
+             RETICLE_SKIP_MAKE_TESTS=1/true/yes to skip this test deliberately"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new("dirtrack_real_make");
+    write(&scratch, "main.sv", "// nothing\n");
+    write(&scratch, "sub/bad.v", "line1\nline2\nline3\n");
+    write(
+        &scratch,
+        "sub/Makefile",
+        "all:\n\tprintf 'bad.v:3: syntax error\\n' >&2; exit 1\n",
+    );
+    let sub = scratch.join("sub");
+    let (mut i, ed) = setup();
+    visit(&mut i, &scratch.join("main.sv"));
+    let cmd = format!("make -w -C {}", sub.to_str().unwrap());
+    do_compile(&mut i, &ed, &cmd);
+    let ok = pump_until(&mut i, Duration::from_secs(10), no_compile_procs_running);
+    assert!(ok, "real make job never finished");
+
+    let n = run(&mut i, "(length compile--errors)");
+    assert_eq!(
+        n, "1",
+        "expected the real make -C's directory announcement to be tracked: {}",
+        n
+    );
+    // Real `make` calls `getcwd()` when reporting the directory it
+    // entered, which on macOS resolves the `/var` -> `/private/var'
+    // symlink `std::env::temp_dir()` itself leaves unresolved -- so the
+    // expected path must be canonicalized the same way, not built from
+    // `sub` directly (that comparison is exercised, unresolved, by the
+    // synthetic-log tests above; this test's own point is proving a
+    // REAL make binary's announcement is followed at all).
+    let real_sub_bad_v = std::fs::canonicalize(sub.join("bad.v")).unwrap();
+    let expected_file = format!("\"{}\"", real_sub_bad_v.to_str().unwrap());
+    let file = run(&mut i, "(aref (car compile--errors) 0)");
+    assert_eq!(file, expected_file, "wrong resolved file: {}", file);
 }

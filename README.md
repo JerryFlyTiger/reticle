@@ -531,6 +531,9 @@ Requested, recorded, not yet scoped:
 - **User-selectable font and theme**; a transparent window with a background
   image that can be faded and scaled, as iTerm2, VS Code and the JetBrains
   IDEs offer.
+- **Modern undo/redo**: a real redo, an undo tree with a visual browser,
+  region undo, and undo history that survives closing the file. Planned,
+  deferred behind Verilog work.
 
 ---
 
