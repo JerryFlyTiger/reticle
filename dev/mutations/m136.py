@@ -117,8 +117,14 @@ MUTATIONS = [
     {
         "label": 'D11 a connection\'s own name field counts as a read again',
         "file": "crates/core/lisp/verilog-auto.el",
-        "old": '                 (not (verilog-auto--identifier-is-connection-name-field-p id)))',
-        "new": '                 t)',
+        # M148 moved the closing paren: this guard grew a third conjunct
+        # (`--identifier-shadowed-p'), so the line that used to end the `and'
+        # no longer does. The old anchor (three closing parens) now occurs
+        # ZERO times. mutate.py's M146 preflight refuses rather than silently
+        # no-opping, so nothing was ever falsely reported green -- but until
+        # this was re-anchored, R3.2's defence had no working mutation.
+        "old": '                 (not (verilog-auto--identifier-is-connection-name-field-p id))',
+        "new": '                 t',
         "test": 'autounused_named_port_connection_name_field_is_not_a_read_of_a_same_named_candidate',
     },
     {

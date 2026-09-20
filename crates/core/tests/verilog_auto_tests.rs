@@ -638,6 +638,190 @@ fn autowire_crash_in_one_interface_does_not_leave_other_sites_partially_expanded
     );
 }
 
+// M149: `verilog-auto--declared-names' scoped the "already declared" search
+// to module-level declarations only (see verilog-auto.el's own M149 header
+// on `verilog-auto--module-level-node-p'). Fixture provenance noted per
+// test -- text taken from `~/My_Projects/reticle-scratch/m149/fixtures/'.
+
+#[test]
+fn autowire_declares_despite_function_local_shadow() {
+    // fixtures/wire_shadow.v
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  function automatic integer f(input integer x);\n    integer done;\n    begin done = x; f = done; end\n  endfunction\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a function-local `integer done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_task_local_shadow() {
+    // fixtures/c_wire_task.v
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  task automatic t;\n    reg done;\n    begin done = 1'b0; end\n  endtask\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a task-local `reg done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_generate_block_local_shadow() {
+    // fixtures/b_wire_generate.v
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  genvar gi;\n  generate\n    for (gi = 0; gi < 2; gi = gi + 1) begin : g_loop\n      wire done;\n      assign done = 1'b0;\n    end\n  endgenerate\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a generate-loop-block-local `wire done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_named_block_local_shadow() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  initial begin : blk\n    reg done;\n    done = 1'b0;\n  end\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a named-block-local `reg done' (`begin : blk') must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_beginless_if_generate_shadow() {
+    // fixtures/gen_if_nobegin.sv -- `if (P) wire done;' with no
+    // begin/end still parses `if_generate_construct' > `generate_block'
+    // > `net_declaration' (M149 ground truth section 4).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  parameter P = 1;\n  wire clk;\n  if (P == 1) wire done;\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a begin-less if-generate-local `wire done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_function_formal_argument_shadow() {
+    // A regression guard on real behaviour (AUTOWIRE still declares the
+    // wire despite a same-named formal argument), NOT a test of the
+    // `tf_port_list' entry in `verilog-auto--nested-scope-types': this
+    // passes independently of `verilog-auto--module-level-node-p'. A
+    // `tf_port_item' formal's name never enters `--declared-names''s
+    // "already declared" set in the first place -- `--declared-names'
+    // only walks `net_decl_assignment'/`variable_decl_assignment' nodes
+    // (plus `list_of_port_identifiers'), and per the pinned grammar's
+    // `node-types.json', `tf_port_item' exposes its identifier only
+    // through a direct `name' field (`simple_identifier'/
+    // `escaped_identifier'); neither `net_decl_assignment' nor
+    // `variable_decl_assignment' ever occurs as a descendant of
+    // `tf_port_item'/`tf_port_list'. So this test would still pass with
+    // the `tf_port_list' entry deleted from the scope-types list -- see
+    // that constant's own docstring for why the entry is kept anyway.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  function automatic integer f(input integer done);\n    f = done;\n  endfunction\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a function formal argument named `done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_despite_fork_join_local_shadow() {
+    // par_block (`fork'/`join') is on `verilog-auto--nested-scope-types'
+    // but had no test. Confirmed by a throwaway `treesit-node-string'
+    // probe (dropped into this file and removed again) that `initial
+    // fork reg done; ... join' parses `initial_construct' >
+    // `statement_or_null' > `statement' > `statement_item' > `par_block'
+    // > `block_item_declaration' > `data_declaration' >
+    // `list_of_variable_decl_assignments' > `variable_decl_assignment',
+    // matching the M148 grammar.js `par_block' rule
+    // (`'fork', ..., repeat($.block_item_declaration), ...,
+    // enclosing($.join_keyword, ...)').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  initial fork\n    reg done;\n    done = 1'b0;\n  join\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(
+            "/*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire done;\n  // End of automatics\n"
+        ),
+        "a fork/join-local `reg done' must not count as the module-level declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_still_skips_bare_generate_region_declaration() {
+    // fixtures/gen_bare.sv -- `generate wire done; endgenerate' with NO
+    // `generate_block' in between declares `done' at MODULE level
+    // (M149 ground truth section 3: slang creates no implicit net for
+    // it). This is the guard on the `generate_region' decision in
+    // `verilog-auto--nested-scope-types': without it, "tidying up" the
+    // list by adding `generate_region' would pass the whole suite.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  clk,\n  output done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  generate\n    wire done;\n    assign done = 1'b0;\n  endgenerate\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("/*AUTOWIRE*/\n  sub_mod"),
+        "a bare `generate'/`endgenerate' region is transparent -- `done' is still module-level, AUTOWIRE must emit nothing: {}",
+        text
+    );
+}
+
 // ===================== AUTOARG =====================
 
 #[test]
@@ -4147,6 +4331,32 @@ fn auto_port_notices_name_the_earlier_modules_signal_across_different_kinds() {
     );
 }
 
+#[test]
+fn autooutput_propagates_despite_function_local_shadow() {
+    // M149 ground truth: fixtures/outp_shadow.v (adapted for body
+    // placement -- see M149 ground truth section 5, an incidental,
+    // out-of-scope finding that non-ANSI port-list placement of
+    // AUTOOUTPUT is separately broken; the fixture's own placement would
+    // exercise that unrelated bug instead of this one).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output done\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  function automatic integer f(input integer x);\n    integer done;\n    begin done = x; f = done; end\n  endfunction\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", None, None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "a function-local `integer done' must not count as the module-level declaration: expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
 // ===================== M126: AUTOREG / AUTOTIEOFF =====================
 //
 // Ground truth measured against real GNU Emacs 30.2 (M126 spec section 1);
@@ -5171,6 +5381,111 @@ fn delete_auto_adjacent_autowire_autoreg_blocks_with_hand_deleted_end_still_dete
     );
 }
 
+// M149: `verilog-auto--body-declared-names' scoped the "already declared"
+// search to module-level declarations only. Fixture provenance noted per
+// test -- text taken from `~/My_Projects/reticle-scratch/m149/fixtures/'.
+
+#[test]
+fn autotieoff_ties_off_despite_function_local_shadow() {
+    // fixtures/tie_shadow.v
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (o1, o2);\n  output o1;\n  output o2;\n  assign o1 = 1'b1;\n  function automatic integer f(input integer x);\n    reg o2;\n    begin o2 = x[0]; f = o2; end\n  endfunction\n  /*AUTOTIEOFF*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(&tieoff_line("  ", "wire", false, "", "o2", "1'h0")),
+        "a function-local `reg o2' must not count as the module-level declaration -- o2 must still be tied off: {}",
+        text
+    );
+}
+
+#[test]
+fn autotieoff_ties_off_despite_generate_block_local_shadow() {
+    // Adapted from fixtures/g_tie_generate.v -- that fixture's own
+    // `assign o2 = 1'b0;' inside the generate block would ALSO suppress
+    // AUTOTIEOFF via `verilog-auto--continuous-assign-driven-names' (a
+    // separate, deliberately module-WIDE check, unrelated to and out of
+    // scope for M149 -- see that function's own docstring), which would
+    // make this test pass for the wrong reason even without the M149
+    // fix. Dropping that assign isolates the "already declared" check
+    // this test is actually pinning.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (o1, o2);\n  output o1;\n  output o2;\n  assign o1 = 1'b1;\n  genvar gi;\n  generate\n    for (gi = 0; gi < 2; gi = gi + 1) begin : g_loop\n      wire o2;\n    end\n  endgenerate\n  /*AUTOTIEOFF*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains(&tieoff_line("  ", "wire", false, "", "o2", "1'h0")),
+        "a generate-loop-block-local `wire o2' must not count as the module-level declaration -- o2 must still be tied off: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreg_declares_despite_function_local_shadow() {
+    // fixtures/reg_shadow.v. Asserted on the full expanded AUTOREG frame,
+    // anchored to the `/*AUTOREG*/' marker itself, not on a bare
+    // `text.contains("reg o;")' -- the fixture's own function-local
+    // `reg o;' already makes a bare substring check pass before
+    // `verilog_auto' is even called, which would make this test vacuous
+    // (it would stay green with the M149 filter deleted entirely).
+    // Anchoring the assertion to the marker plus the frame comments means
+    // it can only match the declaration AUTOREG inserted right after the
+    // marker, never the function-local `reg o;' sitting elsewhere in the
+    // buffer.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, o);\n  input clk;\n  output o;\n  function automatic integer f(input integer x);\n    reg o;\n    begin o = x[0]; f = o; end\n  endfunction\n  /*AUTOREG*/\n  always @(posedge clk) o <= 1'b0;\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = concat!(
+        "  /*AUTOREG*/\n",
+        "  // Beginning of automatic regs (for this module's undeclared outputs)\n",
+        "  reg o;\n",
+        "  // End of automatics\n",
+    );
+    assert!(
+        text.contains(expected),
+        "a function-local `reg o' must not count as the module-level declaration -- o must still be declared reg: expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreg_declares_despite_named_block_local_shadow() {
+    // fixtures/d_reg_namedblock.v. See the comment on
+    // `autoreg_declares_despite_function_local_shadow' above -- same
+    // reasoning for anchoring on the full frame instead of a bare
+    // `text.contains("reg o;")'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, o);\n  input clk;\n  output o;\n  initial begin : blk\n    reg o;\n    o = 1'b0;\n  end\n  /*AUTOREG*/\n  always @(posedge clk) o <= 1'b0;\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = concat!(
+        "  /*AUTOREG*/\n",
+        "  // Beginning of automatic regs (for this module's undeclared outputs)\n",
+        "  reg o;\n",
+        "  // End of automatics\n",
+    );
+    assert!(
+        text.contains(expected),
+        "a named-block-local `reg o' (`begin : blk') must not count as the module-level declaration -- o must still be declared reg: expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
 // ===================== M134: AUTORESET =====================
 // `/*AUTORESET*/', scoped to its own enclosing always block (spec section 1,
 // measured GNU Emacs 30.2) -- see this file's M134 header.
@@ -5853,6 +6168,109 @@ fn autoreset_two_markers_in_the_same_always_block() {
     );
     assert_eq!(text.matches("a_q <= 1'h0;").count(), 2, "buffer: {}", text);
     assert_eq!(text.matches("b_q <= 1'h0;").count(), 2, "buffer: {}", text);
+}
+
+// M149: `verilog-auto--reset-decl-for-name' scoped its BODY declaration
+// search (`net_decl_assignment'/`variable_decl_assignment') to module-level
+// declarations only -- the ANSI/non-ANSI port branches ahead of it were
+// already module-scoped by construction and need no filter. Fixture
+// provenance noted per test -- text taken from
+// `~/My_Projects/reticle-scratch/m149/fixtures/'.
+
+#[test]
+fn autoreset_uses_module_level_width_despite_function_local_shadow() {
+    // fixtures/h_rst_internal.v -- internal `reg [7:0] acc' plus a
+    // `function'-local `reg [2:0] acc'; the expansion must be
+    // `acc <= 8'h0;', not the too-narrow `acc <= 3'h0;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, rst_n, d, o);\n  input clk;\n  input rst_n;\n  input [7:0] d;\n  output [7:0] o;\n  function automatic integer f(input integer x);\n    reg [2:0] acc;\n    begin acc = x[2:0]; f = acc; end\n  endfunction\n  reg [7:0] acc;\n  assign o = acc;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      acc <= d;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops\n      acc <= 8'h0;\n      // End of automatics";
+    assert!(
+        text.contains(expected),
+        "a function-local `reg [2:0] acc' must not be used as acc's width -- expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreset_uses_module_level_width_despite_generate_block_local_shadow() {
+    // fixtures/j_rst_internal_gen.v -- same shadow, but the narrow `acc'
+    // is inside a generate block instead of a function.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, rst_n, d, o);\n  input clk;\n  input rst_n;\n  input [7:0] d;\n  output [7:0] o;\n  genvar gi;\n  generate\n    for (gi = 0; gi < 2; gi = gi + 1) begin : g_loop\n      reg [2:0] acc;\n    end\n  endgenerate\n  reg [7:0] acc;\n  assign o = acc;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      acc <= d;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops\n      acc <= 8'h0;\n      // End of automatics";
+    assert!(
+        text.contains(expected),
+        "a generate-loop-block-local `reg [2:0] acc' must not be used as acc's width -- expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreset_uses_module_level_width_despite_generate_block_net_shadow() {
+    // The NET-kind twin of
+    // `autoreset_uses_module_level_width_despite_generate_block_local_shadow'.
+    // That one shadows with `reg [2:0] acc', which reaches
+    // `verilog-auto--reset-decl-for-name' through its `variable_decl_assignment'
+    // loop. This one shadows with `wire [2:0] acc', which reaches the
+    // `net_decl_assignment' loop -- a SEPARATE loop that runs FIRST, so an
+    // unfiltered net-kind match wins over the module-level `reg' regardless of
+    // document order. M149's mutation D5 neuters exactly that loop's filter and
+    // SURVIVED until this test existed, because no AUTORESET test had a
+    // net-kind nested shadow.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, rst_n, d, o);\n  input clk;\n  input rst_n;\n  input [7:0] d;\n  output [7:0] o;\n  genvar gi;\n  generate\n    for (gi = 0; gi < 2; gi = gi + 1) begin : g_loop\n      wire [2:0] acc;\n    end\n  endgenerate\n  reg [7:0] acc;\n  assign o = acc;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      acc <= d;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops\n      acc <= 8'h0;\n      // End of automatics";
+    assert!(
+        text.contains(expected),
+        "a generate-loop-block-local `wire [2:0] acc' must not be used as acc's width -- expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autoreset_still_prefers_the_port_declaration_width() {
+    // fixtures/rst_shadow.v -- `q' is BOTH a port and has a nested
+    // same-named `function'-local `reg q' (untyped, 1 bit). The ANSI/
+    // non-ANSI port branches run before the body search and must still
+    // win: this is the control case for the M149 change -- a signal
+    // that is a port must resolve through the port branch regardless of
+    // a nested same-named local, exactly as it did before this change
+    // (M149 ground truth: this fixture already came out right pre-M149,
+    // since a port cannot appear inside a `function'/`task'/generate
+    // body in the first place).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (clk, rst_n, d, q);\n  input clk;\n  input rst_n;\n  input [7:0] d;\n  output [7:0] q;\n  function automatic integer f(input integer x);\n    reg q;\n    begin q = x[0]; f = q; end\n  endfunction\n  reg [7:0] q;\n  always @(posedge clk or negedge rst_n) begin\n    if (!rst_n) begin\n      /*AUTORESET*/\n    end else begin\n      q <= d;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "/*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops\n      q <= 8'h0;\n      // End of automatics";
+    assert!(
+        text.contains(expected),
+        "q must resolve through its own port declaration (8 bits), not the function-local 1-bit `reg q' -- expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
 }
 
 // ===================== M127: AUTO_TEMPLATE's substitution language =========
@@ -9146,15 +9564,17 @@ fn autounused_named_parameter_assignment_name_field_is_not_a_read_of_a_same_name
 }
 
 #[test]
-fn autounused_function_local_shadow_is_a_known_limitation_not_fixed() {
-    // R3.3: KNOWN LIMITATION, documented rather than silently wrong (see
-    // verilog-auto--identifier-read-p's own docstring) -- this function
-    // has no lexical-scope resolution at all, so a task/function-local
-    // variable sharing a module-level candidate's own name incorrectly
-    // counts as a read of the OUTER port. Pinning the CURRENT (wrong,
-    // but honestly documented) behavior here means a future scope-aware
-    // fix changes this test on purpose, rather than an accidental
-    // regression changing it silently.
+fn autounused_function_local_shadow_is_resolved() {
+    // R3.3: FIXED by M148 (this test used to be named
+    // `autounused_function_local_shadow_is_a_known_limitation_not_fixed'
+    // and pinned the WRONG behavior -- its own failure message said the
+    // right move, when it started failing, was to re-point it rather
+    // than revert whatever made it fail; this is that re-point).
+    // `verilog-auto--identifier-read-p' now has lexical-scope-aware
+    // shadow detection (`verilog-auto--identifier-shadowed-p'), so the
+    // function-local `a_i' no longer masks the module port `a_i': the
+    // local's own read is excluded (shadowed), and since nothing else
+    // in the module reads the port, it IS listed as unused.
     let (mut i, _ed) = setup();
     insert_src(
         &mut i,
@@ -9164,13 +9584,334 @@ fn autounused_function_local_shadow_is_a_known_limitation_not_fixed() {
     let text = bs(&mut i);
     let block = unused_block(&text);
     assert!(
-        !block.contains("a_i,"),
-        "KNOWN LIMITATION pin -- if this assertion starts FAILING, the most likely \
-         reason is that someone fixed the limitation: update the docstring this test \
-         names and re-point the test, do not revert the change that made it fail. \
-         What is pinned: the function-local `a_i' shadows the outer \
-         port with the same name, and this scan has no scope resolution to tell them apart, so \
-         the outer `a_i' is (incorrectly) NOT listed here: {}",
+        block.contains("a_i,"),
+        "M148: the function-local `a_i' shadows the outer port with the same name, so its \
+         own read must NOT count as a read of the port -- the outer `a_i' must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_task_local_shadow_is_resolved() {
+    // M148 shape 1: a `task' body local shares a module-level candidate's
+    // own name. Ground truth (`dev/lsp-probe.py --diagnostics' against
+    // real `slang-server', M148 record): `shadow-value' + `unused-port'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic b_i,\n  output logic z_o\n);\n  task automatic tk();\n    logic b_i;\n    b_i = 1'b0;\n  endtask\n  assign z_o = 1'b0;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("b_i,"),
+        "the task-local `b_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_named_block_local_shadow_is_resolved() {
+    // M148 shape 2: a NAMED `begin : label ... end' block local.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic c_i,\n  output logic z_o\n);\n  logic blk_out;\n  always_comb begin : named_blk\n    logic c_i;\n    c_i = 1'b0;\n    blk_out = c_i;\n  end\n  assign z_o = blk_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("c_i,"),
+        "the named-block-local `c_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_unnamed_block_local_shadow_is_resolved() {
+    // M148 shape 3: an UNNAMED `begin ... end' block local -- ground
+    // truth found this shadows too (`shadow-value' + `unused-port'), and
+    // it is a distinct dump shape from the named-block case (`(seq_block
+    // (block_item_declaration ...))' with no label child at all), so an
+    // implementation keying on `begin : label' alone would miss it.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic j_i,\n  output logic z_o\n);\n  logic blk_out;\n  always_comb begin\n    logic j_i;\n    j_i = 1'b1;\n    blk_out = j_i;\n  end\n  assign z_o = blk_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("j_i,"),
+        "the unnamed-block-local `j_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_for_int_loop_variable_shadow_is_resolved() {
+    // M148 shape 4: `for (int d_i = 0; ...)' -- `for_initialization' is a
+    // SIBLING of the loop body under `loop_statement', not an ancestor of
+    // it, so the shadow check has to happen at the `loop_statement'
+    // ancestor, one level into `for_initialization'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic d_i,\n  output logic z_o\n);\n  logic loop_out;\n  always_comb begin\n    loop_out = 1'b0;\n    for (int d_i = 0; d_i < 4; d_i++) begin\n      loop_out = loop_out ^ d_i[0];\n    end\n  end\n  assign z_o = loop_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("d_i,"),
+        "the `for (int d_i ...)' loop variable shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_generate_for_genvar_shadow_is_resolved() {
+    // M148 shape 5: `for (genvar k_i = 0; ...)' inside a `generate' loop
+    // -- dump-verified to need RAW child inspection to tell apart from a
+    // loop reusing an already-declared genvar (both produce the
+    // identical named-node sexp; only the raw anonymous `genvar' token
+    // distinguishes them).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic k_i,\n  output logic [3:0] z_o\n);\n  logic [3:0] gen_out;\n  generate\n    for (genvar k_i = 0; k_i < 4; k_i++) begin : g_loop\n      assign gen_out[k_i] = 1'b0;\n    end\n  endgenerate\n  assign z_o = gen_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("k_i,"),
+        "the `for (genvar k_i ...)' loop variable shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_user_typed_for_loop_variable_shadow_is_resolved() {
+    // M148 trailing cold read: the `for_initialization' clause pulled the
+    // loop variable's name out with `verilog-auto--find-first-of-type', an
+    // unrestricted depth-first search. When the loop variable's type is a
+    // user-defined type, the type name is ITSELF a `simple_identifier',
+    // nested inside the `data_type' child and textually FIRST -- so the
+    // search returned the TYPE's name, the shadow check never fired, and a
+    // port whose only other occurrence is being that loop's control variable
+    // stayed (wrongly) counted as read. `int'/`logic'/`bit' do not trigger it
+    // (`data_type' then wraps an `integer_atom_type', not an identifier),
+    // which is why every earlier for-loop test missed this. The fix scans
+    // only the DIRECT children of `for_variable_declaration', where the
+    // loop variable's identifier lives and the type's name does not.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic i_i,\n  output logic z_o\n);\n  typedef logic [3:0] mytype_t;\n  logic loop_out;\n  always_comb begin\n    loop_out = 1'b0;\n    for (mytype_t i_i = 0; i_i < 4; i_i = i_i + 1) begin\n      loop_out = loop_out ^ i_i[0];\n    end\n  end\n  assign z_o = loop_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("i_i,"),
+        "the user-typed `for (mytype_t i_i ...)' loop variable shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_generate_block_body_bare_genvar_declaration_shadow_is_resolved() {
+    // M148 fix round F5: a BARE `genvar gj_i;' statement written inside a
+    // generate block's body -- as opposed to inline in the `for' header,
+    // which is the `genvar_initialization' shape test above. The fix round
+    // found this shape already worked, because the `genvar_declaration'
+    // dispatch clause matches by CHILD type regardless of which node is the
+    // parent, and recorded that in `verilog-auto--scope-declares-name-p''s
+    // docstring. Nothing pinned it, though: a docstring is a claim about the
+    // code, and this codebase has an incident where such a claim was false
+    // from day one and the tests, written from the code, could never catch
+    // it. This test is that claim's pin.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic gj_i,\n  output logic [3:0] z_o\n);\n  logic [3:0] gen_out;\n  generate\n    for (genvar gi = 0; gi < 4; gi++) begin : g_loop\n      genvar gj_i;\n      assign gen_out[gi] = 1'b0;\n    end\n  endgenerate\n  assign z_o = gen_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("gj_i,"),
+        "a bare `genvar gj_i;' in the generate-block BODY shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_generate_block_body_declaration_shadow_is_resolved() {
+    // M148 shape 6: a plain declaration directly inside a generate-block
+    // BODY (`logic h_i;' inside `for (genvar gi = 0; ...) begin : g_loop
+    // ... end') -- dump-verified as a BARE `data_declaration' direct
+    // child of `generate_block', with no `block_item_declaration'
+    // wrapper the way a `seq_block' local gets.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic h_i,\n  output logic [3:0] z_o\n);\n  logic [3:0] gen_out;\n  generate\n    for (genvar gi = 0; gi < 4; gi++) begin : g_loop\n      logic h_i;\n      assign h_i = 1'b0;\n      assign gen_out[gi] = h_i;\n    end\n  endgenerate\n  assign z_o = gen_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("h_i,"),
+        "the generate-block-body-local `h_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_generate_block_wire_declaration_shadow_is_resolved() {
+    // M148 fix round F1/F2, F2: the `wire' variant of the test directly
+    // above -- a bare `wire h_i;' inside a generate-block body parses as
+    // `net_declaration', not `data_declaration' (dump-verified:
+    // `(generate_block name: (simple_identifier) (net_declaration
+    // (net_type) (list_of_net_decl_assignments (net_decl_assignment
+    // (simple_identifier)))))'). Before the fix this was silently NOT
+    // recognized as a shadowing declaration, so the marker did not even
+    // expand (nothing else in the module reads `h_i' as a signal once
+    // `assign h_i = ...'/`gen_out[gi] = h_i' are read as driving the
+    // local `h_i', so the port stayed wrongly counted as read).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic h_i,\n  output logic [3:0] z_o\n);\n  logic [3:0] gen_out;\n  generate\n    for (genvar gi = 0; gi < 4; gi++) begin : g_loop\n      wire h_i;\n      assign h_i = 1'b0;\n      assign gen_out[gi] = h_i;\n    end\n  endgenerate\n  assign z_o = gen_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("h_i,"),
+        "the generate-block-body-local `wire h_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_multi_variable_for_loop_shadow_is_resolved() {
+    // M148 fix round F1: a `for_initialization' can hold SEVERAL
+    // `for_variable_declaration' siblings when each carries an explicit
+    // type (`for (int i = 0, int j_i = 0; ...)', dump-verified to
+    // produce two sibling `for_variable_declaration' nodes). Before the
+    // fix, only the first was ever checked
+    // (`verilog-auto--find-first-of-type'), so `j_i' -- the SECOND loop
+    // variable -- was never recognized as shadowing the outer port,
+    // even though it is only ever read as the loop variable, never as
+    // the port.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic j_i,\n  output logic z_o\n);\n  logic loop_out;\n  always_comb begin\n    loop_out = 1'b0;\n    for (int i = 0, int j_i = 0; i < 4; i = i + 1) begin\n      loop_out = loop_out ^ i[0] ^ j_i[0];\n    end\n  end\n  assign z_o = loop_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("j_i,"),
+        "the SECOND `for' loop variable `j_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_function_formal_argument_shadow_is_resolved() {
+    // M148 shape 7: a `function''s own FORMAL ARGUMENT name
+    // (`function automatic logic fn(input logic i_i);') -- `tf_port_list'
+    // is a direct child of `function_body_declaration', the SAME
+    // container that also holds the function's own local declarations.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic i_i,\n  output logic z_o\n);\n  function automatic logic fn(input logic i_i);\n    return i_i;\n  endfunction\n  assign z_o = fn(1'b0);\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("i_i,"),
+        "the function's own formal argument `i_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_task_formal_argument_shadow_is_resolved() {
+    // M148 fix round F4: the `task' counterpart of the test directly
+    // above -- `task_body_declaration' was dump-verified to carry the
+    // identical `tf_port_list' shape as `function_body_declaration',
+    // and the dispatch in `verilog-auto--scope-declares-name-p' does
+    // not distinguish function from task, so this is expected to pass
+    // without any further code change.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic p_i,\n  output logic z_o\n);\n  task automatic tk(input logic p_i);\n    z_o = p_i;\n  endtask\n  initial tk(1'b0);\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        block.contains("p_i,"),
+        "the task's own formal argument `p_i' shadows the outer port -- must be listed: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_shadow_is_per_occurrence_not_per_name() {
+    // M148 fail-safe test (ground truth `shadow3.sv', `m_i'): a port
+    // shadowed by a `function' local, BUT ALSO genuinely read in an
+    // `always_ff' elsewhere in the module, must NOT be listed -- a
+    // sibling scope's own declaration must not suppress a read
+    // elsewhere. Real `slang-server' agrees: only `shadow-value', no
+    // `unused-port', on this exact shape.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk_i,\n  input  logic m_i,\n  output logic z_o\n);\n  function automatic logic fn();\n    logic m_i;\n    m_i = 1'b0;\n    return m_i;\n  endfunction\n  logic unused_fn;\n  always_ff @(posedge clk_i) begin\n    z_o <= m_i ^ unused_fn;\n  end\n  assign unused_fn = fn();\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        !block.contains("m_i,"),
+        "m_i is shadowed inside `fn' but genuinely read in the always_ff -- must NOT be listed \
+         (a sibling scope's own local must not suppress a read elsewhere): {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_inner_scope_does_not_shadow_an_outer_read() {
+    // M148 fail-safe test (ground truth `shadow3.sv', `n_i'): a port read
+    // in an OUTER named block, re-declared only in a NESTED INNER block
+    // under it, must NOT be listed -- an inner scope's own declaration
+    // must not shadow a read that happens in the surrounding outer scope.
+    // Real `slang-server' agrees: only `shadow-value', no `unused-port'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic n_i,\n  output logic z_o\n);\n  logic blk_out;\n  always_comb begin : b\n    blk_out = n_i;\n    begin\n      logic n_i;\n      n_i = 1'b1;\n      blk_out = blk_out ^ n_i;\n    end\n  end\n  assign z_o = blk_out;\n  wire _unused_ok = &{1'b0,\n                      /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = unused_block(&text);
+    assert!(
+        !block.contains("n_i,"),
+        "n_i is read in the OUTER block `b' before the nested inner block re-declares it -- \
+         the inner declaration must not shadow the outer read, must NOT be listed: {}",
         text
     );
 }

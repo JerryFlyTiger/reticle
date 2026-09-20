@@ -3862,12 +3862,23 @@ itself references OTHER names (M39 dump: `logic y = x;' nests a
 `simple_identifier' for `x' inside `y's own `variable_decl_assignment'),
 so only each assignment's OWN name (its first child for
 `net_decl_assignment', which has no treesit field for it; the `name'
-field for `variable_decl_assignment', which does) is ever collected."
+field for `variable_decl_assignment', which does) is ever collected.
+
+M149: the `net_decl_assignment'/`variable_decl_assignment' walks below
+are filtered through `verilog-auto--module-level-node-p' -- a same-
+named declaration inside a `function'/`task' body, a `begin'/`end'
+block or a generate block no longer counts as already declaring the
+name (M149 ground truth: `wire_shadow.v', `c_wire_task.v',
+`b_wire_generate.v'). The port-identifier walks that follow are not
+filtered: a port can never appear inside one of those nested scopes,
+so they are already module-scoped by construction."
   (let (acc)
     (dolist (n (verilog-auto--find-all-of-type module-decl "net_decl_assignment"))
-      (push (treesit-node-text (treesit-node-child n 0)) acc))
+      (when (verilog-auto--module-level-node-p n module-decl)
+        (push (treesit-node-text (treesit-node-child n 0)) acc)))
     (dolist (n (verilog-auto--find-all-of-type module-decl "variable_decl_assignment"))
-      (push (treesit-node-text (treesit-node-child-by-field-name n "name")) acc))
+      (when (verilog-auto--module-level-node-p n module-decl)
+        (push (treesit-node-text (treesit-node-child-by-field-name n "name")) acc)))
     (dolist (n (verilog-auto--find-all-of-type module-decl "list_of_port_identifiers"))
       (dolist (id (verilog-auto--find-all-of-type n "simple_identifier"))
         (push (treesit-node-text id) acc)))
@@ -3906,12 +3917,21 @@ assignment' node (just with no `=' child) -- so this walk, unlike
 `verilog-auto--declared-names''s two analogous dolist blocks, needs no
 special-casing for the no-initialiser case either; it is identical to
 those two blocks, verbatim, with only the port-identifier blocks
-dropped."
+dropped.
+
+M149: both walks below are filtered through `verilog-auto--module-
+level-node-p', the same narrowing `verilog-auto--declared-names'
+applies -- AUTOTIEOFF/AUTOREG must not treat a `function'/`task'-local
+or generate-block-local declaration as if it were the module-level
+one this command needs to skip (M149 ground truth: `tie_shadow.v',
+`g_tie_generate.v', `reg_shadow.v', `d_reg_namedblock.v')."
   (let (acc)
     (dolist (n (verilog-auto--find-all-of-type module-decl "net_decl_assignment"))
-      (push (treesit-node-text (treesit-node-child n 0)) acc))
+      (when (verilog-auto--module-level-node-p n module-decl)
+        (push (treesit-node-text (treesit-node-child n 0)) acc)))
     (dolist (n (verilog-auto--find-all-of-type module-decl "variable_decl_assignment"))
-      (push (treesit-node-text (treesit-node-child-by-field-name n "name")) acc))
+      (when (verilog-auto--module-level-node-p n module-decl)
+        (push (treesit-node-text (treesit-node-child-by-field-name n "name")) acc)))
     (nreverse acc)))
 
 (defun verilog-auto--net-lvalue-driven-names (lvalue)
@@ -4366,19 +4386,33 @@ signed information `verilog-auto--decl-raw-type-keyword'/
 nil if NAME is declared nowhere -- spec section 1's undeclared-signal
 case, still reset, as 1 bit.
 
-NOT scoped to module-level declarations only (M134 fix round, item 6):
-the `net_decl_assignment'/`variable_decl_assignment' search below walks
-EVERY such node anywhere under MODULE-DECL, including inside a `task'/
-`function'/`generate' body. A same-named LOCAL inside one of those
-would shadow the real module-level signal, first document-order match
-winning -- low likelihood (AUTORESET only fires on names actually
-assigned in an always block, and a task/function-local variable is
-vanishingly unlikely to share a reset signal's name) and left
-UNTESTED. Deliberately not scoped further: every existing DECL-node
-caller in this file (`--output-port-candidate-decls', `--body-declared-
-names') has the identical blanket-search shape, so narrowing only this
-one caller would be new, unvalidated surface area for a corner this
-project has no measured evidence about either way."
+SCOPED to module-level declarations only in its BODY search (M149;
+this replaces an earlier, now-false, claim that this function was
+deliberately left unscoped and untested -- see the M149 record for
+what changed). The `net_decl_assignment'/`variable_decl_assignment'
+search below is filtered through `verilog-auto--module-level-node-p':
+a same-named LOCAL inside a `task'/`function'/generate body no longer
+shadows the real module-level signal (M149 ground truth:
+`h_rst_internal.v', an internal `reg [7:0] acc' shadowed by a
+`function'-local `reg [2:0] acc' now resolves to the module-level
+declaration and expands `acc <= 8'h0;', not the too-narrow
+`acc <= 3'h0;'; pinned by
+`autoreset_uses_module_level_width_despite_function_local_shadow' and
+`autoreset_uses_module_level_width_despite_generate_block_local_shadow').
+The BODY search runs two SEQUENTIAL `dolist' loops, not one merged
+document-order walk: it returns the first module-level
+`net_decl_assignment' match, and only if there is none, the first
+module-level `variable_decl_assignment' match -- a net-kind match
+always wins over a variable-kind one regardless of which came first in
+the source text (this two-loop shape predates M149 and is unchanged by
+it). Within each loop, a nested-scope candidate earlier in document
+order is skipped rather than accepted. The ANSI-port and non-ANSI-port
+branches
+above this one are already module-scoped by construction (a port
+cannot appear inside a `function'/`task'/generate body), which is
+exactly why the port-signal AUTORESET fixtures (`rst_shadow.v',
+`f_rst_generate.v') already came out right before this change and
+need no filter here."
   (or
    (and (verilog-auto--ansi-header-p header)
         (catch 'found
@@ -4398,10 +4432,12 @@ project has no measured evidence about either way."
      nil)
    (catch 'found
      (dolist (n (verilog-auto--find-all-of-type module-decl "net_decl_assignment"))
-       (when (equal (treesit-node-text (treesit-node-child n 0)) name)
+       (when (and (equal (treesit-node-text (treesit-node-child n 0)) name)
+                  (verilog-auto--module-level-node-p n module-decl))
          (throw 'found (verilog-auto--enclosing-of-type n "net_declaration"))))
      (dolist (n (verilog-auto--find-all-of-type module-decl "variable_decl_assignment"))
-       (when (equal (treesit-node-text (treesit-node-child-by-field-name n "name")) name)
+       (when (and (equal (treesit-node-text (treesit-node-child-by-field-name n "name")) name)
+                  (verilog-auto--module-level-node-p n module-decl))
          (throw 'found (verilog-auto--enclosing-of-type n "data_declaration"))))
      nil)))
 
@@ -5063,13 +5099,13 @@ work rather than attempted here):
   so the climb lands on the wrong node and the operator-field check
   fails there too -- refused, not corrupted.
 
-Two other known, unrelated limitations already documented elsewhere:
-`verilog-auto--identifier-read-p''s own docstring (R3.3, function-local
-shadowing) and `verilog-auto--identifier-non-root-hierarchical-
-component-p''s own docstring (a port/instance name collision) -- unlike
-those two (which can silently list a signal that IS read, or silently
-skip one that ISN'T), both limitations here only ever make this idiom
-LESS convenient, never wrong."
+One other known, unrelated limitation already documented elsewhere:
+`verilog-auto--identifier-non-root-hierarchical-component-p''s own
+docstring (a port/instance name collision) -- unlike that one (which
+can silently skip a signal that ISN'T read), the limitation here only
+ever makes this idiom LESS convenient, never wrong. (R3.3, function-
+local shadowing, was the other entry in this list; M148 fixed it --
+see `verilog-auto--identifier-read-p''s own docstring.)"
   (let ((concat (verilog-auto--enclosing-of-types comment '("concatenation"))))
     (and concat
          (let ((n (treesit-node-parent concat)))
@@ -5149,10 +5185,12 @@ illegal fixture is pinned by a named test
 (`autounused_port_and_instance_name_collision_via_hierarchical_read_is_a_known_limitation_not_fixed'
 in verilog_auto_tests.rs). Fixing this needs real name resolution
 (distinguishing \"is this identifier's target an instance or a port\"
-is not answerable from text alone, the same scope-resolution gap
-`verilog-auto--identifier-read-p''s own docstring already documents for
-R3.3's function-local shadowing) -- left as a second, adjacent instance
-of that same documented gap rather than a new one.
+is not answerable from text alone) -- a DIFFERENT, still-open kind of
+name resolution than M148's lexical-scope fix to `verilog-auto--
+identifier-read-p' (R3.3, now fixed): that one is \"which LEXICAL
+SCOPE does an identifier's declaration live in\", this one is \"is this
+identifier's target an instance name or a signal name at all\", and
+M148 does not touch it.
 
 An EARLIER version of this paragraph additionally claimed real
 `slang-server' independently confirms this tool is on the WRONG side
@@ -5216,7 +5254,335 @@ R3.1."
         (and first (treesit-node-eq id first))))
      (t nil))))
 
-(defun verilog-auto--identifier-read-p (name exclude-ranges lvalue-starts all-ids)
+(defun verilog-auto--data-declaration-declares-p (dd name)
+  "Non-nil if DD (a `data_declaration' node) directly names NAME in one
+of its own `variable_decl_assignment' children's `name' field. Used by
+`verilog-auto--scope-declares-name-p'; shallow on purpose -- a `data_
+declaration' never nests another scope inside it, so a full `find-all-
+of-type' sweep over just this one small subtree cannot cross into a
+sibling scope the way a module-wide sweep would."
+  (catch 'found
+    (dolist (va (verilog-auto--find-all-of-type dd "variable_decl_assignment"))
+      (let ((nm (treesit-node-child-by-field-name va "name")))
+        (when (and nm (equal (treesit-node-text nm) name))
+          (throw 'found t))))
+    nil))
+
+(defun verilog-auto--net-declaration-declares-p (nd name)
+  "Non-nil if ND (a `net_declaration' node) directly names NAME in one
+of its own `net_decl_assignment' children. F2 fix (M148 review round):
+a bare `wire h_i;' written as a direct statement inside a
+`generate_block' body parses as `net_declaration', NOT `data_
+declaration' -- dump-verified (`verilog-auto--parse-string' +
+`treesit-node-string'): `(generate_block name: (simple_identifier)
+(net_declaration (net_type) (list_of_net_decl_assignments (net_decl_
+assignment (simple_identifier)))))'. Unlike `variable_decl_assignment',
+a `net_decl_assignment' does NOT expose its identifier under a `name'
+field (`treesit-node-child-by-field-name' returns nil, dump-verified
+against a two-identifier `wire h_i, h2_i;' fixture) -- its own
+`simple_identifier' child has to be found by type instead. Shallow
+on purpose, same reasoning as `verilog-auto--data-declaration-declares-p':
+a `net_declaration' never nests another scope inside it.
+`function'/`task' bodies and `seq_block's cannot contain a
+`net_declaration' at all (nets are only legal in a module/generate-
+block scope), so this is only ever reached from the `generate_block'
+bare-child case in `verilog-auto--scope-declares-name-p'."
+  (catch 'found
+    (dolist (nda (verilog-auto--find-all-of-type nd "net_decl_assignment"))
+      (let ((id (verilog-auto--find-first-of-type nda "simple_identifier")))
+        (when (and id (equal (treesit-node-text id) name))
+          (throw 'found t))))
+    nil))
+
+(defun verilog-auto--genvar-initialization-declares-p (gi name)
+  "Non-nil if GI (a `genvar_initialization' node, the first clause of a
+`for (... ; ...; ...)' generate loop) is an INLINE genvar declaration
+(`for (genvar k_i = 0; ...)') naming NAME, as opposed to a loop
+reusing an ALREADY-declared genvar (`for (k_i = 0; ...)', `k_i'
+declared by a separate module-level `genvar_declaration'). M148 dump-
+verified (`verilog-auto--parse-string' + raw `treesit-node-child'):
+both shapes produce the IDENTICAL named-node sexp, `(genvar_
+initialization (simple_identifier) (constant_expression ...))' -- the
+`genvar' keyword is an ANONYMOUS token, invisible to `treesit-node-
+string' and to `verilog-auto--find-all-of-type' (which only matches
+NAMED node types). The only place it is visible at all is the raw
+child list: dump on the inline shape shows raw children `(\"genvar\"
+\"simple_identifier\" \"=\" \"constant_expression\")', four children
+including a `genvar' token; the already-declared shape shows only
+three, `(\"simple_identifier\" \"=\" \"constant_expression\")', with no
+`genvar' token anywhere. So this walks EVERY raw child of GI (via
+`treesit-node-child' by index, since `treesit-node-string'/`find-all-
+of-type' cannot see an anonymous token at all) looking for one whose
+type is `genvar' -- not a check of any particular position, since
+nothing here relies on `genvar' always landing at the same index. Only
+the inline shape introduces a NEW declaration that can shadow an outer
+name -- the already-declared shape is simply a read/write of a genvar
+declared elsewhere, and that elsewhere is where its own shadowing (if
+any) is decided."
+  (and (let ((n (treesit-node-child-count gi)) (has-genvar nil))
+         (dotimes (idx n)
+           (when (equal (treesit-node-type (treesit-node-child gi idx)) "genvar")
+             (setq has-genvar t)))
+         has-genvar)
+       (let ((id (verilog-auto--find-first-of-type gi "simple_identifier")))
+         (and id (equal (treesit-node-text id) name)))))
+
+(defun verilog-auto--scope-declares-name-p (node name)
+  "Non-nil if NODE directly introduces a declaration of NAME, looking
+only at NODE's own DIRECT children (raw index, so anonymous keyword
+tokens are visible too) -- never a deep subtree walk, which would
+re-introduce the very unbounded-scan bug M148 exists to fix. Used by
+`verilog-auto--identifier-shadowed-p', which calls this once per
+ancestor on an occurrence's own ancestor chain.
+
+M148 dump-verified shapes (`verilog-auto--parse-string' +
+`treesit-node-string'/raw `treesit-node-child', six real fixtures):
+
+- `data_declaration' as a BARE direct child (dump-verified: a
+  `generate_block''s own local, e.g. `logic h_i;' inside a
+  `for (genvar ...) begin : g_loop ... end' body, is a direct
+  `data_declaration' child of `generate_block' with no wrapper) --
+  checked via `verilog-auto--data-declaration-declares-p'.
+- `net_declaration' as a BARE direct child (M148 review round, F2:
+  the SAME `generate_block' body local, but declared `wire h_i;'
+  instead of `logic h_i;', parses as `net_declaration', not `data_
+  declaration' -- dump-verified: `(generate_block name: (simple_
+  identifier) (net_declaration (net_type) (list_of_net_decl_
+  assignments (net_decl_assignment (simple_identifier)))))'. `wire'
+  inside a `function'/`task'/`seq_block' is not legal Verilog (nets
+  cannot be declared there), so this shape is only ever reached from a
+  `generate_block' ancestor.) -- checked via `verilog-auto--net-
+  declaration-declares-p'.
+- `block_item_declaration', one level deeper into its own single
+  `data_declaration' child -- the wrapper dump-verified around every
+  local variable inside a `function_body_declaration', `task_body_
+  declaration', named `seq_block' (`begin : label ... end') and
+  UNNAMED `seq_block' (`begin ... end', dump-verified to have the
+  identical `(seq_block (block_item_declaration ...))' shape with no
+  label child at all -- an implementation keying on `begin : label'
+  alone would miss this one).
+- `tf_port_list' (a `function'/`task''s own FORMAL ARGUMENTS), one
+  level deeper into each `tf_port_item' child's `name' field --
+  dump-verified: `function automatic logic fn(input logic i_i);' puts
+  `tf_port_list' as a direct child of `function_body_declaration',
+  the SAME container that also holds the function's own local
+  `block_item_declaration's, so both are checked at the same ancestor.
+- `for_initialization' (`for (int d_i = 0; ...)'), one level deeper
+  into EVERY `for_variable_declaration' child (M148 review round, F1:
+  a `for_initialization' can legally hold SEVERAL `for_variable_
+  declaration' siblings, one per loop variable, as long as each one
+  carries an explicit type -- `for (int i = 0, int j_i = 0; ...)'
+  dump-verifies to `(for_initialization (for_variable_declaration ...)
+  (for_variable_declaration ...))', two siblings, and checking only
+  the first (`verilog-auto--find-first-of-type') silently missed
+  `j_i''s own declaration. The SAME-type comma form, `for (int i = 0,
+  j_i = 0; ...)' -- no repeated `int' on the second variable -- is NOT
+  a live path for this: dump-verified to put only `i''s own
+  `for_variable_declaration' inside `for_initialization' at all, with
+  `, j_i = 0' instead becoming `(ERROR (simple_identifier))', a
+  SIBLING of `for_initialization' under `loop_statement', not a
+  declaration of anything this function needs to recognize), whose own
+  `simple_identifier' child (dump-verified: a plain child, NOT a
+  `name' field) is the loop variable. Dump-verified as a direct child
+  of `loop_statement', a SIBLING of the loop's condition/step/body, so
+  this is checked at the `loop_statement' ancestor, not inside the
+  body. The loop variable's own identifier is found by scanning ONLY
+  the DIRECT children of `for_variable_declaration', never by a
+  depth-first search: when the loop variable carries a USER-DEFINED
+  type, the type's own name is itself a `simple_identifier' and it
+  comes first -- `for (mytype_t i_i = 0; ...)' dump-verifies to
+  `(for_variable_declaration (data_type (simple_identifier))
+  (simple_identifier) (expression ...))', so the depth-first
+  `verilog-auto--find-first-of-type' this clause used at first
+  returned `mytype_t' instead of `i_i' and the shadow was silently
+  missed (M148 trailing cold read, reproduced end to end; pinned by
+  `autounused_user_typed_for_loop_variable_shadow_is_resolved').
+  A primitive type does not expose the bug -- `int'/`logic'/`bit' put
+  an `integer_atom_type'/`integer_vector_type' inside `data_type',
+  not an identifier -- which is why every earlier for-loop test
+  passed.
+- `genvar_initialization' (`for (genvar k_i = 0; ...)' inside a
+  `generate' loop) -- `verilog-auto--genvar-initialization-declares-p'
+  (see its own docstring for why the inline-vs-reused distinction
+  needs raw child inspection). Dump-verified as a direct child of
+  `loop_generate_construct', a SIBLING of `generate_block' (the loop
+  body) -- checked at the `loop_generate_construct' ancestor.
+- `genvar_declaration' (a bare `genvar e_i;' statement, not part of a
+  `for' clause), via its own `list_of_genvar_identifiers' child's
+  `simple_identifier' children. This is a BARE direct child regardless
+  of which node happens to be its parent, so it is already picked up
+  when the parent is a `generate_block' too (M148 review round, F5: a
+  bare `genvar gj_i;' written directly inside a `for (genvar ...)
+  begin : g_loop ... end' body -- as opposed to inline in the `for'
+  header -- dump-verifies to `(generate_block name: (simple_identifier)
+  (genvar_declaration ...))', a direct child exactly like the
+  `data_declaration'/`net_declaration' cases above; confirmed by
+  running a fixture with a generate-block-body `genvar gj_i;' shadowing
+  a same-named port through `verilog-auto' end to end -- the port IS
+  listed as unused, no code change needed for this shape).
+
+Fail-safe direction: if NODE's shape does not match any of the above,
+this returns nil (not shadowed) -- keeping an occurrence counted as a
+read, rather than risking a false shadow that would silently hide a
+genuinely read port from `/*AUTOUNUSED*/' (worse than M136's original
+gap, which only ever OVER-lists, never under-lists)."
+  (let ((n (treesit-node-child-count node))
+        (found nil))
+    (dotimes (idx n)
+      (unless found
+        (let* ((child (treesit-node-child node idx))
+               (ctype (treesit-node-type child)))
+          (cond
+           ((string= ctype "data_declaration")
+            (when (verilog-auto--data-declaration-declares-p child name)
+              (setq found t)))
+           ((string= ctype "net_declaration")
+            (when (verilog-auto--net-declaration-declares-p child name)
+              (setq found t)))
+           ((string= ctype "block_item_declaration")
+            (let ((dd (verilog-auto--find-first-of-type child "data_declaration")))
+              (when (and dd (verilog-auto--data-declaration-declares-p dd name))
+                (setq found t))))
+           ((string= ctype "tf_port_list")
+            (dolist (item (verilog-auto--find-all-of-type child "tf_port_item"))
+              (let ((nm (treesit-node-child-by-field-name item "name")))
+                (when (and nm (equal (treesit-node-text nm) name))
+                  (setq found t)))))
+           ((string= ctype "for_initialization")
+            (dolist (fvd (verilog-auto--find-all-of-type child "for_variable_declaration"))
+              (let ((fvd-n (treesit-node-child-count fvd)))
+                (dotimes (fvd-i fvd-n)
+                  (let ((c (treesit-node-child fvd fvd-i)))
+                    (when (and (string= (treesit-node-type c) "simple_identifier")
+                               (equal (treesit-node-text c) name))
+                      (setq found t)))))))
+           ((string= ctype "genvar_initialization")
+            (when (verilog-auto--genvar-initialization-declares-p child name)
+              (setq found t)))
+           ((string= ctype "genvar_declaration")
+            (dolist (id (verilog-auto--find-all-of-type child "simple_identifier"))
+              (when (equal (treesit-node-text id) name)
+                (setq found t))))))))
+    found))
+
+(defun verilog-auto--identifier-shadowed-p (id name module-decl)
+  "Non-nil if ID (a `simple_identifier' node whose own text is NAME) is
+SHADOWED: some ancestor of ID, strictly below MODULE-DECL (MODULE-DECL
+itself is never checked -- a module-level declaration sharing a port's
+own name is a namespace collision the language itself rejects, not a
+shadow this file needs to resolve), directly introduces its OWN
+declaration of NAME (`verilog-auto--scope-declares-name-p'). Walks up
+via `treesit-node-parent' until MODULE-DECL is reached (exclusive) or
+there are no more parents left (defensive only: every `simple_
+identifier' this file ever looks at has a `module_declaration'/
+`interface_declaration' ancestor by construction, and this case is not
+known to occur).
+
+Scope-WIDE, not position-aware, and PER-OCCURRENCE, not per-name --
+M148 ground truth (`dev/lsp-probe.py --diagnostics' against real
+`slang-server', see the M148 record):
+
+- A sibling scope's declaration does not shadow: a port shadowed by a
+  `function' local AND genuinely read in an `always_ff' produces only
+  `shadow-value', never `unused-port' -- the `always_ff' read's own
+  ancestor chain never passes through the function, so it alone keeps
+  the whole port counted as read even though the function-local
+  occurrence is (correctly) excluded.
+- An inner scope's declaration does not shadow a read in the
+  surrounding OUTER scope: a name read in an outer named block,
+  re-declared only in a NESTED inner block under it, produces no
+  `unused-port' either -- the outer read's ancestor chain never
+  reaches the inner block.
+- No ordering check is needed: referring to a name before its own
+  declaration in the SAME scope is rejected outright by elaboration
+  (`used before its declaration', severity error) -- a file that
+  elaborates at all can never present a read that textually precedes
+  its own shadowing declaration."
+  (let ((n (treesit-node-parent id)))
+    (catch 'found
+      (while (and n (not (treesit-node-eq n module-decl)))
+        (when (verilog-auto--scope-declares-name-p n name)
+          (throw 'found t))
+        (setq n (treesit-node-parent n)))
+      nil)))
+
+(defconst verilog-auto--nested-scope-types
+  '("generate_block" "seq_block" "par_block"
+    "function_body_declaration" "task_body_declaration" "tf_port_list")
+  "Node types M149 treats as introducing a nested scope for the
+\"already declared\" question -- the dual list to `verilog-auto--
+scope-declares-name-p''s own child-shape catalogue, but framed as
+ANCESTOR types instead of direct-child shapes, because M149's question
+(\"is this DECLARATION inside a nested scope\") walks a node's own
+ancestor chain rather than a name-occurrence's. `generate_region' is
+DELIBERATELY not on this list -- a bare `generate wire done;
+endgenerate' declares `done' at module level (`fixtures/gen_bare.sv',
+M149 ground truth: slang creates no implicit net for it), while
+`generate_block' (the body of an `if'/`for'/`case' generate construct,
+present even with no `begin'/`end' -- `if (P) wire done;' still
+parses `if_generate_construct' > `generate_block' > `net_declaration',
+M149 ground truth `fixtures/gen_if_nobegin.sv') genuinely is a scope.
+Adding `generate_region' here would newly break code that works
+today; do not \"tidy it up\".
+
+`tf_port_list' is UNREACHABLE from all three of this list's current
+callers (`verilog-auto--declared-names', `--body-declared-names',
+`--reset-decl-for-name') -- kept anyway, as defensive coverage for a
+future caller. Each of those three only walks `net_decl_assignment'/
+`variable_decl_assignment' nodes; per the pinned tree-sitter-
+systemverilog grammar's own `node-types.json' (the version
+`Cargo.lock' pins), `tf_port_item' exposes its identifier ONLY through
+a direct `name' field (`simple_identifier'/`escaped_identifier'), and
+neither `net_decl_assignment' nor `variable_decl_assignment' ever
+occurs as a descendant of `tf_port_item'/`tf_port_list'. So the
+ancestor walk these three callers run can never even meet a
+`tf_port_list' ancestor -- this entry does no work for them today. It
+stays on the list for a caller that instead walks `tf_port_item'
+children directly (a wider search than these three run), so that such
+a caller would not need to rediscover this scope boundary from
+scratch.")
+
+(defun verilog-auto--module-level-node-p (node module-decl)
+  "Non-nil if NODE's own declaration counts as MODULE-LEVEL: no
+ancestor strictly between NODE and MODULE-DECL has a type in
+`verilog-auto--nested-scope-types'. The dual of `verilog-auto--
+identifier-shadowed-p': that one asks whether an OCCURRENCE (a read)
+sits inside a nested scope; this one asks whether a DECLARATION does.
+Used to narrow the \"is NAME already declared\" search in `verilog-
+auto--declared-names', `verilog-auto--body-declared-names' and
+`verilog-auto--reset-decl-for-name' to module-level declarations only
+(M149) -- without this, a same-named declaration inside a `function',
+`task', `begin'/`end' block or generate block was wrongly counted as
+already declaring the module-level signal, and the AUTO command
+emitted nothing for it (M149 ground truth: `fixtures/scope_wide.sv',
+a missing `wire [7:0] done;' silently truncates a port connection from
+8 bits to 1 under slang).
+
+Fail-safe direction is the OPPOSITE of `verilog-auto--identifier-
+shadowed-p''s: that one fails safe toward \"not shadowed\" (an
+under-recognized shadow only makes AUTOUNUSED over-list a port, never
+silently break the build). Here, either direction can break a build --
+under-declaring gives a silent 1-bit implicit net, over-declaring
+gives a hard duplicate-declaration error -- so this function fails
+safe toward \"module-level\", i.e. today's answer, whenever the walk
+cannot positively identify a nested scope: if it runs out of parents
+before reaching MODULE-DECL, it returns t rather than nil. This is a
+STRICT NARROWING of the already-declared set for positively recognised
+nested scopes only; no shape not on `verilog-auto--nested-scope-types'
+may change behaviour."
+  (let ((n (treesit-node-parent node)))
+    (catch 'done
+      (while n
+        (when (treesit-node-eq n module-decl)
+          (throw 'done t))
+        (when (member (treesit-node-type n) verilog-auto--nested-scope-types)
+          (throw 'done nil))
+        (setq n (treesit-node-parent n)))
+      ;; Ran out of parents without ever meeting MODULE-DECL -- defensive
+      ;; fail-safe, fails toward "module-level" (see docstring above).
+      t)))
+
+(defun verilog-auto--identifier-read-p (name exclude-ranges lvalue-starts all-ids module-decl)
   "Non-nil if some occurrence of NAME among ALL-IDS (every
 `simple_identifier' node anywhere in the enclosing module) counts as a
 read: its own (START . END) span is not wholly inside EXCLUDE-RANGES
@@ -5226,28 +5592,36 @@ START position, `verilog-auto--all-lvalue-driven-id-nodes' -- an
 occurrence that is ONLY ever driven, never read, must not count), it
 is not a non-root component of a dotted hierarchical reference
 (`verilog-auto--identifier-non-root-hierarchical-component-p', M136 fix
-round R3.1), and it is not a connection/parameter NAME field
-(`verilog-auto--identifier-is-connection-name-field-p', R3.2).
+round R3.1), it is not a connection/parameter NAME field
+(`verilog-auto--identifier-is-connection-name-field-p', R3.2), and it
+is not SHADOWED by an inner scope's own same-named declaration
+(`verilog-auto--identifier-shadowed-p', MODULE-DECL is ID's enclosing
+`module_declaration'/`interface_declaration', M148 fix round R3.3).
 
-KNOWN LIMITATION, not fixed (M136 fix round R3.3, documented rather
-than silently wrong): this function has no notion of LEXICAL SCOPE at
-all -- a `task'/`function' body that happens to declare its OWN local
-variable with the SAME NAME as a module-level candidate (`function
-automatic void f(); logic a_i; a_i = 1\\='b0; endfunction', shadowing a
-module-level `input logic a_i;') has that local variable's own read
-counted as a read of the OUTER port, because nothing here ever checks
-which declaration a given occurrence's name actually resolves to. A
-correct fix needs real lexical scope resolution, which this file has
-never had (every other AUTO command's own \"already declared\" checks
-are name-based lookups over declaration LISTS, never a scope walk).
-Pinned, not silently wrong: see
-`autounused_function_local_shadow_is_a_known_limitation_not_fixed' in
-verilog_auto_tests.rs."
+M148 fixed R3.3's own former known limitation: this function now has
+lexical-scope-aware shadow detection for eight dump-verified shapes --
+`function'/`task' body locals and formal arguments, named and unnamed
+`begin'/`end' blocks, a `for (int ...)' loop variable, a `for
+(genvar ...)' loop variable inside a `generate' construct, and a plain
+declaration inside a generate-block body (`verilog-auto--scope-
+declares-name-p' names each shape in its own docstring). Fail-safe
+direction is unchanged in spirit: any occurrence this scope logic
+cannot classify keeps counting as a read, never the other way, because
+a false shadow (hiding a genuinely read port from `/*AUTOUNUSED*/')
+would make the `_unused_ok' idiom assert something false -- worse than
+under-reporting.
+
+KNOWN, NARROWER LIMITATION (unchanged by M148, out of its scope): this
+function still has no name RESOLUTION for hierarchical references --
+see `verilog-auto--identifier-non-root-hierarchical-component-p''s own
+docstring for the adjacent, still-open gap where a port and a
+same-named submodule instance collide."
   (catch 'found
     (dolist (id all-ids)
       (when (and (equal (treesit-node-text id) name)
                  (not (verilog-auto--identifier-non-root-hierarchical-component-p id))
-                 (not (verilog-auto--identifier-is-connection-name-field-p id)))
+                 (not (verilog-auto--identifier-is-connection-name-field-p id))
+                 (not (verilog-auto--identifier-shadowed-p id name module-decl)))
         (let ((start (treesit-node-start id)) (end (treesit-node-end id)))
           (unless (or (verilog-auto--pos-in-ranges-p start end exclude-ranges)
                       (gethash start lvalue-starts))
@@ -5292,7 +5666,8 @@ initializer (`assign x = &{1'b0, /*AUTOUNUSED*/ 1'b0};'/`wire x = &{...};'), exp
         (dolist (c candidates)
           (let* ((nm (car c))
                  (ranges (nth 2 c)))
-            (when (and (not (verilog-auto--identifier-read-p nm ranges lvalue-starts all-ids))
+            (when (and (not (verilog-auto--identifier-read-p
+                             nm ranges lvalue-starts all-ids module-decl))
                        (or (null verilog-auto-unused-ignore-regexp)
                            (not (string-match-p verilog-auto-unused-ignore-regexp nm))))
               (push nm unread))))
