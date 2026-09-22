@@ -3396,6 +3396,26 @@ fn verilog_every_demo_rtl_file_reindents_to_its_own_on_disk_columns_except_named
             46,
             "hand-aligned commented-out code inside a block comment",
         ),
+        // M153: the same two pre-existing quirks again, for
+        // `exec_unit.sv'. The module header-line quirk (line 21, `module
+        // exec_unit #(') is the same one every other top-level module
+        // header in demo/rtl/ already hits above. Lines 55 and 75 are the
+        // interior of this file's two `AUTO_TEMPLATE' block comments
+        // (`/* regfile AUTO_TEMPLATE ( ... ); */' and `/* alu
+        // AUTO_TEMPLATE ( ... ); */') -- the identical "tree-sitter parses
+        // a block comment as ONE leaf node" limitation `sram_dual_channel.
+        // sv' lines 42-46 above already document, not a new defect.
+        ("rtl/core/exec_unit.sv", 21, "module header-line quirk"),
+        (
+            "rtl/core/exec_unit.sv",
+            55,
+            "hand-aligned commented-out code inside a block comment",
+        ),
+        (
+            "rtl/core/exec_unit.sv",
+            75,
+            "hand-aligned commented-out code inside a block comment",
+        ),
     ];
 
     let mut mismatches: Vec<(String, usize, usize, String, String)> = Vec::new();

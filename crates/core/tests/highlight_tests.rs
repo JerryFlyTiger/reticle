@@ -1688,3 +1688,151 @@ fn verilog_keyword_sweep_covers_every_reserved_word_leaf() {
         failures.join("\n")
     );
 }
+
+// ============================================================
+// M151: a guard against the fixed ~2s `tick_until` shape creeping back
+// into any test file. That shape (`for _ in 0..200` with a fixed
+// per-iteration sleep, no wall-clock deadline) is what M151 replaced in
+// five files after it reproduced 3/3 rounds under load (30 `yes`
+// burners, load ~8): `scope_header_tests` 21/24 red,
+// `font_lock_philosophy_tests` 1/9 red, every failure at a `tick_until`
+// assertion. This test reads every `tick_until` helper's own body and
+// fails loudly, naming file and line, if it finds the old fixed-count
+// loop, a `for`/`while` loop of any shape, or is missing a real
+// `Instant::now() >= deadline`-style comparison against the clock. It
+// only scans `crates/core/tests/` (this crate's own test directory, via
+// `CARGO_MANIFEST_DIR`), not every test file in the workspace, and it
+// only covers helpers literally named `tick_until`; inline polling
+// loops with the same shape (e.g. the reparse-heal loop in
+// `show_paren_tests.rs`) are not scanned by this guard.
+#[test]
+fn guard_every_tick_until_polls_under_a_ceiling() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "guard_every_tick_until_polls_under_a_ceiling: could not read \
+             its own target directory {:?}: {}",
+            dir, e
+        )
+    });
+
+    let mut rs_files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| {
+            panic!(
+                "guard_every_tick_until_polls_under_a_ceiling: could not \
+                 read a directory entry: {}",
+                e
+            )
+        });
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            rs_files.push(path);
+        }
+    }
+
+    // M114 self-check floor: a mechanism that decides what to check must
+    // fail loudly if it ends up checking (almost) nothing.
+    assert!(
+        rs_files.len() >= 50,
+        "guard lost its target: only {} .rs files found under {:?}, \
+         expected at least 50",
+        rs_files.len(),
+        dir
+    );
+
+    // Built from parts at runtime, not spelled as one literal, so this
+    // guard's own source is never itself a hit (same idiom as
+    // `guard_no_long_thread_sleeps_in_this_file` in
+    // `lsp_autostart_tests.rs`).
+    let fn_marker: String = ["fn ", "tick_until"].concat();
+    let fixed_loop_marker: String = ["for _ in 0", ".."].concat();
+    let deadline_marker: String = ["Instant::", "now()", " >="].concat();
+    let for_marker = "for ";
+    let while_marker = "while ";
+
+    let mut definitions_found = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+
+    for path in &rs_files {
+        let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "guard_every_tick_until_polls_under_a_ceiling: could not \
+                 read {:?}: {}",
+                path, e
+            )
+        });
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with(&fn_marker) || trimmed.contains(&fn_marker)) {
+                continue;
+            }
+            // Only a genuine definition, not e.g. a call site or a
+            // doc-comment mention.
+            if !trimmed.starts_with(&fn_marker) {
+                continue;
+            }
+            definitions_found += 1;
+            let start = idx;
+            // A top-level `fn`'s body ends at the first following line
+            // that is EXACTLY "}" at column 0 (no trimming) -- a bare
+            // `}` that closes an inner block, like the `if run(...) ==
+            // "t" { return true; }` inside `tick_until`, is indented and
+            // does not match. If none is found, that is itself a
+            // violation, not a silent fall-through to end-of-file.
+            let mut end: Option<usize> = None;
+            for (j, body_line) in lines.iter().enumerate().skip(start + 1) {
+                if *body_line == "}" {
+                    end = Some(j);
+                    break;
+                }
+            }
+            let end = match end {
+                Some(e) => e,
+                None => {
+                    violations.push(format!(
+                        "{:?}:{} -- could not find this fn's closing brace \
+                         (a top-level \"}}\" at column 0)",
+                        path,
+                        idx + 1
+                    ));
+                    continue;
+                }
+            };
+            let body = lines[start..=end].join("\n");
+            let has_fixed_loop = body.contains(&fixed_loop_marker);
+            let has_deadline = body.contains(&deadline_marker);
+            let has_bad_loop = body.lines().any(|l| {
+                let t = l.trim_start();
+                t.starts_with(for_marker) || t.starts_with(while_marker)
+            });
+            if has_fixed_loop || has_bad_loop || !has_deadline {
+                violations.push(format!(
+                    "{:?}:{} -- fixed_loop={} bad_loop={} has_deadline={}",
+                    path,
+                    idx + 1,
+                    has_fixed_loop,
+                    has_bad_loop,
+                    has_deadline
+                ));
+            }
+        }
+    }
+
+    assert!(
+        definitions_found >= 6,
+        "guard lost its target: only found {} `fn tick_until` \
+         definitions across {} file(s), expected at least 6",
+        definitions_found,
+        rs_files.len()
+    );
+
+    assert!(
+        violations.is_empty(),
+        "found {} `tick_until` helper(s) with a fixed loop count and/or \
+         no wall-clock deadline (M151's regression shape):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}

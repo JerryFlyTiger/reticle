@@ -54,18 +54,23 @@ fn run(interp: &mut Interp, src: &str) -> String {
     }
 }
 
-/// Pump ticks (10ms apart, max 2s) until `pred` returns "t" -- identical
+/// Pump ticks until `pred` returns "t", bounded by a 30s hang-guard
+/// deadline rather than a fixed loop count (M151; see
+/// `highlight_tests.rs`'s helper for the full rationale) -- identical
 /// contract to `rainbow_delimiters_tests.rs`'s own helper of the same
 /// name.
 fn tick_until(interp: &mut Interp, pred: &str) -> bool {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         core::idle_tick(interp, std::time::Duration::ZERO);
         if run(interp, pred) == "t" {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    false
 }
 
 const COUNT_HL: &str = "(let ((n 0))
@@ -376,13 +381,17 @@ fn stale_cache_after_an_edit_elsewhere_yields_no_highlight_until_reparse_lands()
     // without ever actually waiting for a NEW parse generation. Poll
     // the highlight itself instead.
     let mut healed = false;
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         core::idle_tick(&mut i, std::time::Duration::ZERO);
         if bg_at(&i, &ed, r_open, c_open) == Some(DRACULA_SHOW_PAREN_MATCH) {
             healed = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
     assert!(
         healed,

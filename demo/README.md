@@ -233,7 +233,7 @@ Verified on macOS (arm64) when this directory was written:
   `/*AUTOUNUSED*/` block and `LSP: autostarted slang-server`. **What has not
   been exercised: pressing the keys.** The `C-c C-a` / `C-c C-k` round trip is
   covered by the test suite, not by this script.
-- `./tools/lint_rtl.sh` — **all three checks pass** across all 22 Verilog
+- `./tools/lint_rtl.sh` — **all three checks pass** across all 23 Verilog
   and SystemVerilog files (`verible-verilog-syntax`, `-lint`, `-format
   --verify`).
 - `./tools/run_sim.sh` — **all four simulations actually run and pass**:
@@ -264,7 +264,7 @@ no test in this repo re-runs them.
 
 And, driving the editor itself rather than the external toolchains:
 
-- **All 39 files open in the correct major mode** — 33 in a
+- **All 40 files open in the correct major mode** — 34 in a
   language-specific mode (`verilog-mode`, `rust-mode`, `c-mode`,
   `c++-mode`, `python-mode`, `perl-mode`, `sh-mode`, `java-mode`,
   `emacs-lisp-mode`, `org-mode`) and 6 in `fundamental-mode`
@@ -276,17 +276,19 @@ And, driving the editor itself rather than the external toolchains:
   `rtl/mem/sram_dual_channel.sv` added the same way. M143:
   `rtl/mem/sram_bank_4k.sv` added the same way — a parameter-fixing
   wrapper that instantiates `sram_bank` with a `.*` wildcard port
-  connection, dump-verified to open in `verilog-mode`.)
+  connection, dump-verified to open in `verilog-mode`. M153:
+  `rtl/core/exec_unit.sv` added the same way.)
 - From `rtl/top/soc_top.sv`, **`M-.` on `alu` lands in
   `rtl/core/alu.sv`** and port completion engages inside `u_regfile`'s
   port list — the two table rows above are measured, not asserted.
-- That file sees **11 library files** even though `rtl/top/` contains
-  only `soc_top.sv` itself: all eleven arrive via `rtl/verible.filelist`
-  (measured 2026-09-17 by counting that file's non-comment,
-  non-`+incdir+` lines excluding `top/soc_top.sv` itself — M143 added
-  `mem/sram_bank_4k.sv` to the list, and the sentence had already drifted
-  to "nine" before that: the true count was ten).
-- Open any of the 21 files under `rtl/`, `rtl-verilog2001/` and
+- That file sees **12 library files** even though `rtl/top/` contains
+  only `soc_top.sv` itself: all twelve arrive via `rtl/verible.filelist`
+  (measured 2026-09-22 by counting that file's non-comment,
+  non-`+incdir+` lines excluding `top/soc_top.sv` itself — M153 added
+  `core/exec_unit.sv` to the list, bringing eleven up to twelve; M143 had
+  added `mem/sram_bank_4k.sv` before that, and the sentence had already
+  drifted to "nine" earlier still: the true count then was ten).
+- Open any of the 22 files under `rtl/`, `rtl-verilog2001/` and
   `verif/` that have enough indented lines to go on, and the editor's
   indent step
   **follows that file's own 2-space style** instead of `verilog-mode`'s
@@ -329,7 +331,7 @@ And, driving the editor itself rather than the external toolchains:
 
 The four editor claims above, plus the `C-c C-a` / `C-c C-k` rows of
 the keybinding table, are the ones a test now re-checks on every run:
-`crates/core/tests/demo_smoke_tests.rs`. The "11 library files" count is
+`crates/core/tests/demo_smoke_tests.rs`. The "12 library files" count is
 not asserted directly — the cross-file jump and completion tests only
 prove that resolution reaches other directories at all. Add or remove a
 file under `demo/` and that test fails until its expected-mode table and
@@ -367,7 +369,8 @@ supplies the `reg` declaration that used to be hand-written. The same
 `PASS: gray_ctr WIDTH=4` and `PASS: fifo_gray_top 8 x 32, GRAY_WIDTH=4`
 lines above were re-observed after that change (`./tools/run_sim.sh`),
 and `./tools/lint_rtl.sh` re-run clean across all 22 files (M143 added a
-22nd, `rtl/mem/sram_bank_4k.sv`). `rtl/core/
+22nd, `rtl/mem/sram_bank_4k.sv`; M153 later added a 23rd,
+`rtl/core/exec_unit.sv`, see below). `rtl/core/
 status_regs_stub.sv` is new material for `/*AUTOTIEOFF*/` on a real ANSI
 SystemVerilog module (a bring-up stub whose outputs are declared but not
 yet driven, ordinary early-stage RTL practice) — lint/format-clean under
@@ -414,6 +417,39 @@ what the design contains; dump-verified with `./tools/lint_rtl.sh`
 (syntax/lint/format, zero waivers). Like `status_regs_stub.sv`, it is
 deliberately not instantiated anywhere — it exists as material, not
 integration.
+
+M153 added `rtl/core/exec_unit.sv`: the first demo file to show
+AUTOINPUT/AUTOOUTPUT (M150) and AUTOWIRE (M152) together. `op_i` (typed
+`soc_pkg::alu_op_e`) is hand-written; every other port on `exec_unit`'s
+own header comes from AUTOINPUT/AUTOOUTPUT reading its two sub-instances
+(`u_regfile`, `u_alu`) — notice both "Beginning of automatic" banners
+sit *inside* the `)(` port-list parentheses, not after them, which is
+what M150 added. The body `/*AUTOWIRE*/` declares the two internal
+`operand_a`/`operand_b` wires the AUTO_TEMPLATEs route between the two
+sub-instances, each carrying a bit/part-select (`operand_\1[]`) rather
+than a bare connection — the shape M152 fixed (before it, AUTOWIRE
+silently declared nothing here and the generated Verilog didn't
+compile). Checked against real GNU Emacs 30.2 (verible-formatted both
+sides) with two accepted, measured differences, neither a reticle
+defect: AUTOWIRE here emits `wire` where GNU emits `logic` (reticle's
+own AUTOWIRE has always emitted `wire`, pinned by existing
+`verilog_auto_tests.rs` cases, and a net driven by a sub-instance output
+is legal as either keyword); and `op_i` sits under `// Inputs` in
+reticle's AUTOINST versus `// Interfaces` under GNU — reticle is right
+on the semantics (`op_i` is an ordinary input, not an SV `interface`
+port; GNU's own "Interfaces" bucket also catches package-typed ports, a
+GNU quirk this project chose not to copy). Separately measured: reticle's
+own AUTOINPUT *does* propagate a package-scoped enum port like `op_i` if
+it is deleted and regenerated (GNU's never does) — kept hand-written
+anyway so the file expands identically under either implementation.
+Same pinning discipline as the other AUTO demo files:
+`demo_rtl_exec_unit_port_list_auto_matches_editor_output` in
+`crates/core/tests/demo_smoke_tests.rs` runs delete-auto → verilog-auto →
+format-buffer and asserts byte-equality with what is on disk, plus that
+both banners land before the header's closing `);`. Checked by slang
+(`dev/lsp-probe.py --diagnostics`) with zero diagnostics of any severity.
+It is deliberately not instantiated anywhere in `rtl/top/soc_top.sv`,
+for the same reason `sram_dual_channel.sv` and `sram_bank_4k.sv` aren't.
 
 ### Checked by Verible, never simulated
 

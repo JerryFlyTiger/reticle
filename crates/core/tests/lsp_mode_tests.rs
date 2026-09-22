@@ -907,7 +907,7 @@ fn project_root_for_command_workspace_style_leaves_a_non_verilog_file_alone() {
 #[test]
 fn filelist_component_root_of_demo_verif_is_the_demo_directory() {
     // Real repo material (CLAUDE.md: use what's here, don't fabricate).
-    // `demo/rtl/verible.filelist' (11 paths) and `demo/verif/verible.
+    // `demo/rtl/verible.filelist' (13 paths) and `demo/verif/verible.
     // filelist' (8 paths, 5 shared with `demo/rtl') share files ->
     // one component -> smallest covering directory is `demo' itself.
     let mut i = setup();
@@ -2033,8 +2033,12 @@ fn definition_at_point_round_trips_through_a_real_cat_subprocess() {
         "1"
     );
 
+    // M151: a wall-clock deadline, not a latency budget -- this only
+    // bounds how long we wait for a hang, it is not asserting how fast
+    // delivery should be.
     let mut delivered = false;
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         let r = run(&mut i, "(lsp-process-pending test--client)");
         assert!(
             !r.starts_with("ERROR"),
@@ -2043,6 +2047,9 @@ fn definition_at_point_round_trips_through_a_real_cat_subprocess() {
         );
         if run(&mut i, "(length (lsp--client-callbacks test--client))") == "0" {
             delivered = true;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

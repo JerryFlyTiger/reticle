@@ -9,6 +9,7 @@
 pkg/soc_pkg.sv
 core/alu.sv
 core/regfile.sv
+core/exec_unit.sv
 core/clk_gate.sv
 core/status_regs_stub.sv
 mem/sram_wrapper.sv

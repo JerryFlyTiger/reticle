@@ -20,9 +20,9 @@
 //!   child exits and closes its end) doesn't hang or panic the writer
 //!   thread on EPIPE.
 //!
-//! All polling loops are bounded (a fixed retry count with a short sleep
-//! between attempts) rather than infinite, per project convention: a
-//! hung test should fail loudly, not hang the test binary.
+//! All polling loops are bounded (a 30s wall-clock deadline with a short
+//! sleep between attempts, M151) rather than infinite, per project
+//! convention: a hung test should fail loudly, not hang the test binary.
 
 use elisp::interp::Interp;
 use elisp::printer::prin1_to_string;
@@ -76,14 +76,16 @@ fn eval_str(interp: &mut Interp, src: &str) -> String {
     prin1_to_string(interp, &v)
 }
 
-/// Poll `(shell-process-poll proc)` up to `max_polls` times (sleeping
-/// briefly between attempts), returning every printed result seen
-/// (skipping bare "nil"s) plus the loop's own diagnostic on timeout.
-/// Bounded so a regression that hangs the process shows up as a test
-/// failure, not a wedged test binary.
-fn poll_until_exit(interp: &mut Interp, max_polls: u32) -> Vec<String> {
+/// Poll `(shell-process-poll proc)` against a wall-clock deadline
+/// (sleeping briefly between attempts), returning every printed result
+/// seen (skipping bare "nil"s) plus the loop's own diagnostic on
+/// timeout. Bounded so a regression that hangs the process shows up as
+/// a test failure, not a wedged test binary. M151: a 30s hang guard,
+/// not a latency budget -- was previously a fixed poll count.
+fn poll_until_exit(interp: &mut Interp) -> Vec<String> {
     let mut results = Vec::new();
-    for _ in 0..max_polls {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
         let s = eval_str(interp, "(shell-process-poll proc)");
         if s != "nil" {
             let is_exit = s.starts_with("(exit .");
@@ -92,11 +94,14 @@ fn poll_until_exit(interp: &mut Interp, max_polls: u32) -> Vec<String> {
                 return results;
             }
         }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!(
-        "shell-process-poll did not report exit within {} polls; results so far: {:?}",
-        max_polls, results
+        "shell-process-poll did not report exit within the poll budget; results so far: {:?}",
+        results
     );
 }
 
@@ -108,7 +113,7 @@ fn poll_until_exit(interp: &mut Interp, max_polls: u32) -> Vec<String> {
 fn start_shell_process_two_args_unchanged() {
     with_interp(|i| {
         eval(i, r#"(setq proc (start-shell-process "echo hi" "."))"#);
-        let results = poll_until_exit(i, 200);
+        let results = poll_until_exit(i);
         // Bare string, not a cons -- merged mode is still the default
         // and still returns raw strings, exactly as before M79.
         assert_eq!(
@@ -126,7 +131,7 @@ fn start_shell_process_two_args_unchanged() {
 fn stdin_string_is_delivered() {
     with_interp(|i| {
         eval(i, r#"(setq proc (start-shell-process "cat" "." "hello"))"#);
-        let results = poll_until_exit(i, 200);
+        let results = poll_until_exit(i);
         assert_eq!(
             results,
             vec!["\"hello\"".to_string(), "(exit . 0)".to_string()]
@@ -138,7 +143,7 @@ fn stdin_string_is_delivered() {
 fn stdin_nil_still_means_eof() {
     with_interp(|i| {
         eval(i, r#"(setq proc (start-shell-process "cat" "." nil))"#);
-        let results = poll_until_exit(i, 200);
+        let results = poll_until_exit(i);
         // No output chunk at all: cat on a closed stdin produces
         // nothing before exiting, same as the pre-M79 Stdio::null().
         assert_eq!(results, vec!["(exit . 0)".to_string()]);
@@ -178,7 +183,11 @@ fn large_stdin_payload_round_trips_intact() {
         let start = std::time::Instant::now();
         let mut got = String::new();
         let mut saw_exit = false;
-        for _ in 0..1000 {
+        // M151: a wall-clock deadline, not a latency budget -- this only
+        // bounds how long we wait for a hang; the real latency check is
+        // the `start.elapsed() < 10s` assertion below.
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             let v = eval(i, "(shell-process-poll proc)");
             match &v {
                 Value::Str(s) => got.push_str(s),
@@ -197,6 +206,9 @@ fn large_stdin_payload_round_trips_intact() {
                     break;
                 }
                 _ => {}
+            }
+            if std::time::Instant::now() >= poll_deadline {
+                break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -227,7 +239,9 @@ fn separate_mode_splits_stdout_and_stderr() {
         let mut stdout_acc = String::new();
         let mut stderr_acc = String::new();
         let mut saw_exit = false;
-        for _ in 0..200 {
+        // M151: a 30 s hang guard, not a latency budget (was 200 x 20 ms).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
             let v = eval(i, "(shell-process-poll proc)");
             match &v {
                 Value::Nil => {}
@@ -252,6 +266,9 @@ fn separate_mode_splits_stdout_and_stderr() {
                     "unexpected non-cons, non-nil poll result: {}",
                     prin1_to_string(i, other)
                 ),
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -284,9 +301,9 @@ fn merged_default_and_explicit_merged_symbol_agree() {
             r#"(setq proc2 (start-shell-process "echo hi" "." nil 'merged))"#,
         );
         eval(i, "(setq proc proc1)");
-        let default_results = poll_until_exit(i, 200);
+        let default_results = poll_until_exit(i);
         eval(i, "(setq proc proc2)");
-        let explicit_results = poll_until_exit(i, 200);
+        let explicit_results = poll_until_exit(i);
         assert_eq!(default_results, explicit_results);
         assert_eq!(
             default_results,
@@ -493,7 +510,7 @@ fn invalid_streams_value_errors() {
 fn nonzero_exit_code_is_reported() {
     with_interp(|i| {
         eval(i, r#"(setq proc (start-shell-process "exit 3" "."))"#);
-        let results = poll_until_exit(i, 200);
+        let results = poll_until_exit(i);
         assert_eq!(results, vec!["(exit . 3)".to_string()]);
     });
 }
@@ -522,7 +539,7 @@ fn stdin_given_but_unread_does_not_hang_or_panic() {
             i,
             r#"(setq proc (start-shell-process "true" "." test-payload))"#,
         );
-        let results = poll_until_exit(i, 200);
+        let results = poll_until_exit(i);
         assert_eq!(results, vec!["(exit . 0)".to_string()]);
     });
 }
@@ -542,7 +559,7 @@ fn stdin_given_but_unread_does_not_hang_or_panic() {
 fn exit_reported_exactly_once() {
     with_interp(|i| {
         eval(i, r#"(setq proc (start-shell-process "exit 3" "."))"#);
-        let first = poll_until_exit(i, 200);
+        let first = poll_until_exit(i);
         assert_eq!(first, vec!["(exit . 3)".to_string()]);
         // Poll several more times: no second exit event, no panic, and
         // every result is plain nil.

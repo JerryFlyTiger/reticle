@@ -41,16 +41,21 @@ fn run(interp: &mut Interp, src: &str) -> String {
     }
 }
 
-/// Same contract as `show_paren_tests.rs`'s helper of the same name.
+/// Same contract as `show_paren_tests.rs`'s helper of the same name:
+/// polls to a 30s hang-guard deadline, not a fixed loop count (M151;
+/// see `highlight_tests.rs`'s helper for the full rationale).
 fn tick_until(interp: &mut Interp, pred: &str) -> bool {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         core::idle_tick(interp, std::time::Duration::ZERO);
         if run(interp, pred) == "t" {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    false
 }
 
 const COUNT_HL: &str = "(let ((n 0))

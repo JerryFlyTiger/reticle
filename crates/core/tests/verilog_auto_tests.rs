@@ -167,6 +167,28 @@ fn port_decl(
     module: &str,
     ellipsis: bool,
 ) -> String {
+    port_decl_term(
+        indent, decl_kw, ty, range, name, ";", verb, inst, module, ellipsis,
+    )
+}
+
+/// Like `port_decl`, but with an explicit terminator (M150 part 2's
+/// comma-form uses `,`/`""` instead of the module-body `;`) -- `port_decl`
+/// itself delegates here with `";"` so every existing caller stays
+/// byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn port_decl_term(
+    indent: &str,
+    decl_kw: &str,
+    ty: Option<&str>,
+    range: Option<&str>,
+    name: &str,
+    term: &str,
+    verb: &str,
+    inst: &str,
+    module: &str,
+    ellipsis: bool,
+) -> String {
     let mut body = format!("{} ", decl_kw);
     if let Some(t) = ty {
         body.push_str(t);
@@ -177,7 +199,7 @@ fn port_decl(
         body.push(' ');
     }
     body.push_str(name);
-    body.push(';');
+    body.push_str(term);
     let comment = format!(
         "// {} {} of {}{}",
         verb,
@@ -482,17 +504,434 @@ fn autowire_input_only_module_produces_no_wire() {
 }
 
 #[test]
-fn autowire_skips_non_bare_connection() {
+fn autowire_composite_connections_still_produce_nothing() {
+    // M152 rewrite: the old name of this test ("skips_non_bare_connection")
+    // used a fixture where `bus' was already declared, so it passed whether
+    // or not AUTOWIRE actually filtered anything -- see this file's M152
+    // header for the real defect that hid behind it. A bit-select
+    // connection is no longer "non-bare" as of M152 (see
+    // `autowire_bit_select_declares_one_bit_range' below); what's still
+    // true, matching real GNU (`dev/gnu-auto/run.sh wire_concat.v' /
+    // `wire_const.v', M152 measurement), is that a CONCATENATION and a
+    // CONSTANT connection contribute nothing at all.
     let (mut i, _ed) = setup();
     insert_src(
         &mut i,
-        "module sub_mod (\n  output logic [3:0] count\n);\nendmodule\n\nmodule top;\n  wire [7:0] bus;\n  /*AUTOWIRE*/\n  sub_mod u1 (.count(bus[3:0]));\nendmodule\n",
+        "module sub_two (\n  output logic out0,\n  output logic out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_two u1 (.out0({my_concat_a, my_concat_b}), .out1(8'h0));\nendmodule\n",
     );
     verilog_auto(&mut i);
     let text = bs(&mut i);
     assert!(
-        text.contains("/*AUTOWIRE*/\n  sub_mod"),
-        "a non-bare connection target must not synthesize a wire: {}",
+        text.contains("/*AUTOWIRE*/\n  sub_two"),
+        "a concatenation and a constant connection must not synthesize a wire: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_narrower_part_select_uses_connections_own_width() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_narrow2.v', M152):
+    // `.dout (my_narrow[3:0])' on a `[7:0]' sub port -> `wire [3:0] my_narrow;'
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic [7:0] dout\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_mod u1 (.dout(narrow[3:0]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [3:0] narrow;"),
+        "the connection's own [3:0] must win over the sub port's declared [7:0]: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_bit_select_declares_one_bit_range() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_bit2.v', M152):
+    // `.dout (my_bit[2])' -> `wire [2:2] my_bit;'
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic [7:0] dout\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_mod u1 (.dout(bitsel[2]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [2:2] bitsel;"),
+        "a single bit-select must widen to a one-bit range, matching GNU: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_two_bit_selects_of_same_signal() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_twobits2.v', M152):
+    // `.out0(bus[0])' + `.out1(bus[1])' on ONE instance -> `wire [1:0] bus;'
+    // (a single merged declaration, not a first-range-wins dedup to
+    // `[0:0]' -- see `verilog-auto--union-select-ranges''s own header for
+    // the general merge rule this now goes through).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two (\n  output logic out0,\n  output logic out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_two u1 (.out0(bus[0]), .out1(bus[1]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [1:0] bus;"),
+        "two literal bit-selects of the same name must merge into one range: {}",
+        text
+    );
+    assert_eq!(
+        text.matches("wire [").count(),
+        1,
+        "must be exactly one wire declaration, not two: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_partselect_and_bitselect_from_two_ports() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_mixed_part_bit.v', M152):
+    // `.wide(bus[7:4])' + `.narrow(bus[0])' on ONE instance -> `wire [7:0]
+    // bus;' (union of the two selects' own bounds, not first-seen `[7:4]').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_four (\n  input clk,\n  output [7:0] wide,\n  output narrow\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_four u_sub (.wide(bus[7:4]), .narrow(bus[0]), .clk(clk));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [7:0] bus;"),
+        "a part-select and a bit-select of the same name must union to [7:0]: {}",
+        text
+    );
+    assert_eq!(
+        text.matches("wire [").count(),
+        1,
+        "one declaration: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_two_partselects_of_same_signal() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_two_partselects.v', M152):
+    // `.o0(bus[3:0])' + `.o1(bus[7:4])' -> `wire [7:0] bus;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out u_sub (.o0(bus[3:0]), .o1(bus[7:4]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [7:0] bus;"),
+        "two part-selects of the same name must union to [7:0]: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_bare_connection_and_bit_select() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_bare_and_bit.v', M152):
+    // `.out0(bus)' (bare) + `.out1(bus[1])' -> `wire [1:1] bus;' -- the
+    // bare connection's own submodule width contributes NOTHING to the
+    // range, the bit-select wins outright (also measured with an 8-bit
+    // bare port instead of a 1-bit one, same result: `[9:9]', not
+    // `[9:0]').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two (\n  input clk,\n  output out0,\n  output out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_two u_sub (.out0(bus), .out1(bus[1]), .clk(clk));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [1:1] bus;"),
+        "a bare connection must not widen the bit-select's own range: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_bare_wide_connection_contributes_nothing_to_width() {
+    // GNU measured (fix round 2, M152 cold review): `sub_bare_wide (output
+    // [7:0] out0, output out1)' with `.out0(bus)' (bare, WIDE) + `.out1
+    // (bus[9])' -> `wire [9:9] bus;', not `[9:0]' -- an 8-bit BARE
+    // connection contributes NOTHING to the width, same as the already-
+    // covered 1-bit bare case above, just with a wider submodule port to
+    // make sure the width isn't sneaking in through the bare side.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_bare_wide (\n  output [7:0] out0,\n  output out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_bare_wide u_sub (.out0(bus), .out1(bus[9]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [9:9] bus;"),
+        "a WIDE bare connection must not widen the bit-select's own range: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_bitselect_then_partselect() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_bit_then_part.v', M152):
+    // `.out0(bus[0])' + `.out1(bus[3:0])' -> `wire [3:0] bus;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two2 (\n  output out0,\n  output [3:0] out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_two2 u_sub (.out0(bus[0]), .out1(bus[3:0]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [3:0] bus;"),
+        "a bit-select and a wider part-select must union to the wider one: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_merges_identical_partselects() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_identical_partselects.v',
+    // M152): `.o0(bus[3:0])' + `.o1(bus[3:0])' -> `wire [3:0] bus;', not a
+    // conflict.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out u_sub (.o0(bus[3:0]), .o1(bus[3:0]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [3:0] bus;"),
+        "two identical part-selects must not become a conflict: {}",
+        text
+    );
+    assert!(
+        !msg.contains("conflicting widths"),
+        "identical selects are not a conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_preserves_singleton_ascending_select() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_ascending.v', M152):
+    // `.dout(bus[0:3])' alone -> `wire [0:3] bus;', never renormalized to
+    // `[3:0]' -- a SINGLE contributing select is never run through the
+    // union/merge step at all.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out8 (\n  output [7:0] dout\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out8 u_sub (.dout(bus[0:3]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [0:3] bus;"),
+        "a lone ascending select must stay as written: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_singleton_select_is_not_reported_as_a_conflict() {
+    // Companion to `autowire_preserves_singleton_ascending_select' above
+    // (fix round 2, M152 cold review point 3): a single, unmerged select
+    // must never be pushed onto `verilog-auto--port-range-conflicts', not
+    // just leave the right text in the buffer. That variable is let-bound
+    // fresh inside `verilog-auto' itself and reset before the call
+    // returns (see `verilog-auto''s own `let'), so it cannot be inspected
+    // from outside after the call -- the ECHOED message is the only
+    // externally observable trace of it, which is what this test reads.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out8 (\n  output [7:0] dout\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out8 u_sub (.dout(bus[0:3]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    assert!(
+        !msg.contains("conflicting widths"),
+        "a lone select must not be reported as a width conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_merges_two_ascending_selects_ascending() {
+    // GNU measured (fix round 2, M152 cold review, `dev/gnu-auto/run.sh
+    // wire_asc_asc_mix.v' fixture shape): `.o0(bus[0:3])' + `.o1(bus[4:7])'
+    // (both ascending). Real GNU's `verilog-signals-combine-bus' produces
+    // `wire [4:3] bus;' here (max of the first bounds, min of the second
+    // bounds, regardless of direction) -- backwards and disjoint from
+    // both inputs, not usable. Reticle DELIBERATELY diverges: every
+    // select ascending -> ascending union `[MIN:MAX]' = `[0:7]'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out u_sub (.o0(bus[0:3]), .o1(bus[4:7]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [0:7] bus;"),
+        "two ascending selects must union ascending, not GNU's own [4:3]: {}",
+        text
+    );
+    assert!(
+        !msg.contains("conflicting widths"),
+        "a computable ascending union is not a conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_merges_two_ascending_selects_identical() {
+    // GNU measured (fix round 2, M152 cold review, `wire_asc_identical.v'
+    // fixture shape): `.o0(bus[0:3])' + `.o1(bus[0:3])' (both ascending,
+    // identical) -> real GNU's own `wire [0:3] bus;'. This is the one
+    // ascending row where GNU's formula and reticle's `[MIN:MAX]' rule
+    // happen to agree.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out u_sub (.o0(bus[0:3]), .o1(bus[0:3]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [0:3] bus;"),
+        "two identical ascending selects must union to [0:3], not flip descending: {}",
+        text
+    );
+    assert!(
+        !msg.contains("conflicting widths"),
+        "an identical-ascending union is not a conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_reports_conflict_for_ascending_mixed_with_descending_select() {
+    // GNU measured (fix round 2, M152 cold review, `wire_asc_desc_mix.v'
+    // fixture shape): `.o0(bus[0:3])' (ascending) + `.o1(bus[7:4])'
+    // (descending). Real GNU's own `verilog-signals-combine-bus' produces
+    // `wire [7:3] bus;' here -- not disjoint-looking like the pure-
+    // ascending case, but not a principled merge of an ascending and a
+    // descending selection of the same bus either (the ascending-only
+    // measurement above shows the same formula cannot be trusted once
+    // ascending selects are involved). Reticle DELIBERATELY diverges:
+    // one ascending and one descending select of the same name cannot be
+    // merged, first-seen wins (`[0:3]') and the name is reported as a
+    // width conflict, the same path the symbolic-mixed case already
+    // takes.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_out u_sub (.o0(bus[0:3]), .o1(bus[7:4]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [0:3] bus;"),
+        "a mixed-direction union falls back to the first-seen select, not GNU's own [7:3]: {}",
+        text
+    );
+    assert!(
+        msg.contains("conflicting widths") && msg.contains("bus"),
+        "an ascending select mixed with a descending one must be reported as a conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_reports_conflict_for_symbolic_mixed_with_numeric_select() {
+    // GNU measured (`dev/gnu-auto/run.sh wire_symbolic_mixed_part.v',
+    // M152): `.out0(bus[i])' + `.out1(bus[3:0])' cannot be unioned (`i' is
+    // not a plain decimal literal) -- GNU keeps the FIRST connection's own
+    // select verbatim (`[i]') with a `, Couldn't Merge' provenance suffix
+    // this codebase does not reproduce (AUTOWIRE carries no provenance
+    // comment at all, pre-M152). Reticle's own first-seen text is `[i:i]'
+    // (the existing widening a solitary symbolic bit-select already gets,
+    // `verilog-auto--connection-own-range''s own documented gap) --
+    // what THIS test pins is that the conflict is reported at all, not
+    // silently narrowed to `bus[i]' the way it would be if `bus[3:0]'
+    // were simply dropped.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two3 (\n  output out0,\n  output [3:0] out1\n);\nendmodule\n\nmodule top;\n  /*AUTOWIRE*/\n  sub_two3 u_sub (.out0(bus[i]), .out1(bus[3:0]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [i:i] bus;"),
+        "unmergeable selects fall back to the first-seen one: {}",
+        text
+    );
+    assert!(
+        msg.contains("conflicting widths") && msg.contains("bus"),
+        "a symbolic bound mixed with a literal one must be reported, not silently narrowed: {}",
+        msg
+    );
+}
+
+#[test]
+fn autowire_connections_own_range_is_not_param_substituted() {
+    // M152 measurement (`dev/gnu-auto/run.sh wire_param2.v' with
+    // `verilog-auto-inst-param-value' both off and on): GNU's own AUTOINST
+    // only substitutes an instance's parameter override into a `[]'
+    // template token when that knob is explicitly turned on (it defaults
+    // off), and this codebase's AUTOINST does not perform that
+    // substitution at all -- confirmed directly against this build: a
+    // `#(.W(8))' override on a `.dout (my_pout[])' template still expands
+    // to the SYMBOLIC `my_pout[W-1:0]', never `my_pout[7:0]'. So the
+    // connection's own range, once AUTOWIRE reads it back off the
+    // (symbolic) expanded connection, is verbatim `[W-1:0]' -- distinct
+    // from the OTHER, pre-existing param-substitution path this file
+    // already pins (`autoinst_param_override_substitutes_range_word_
+    // boundary_and_no_override_keeps_symbol'), which only ever applies to
+    // a BARE connection's fallback to the submodule's own declared range.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_param #(parameter W = 1) (\n  input  logic clk,\n  output logic [W-1:0] dout\n);\nendmodule\n\n/* sub_param AUTO_TEMPLATE (\n  .dout (my_pout[]),\n  ); */\nmodule top;\n  wire clk;\n  sub_param #(.W(8)) u1 (/*AUTOINST*/);\n  /*AUTOWIRE*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [W-1:0] my_pout;"),
+        "the connection's own (unsubstituted) range must be used verbatim: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_declares_wire_for_template_generated_part_select() {
+    // The M152 repro shape itself: `/* regfile AUTO_TEMPLATE (
+    // .rdata_\(.\)_o (operand_\1[]), ); */' makes AUTOINST write
+    // `.rdata_a_o (operand_a[DataWidth-1:0])' -- an OUTPUT connection
+    // with its own part-select, not a bare identifier. Before M152,
+    // `/*AUTOWIRE*/' silently declared nothing for it and the generated
+    // Verilog left `operand_a' undeclared (illegal). GNU (`dev/gnu-auto/
+    // run.sh wire_part2.v', M152 measurement) declares
+    // `wire [DataWidth-1:0] operand_a;' for the equivalent shape.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module regfile (\n  input  logic clk,\n  output logic [DataWidth-1:0] rdata_a_o\n);\nendmodule\n\n/* regfile AUTO_TEMPLATE (\n  .rdata_\\(.\\)_o (operand_\\1[]),\n  ); */\nmodule top;\n  wire clk;\n  regfile u1 (/*AUTOINST*/);\n  /*AUTOWIRE*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [DataWidth-1:0] operand_a;"),
+        "the template-generated part-select connection must declare the wire: {}",
         text
     );
 }
@@ -818,6 +1257,42 @@ fn autowire_still_skips_bare_generate_region_declaration() {
     assert!(
         text.contains("/*AUTOWIRE*/\n  sub_mod"),
         "a bare `generate'/`endgenerate' region is transparent -- `done' is still module-level, AUTOWIRE must emit nothing: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_end_to_end_between_two_instances_stays_off_the_module_ports() {
+    // M152 end-to-end repro shape: `regfile' drives `operand_a'/
+    // `operand_b' (template-generated part-selects) and `alu' consumes
+    // them, both wired entirely INSIDE `top' -- `top' itself has no
+    // ports at all for these two names. AUTOWIRE must declare both;
+    // AUTOOUTPUT/AUTOINPUT must list neither (each name is connected as
+    // BOTH an output and an input across the two instances, which is
+    // exactly the O\(IuB)/I\(OuB) exclusion `verilog-auto--port-
+    // propagation-select' already implements -- this pins that the FIX
+    // for the AUTOWIRE gap didn't also make these two names leak into
+    // AUTOOUTPUT/AUTOINPUT).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module regfile (\n  input  logic clk,\n  output logic [DataWidth-1:0] rdata_a_o,\n  output logic [DataWidth-1:0] rdata_b_o\n);\nendmodule\n\nmodule alu (\n  input  logic clk,\n  input  logic [DataWidth-1:0] din_a_i,\n  input  logic [DataWidth-1:0] din_b_i\n);\nendmodule\n\n/* regfile AUTO_TEMPLATE (\n  .rdata_\\(.\\)_o (operand_\\1[]),\n  ); */\n/* alu AUTO_TEMPLATE (\n  .din_\\(.\\)_i (operand_\\1[]),\n  ); */\nmodule top;\n  wire clk;\n  regfile u_rf (/*AUTOINST*/);\n  alu u_alu (/*AUTOINST*/);\n  /*AUTOWIRE*/\n  /*AUTOOUTPUT*/\n  /*AUTOINPUT*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("wire [DataWidth-1:0] operand_a;"),
+        "operand_a must be declared by AUTOWIRE: {}",
+        text
+    );
+    assert!(
+        text.contains("wire [DataWidth-1:0] operand_b;"),
+        "operand_b must be declared by AUTOWIRE: {}",
+        text
+    );
+    assert!(
+        text.contains("/*AUTOOUTPUT*/\n  /*AUTOINPUT*/"),
+        "operand_a/operand_b must NOT be promoted to module ports by AUTOOUTPUT/AUTOINPUT (both markers must stay empty): {}",
         text
     );
 }
@@ -3338,6 +3813,40 @@ fn autoinput_declares_input_for_unconnected_submodule_input() {
 }
 
 #[test]
+fn autoinput_narrower_part_select_uses_connections_own_width() {
+    // M152: GNU measured (`dev/gnu-auto/run.sh io_narrow.v'): a connection
+    // with its own `[3:0]' part-select on a `[7:0]' sub port declares
+    // `input [3:0]', not the sub port's own `[7:0]'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input logic [7:0] din,\n  output logic dout\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOINPUT*/\n  sub_mod u1 (.din(narrow_in[3:0]), .dout(dout));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOINPUT*/\n  // Beginning of automatic inputs (from unused autoinst inputs)\n{}\n  // End of automatics",
+        port_decl(
+            "  ",
+            "input",
+            Some("logic"),
+            Some("[3:0]"),
+            "narrow_in",
+            "To",
+            "u1",
+            "sub_mod",
+            false
+        )
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
 fn autoinput_skips_signal_driven_by_another_instance() {
     let (mut i, _ed) = setup();
     insert_src(
@@ -3391,6 +3900,40 @@ fn autooutput_copies_type_and_range_from_submodule_port() {
     let expected = format!(
         "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
         port_decl("  ", "output", Some("logic"), Some("[7:0]"), "dout", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+}
+
+#[test]
+fn autooutput_narrower_part_select_uses_connections_own_width() {
+    // M152: GNU measured (`dev/gnu-auto/run.sh io_narrow.v'): a connection
+    // with its own `[3:0]' part-select on a `[7:0]' sub port declares
+    // `output [3:0]', not the sub port's own `[7:0]'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic [7:0] dout\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_mod u1 (.dout(narrow_out[3:0]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "/*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl(
+            "  ",
+            "output",
+            Some("logic"),
+            Some("[3:0]"),
+            "narrow_out",
+            "From",
+            "u1",
+            "sub_mod",
+            false
+        )
     );
     assert!(
         text.contains(&expected),
@@ -3494,6 +4037,134 @@ fn autooutput_reports_conflicting_widths_across_instances() {
     assert!(
         msg.contains("conflicting widths") && msg.contains("shared"),
         "echo must report the conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_merges_partselect_and_bitselect_from_two_ports() {
+    // GNU measured (`dev/gnu-auto/run.sh output_mixed_part_bit2.v', M152:
+    // an AUTO_TEMPLATE + AUTOINST expansion of `.wide(bus[7:4])' +
+    // `.narrow(bus[0])' on one instance): `output [7:0] bus;' -- the same
+    // union rule as AUTOWIRE's, not first-seen `[7:4]'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_four (\n  input clk,\n  output [7:0] wide,\n  output narrow\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_four u1 (.wide(bus[7:4]), .narrow(bus[0]), .clk(clk));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("output [7:0] bus;"),
+        "a part-select and a bit-select of the same name must union to [7:0]: {}",
+        text
+    );
+    assert!(
+        !msg.contains("conflicting widths"),
+        "a computable union is not a conflict: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_merges_two_partselects_of_same_signal() {
+    // GNU measured (`dev/gnu-auto/run.sh output_two_partselects2.v', M152):
+    // `.o0(bus[3:0])' + `.o1(bus[7:4])' -> `output [7:0] bus;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_out (\n  output [7:0] o0,\n  output [7:0] o1\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_out u1 (.o0(bus[3:0]), .o1(bus[7:4]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("output [7:0] bus;"),
+        "two part-selects of the same name must union to [7:0]: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_merges_bare_connection_and_bit_select() {
+    // GNU measured (`dev/gnu-auto/run.sh output_bare_and_bit2.v', M152):
+    // `.out0(bus)' (bare) + `.out1(bus[1])' -> `output [1:1] bus;' -- the
+    // bare connection's own submodule width is dropped entirely.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two (\n  input clk,\n  output out0,\n  output out1\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_two u1 (.out0(bus), .out1(bus[1]), .clk(clk));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("output [1:1] bus;"),
+        "a bare connection must not widen the bit-select's own range: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_bare_wide_connection_contributes_nothing_to_width() {
+    // Same measurement as `autowire_bare_wide_connection_contributes_
+    // nothing_to_width' (fix round 2, M152 cold review), through
+    // AUTOOUTPUT: `.out0(bus)' (bare, an 8-bit port) + `.out1(bus[9])' ->
+    // `output [9:9] bus;', not `[9:0]'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_bare_wide (\n  output [7:0] out0,\n  output out1\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_bare_wide u1 (.out0(bus), .out1(bus[9]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("output [9:9] bus;"),
+        "a WIDE bare connection must not widen the bit-select's own range: {}",
+        text
+    );
+}
+
+#[test]
+fn autoinput_merges_bitselect_then_partselect() {
+    // GNU measured (`dev/gnu-auto/run.sh input_mixed_part_bit2.v', M152,
+    // and the AUTOWIRE analogue `wire_bit_then_part.v'): `.in0(bus[3:0])'
+    // + `.in1(bus[7:4])' -> `input [7:0] bus;', the same union rule as
+    // AUTOOUTPUT's and AUTOWIRE's.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two_in (\n  input in0,\n  input [7:0] in1\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOINPUT*/\n  sub_two_in u1 (.in0(bus[3:0]), .in1(bus[7:4]));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("input [7:0] bus;"),
+        "a bit-select and a wider part-select must union to the wider one: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_reports_conflict_for_symbolic_mixed_with_numeric_select() {
+    // Same shape as AUTOWIRE's own
+    // `autowire_reports_conflict_for_symbolic_mixed_with_numeric_select',
+    // through AUTOOUTPUT: `.out0(bus[i])' + `.out1(bus[3:0])' cannot be
+    // unioned -- first-seen (`[i:i]') wins and the conflict is reported,
+    // not silently narrowed.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_two3 (\n  output out0,\n  output [3:0] out1\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/\n  sub_two3 u1 (.out0(bus[i]), .out1(bus[3:0]));\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("output [i:i] bus;"),
+        "unmergeable selects fall back to the first-seen one: {}",
+        text
+    );
+    assert!(
+        msg.contains("conflicting widths") && msg.contains("bus"),
+        "a symbolic bound mixed with a literal one must be reported: {}",
         msg
     );
 }
@@ -11033,6 +11704,1480 @@ fn multi_instance_statement_both_markers_well_formed_neither_misclassified() {
     assert!(
         u_a_slice.contains(".rd") && u_a_slice.contains(".wr"),
         "u_a must expand: {}",
+        text
+    );
+}
+
+// ===================== M150 part 1: an AUTO directive that shares its line
+//
+// Two defects in `verilog-auto--line-indent'/the six block-style AUTO
+// commands' own shared insert shape, both measured against GNU Emacs 30.2
+// (ground truth: `reticle-scratch/m150/ground-truth.md').
+//
+// Defect A: the indent used for every inserted line used to be the
+// literal text from the directive's own line start up to the directive
+// itself, not that line's leading whitespace -- code preceding the
+// directive on its line (`wire foo; /*AUTOWIRE*/') was duplicated onto
+// every inserted line.
+//
+// Defect D: non-whitespace text AFTER the directive on its own line
+// (`/*AUTOWIRE*/ wire x;') used to be swallowed into the "// End of
+// automatics" line comment, silently eating a declaration the user
+// wrote. Fixed by splitting the line: the trailing text moves to its own
+// new line, reindented, right after "// End of automatics" -- a
+// deliberate divergence from GNU (which leaves it on the directive's own
+// line), because inside a port list (part 2 of this milestone) that text
+// can itself be more port syntax, and appending after end-of-line would
+// place the block outside the list.
+
+#[test]
+fn autowire_directive_after_code_on_same_line_does_not_copy_the_code() {
+    // P1 / bat/a11_body_sameline.v shape: `  wire foo; /*AUTOWIRE*/'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic [WIDTH-1:0] count,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  wire foo; /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .count(count), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = "  wire foo; /*AUTOWIRE*/\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [WIDTH-1:0] count;\n  wire done;\n  // End of automatics";
+    assert!(
+        text.contains(expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+    assert_eq!(
+        text.matches("wire foo;").count(),
+        1,
+        "wire foo; must not be duplicated onto every inserted line: {}",
+        text
+    );
+    // Every inserted line starts with exactly 2 spaces then `//' or `wire'
+    // -- an exact-line check (`.contains(line)' on the whole text would
+    // also match a longer line that merely starts with this substring).
+    for line in [
+        "  // Beginning of automatic wires (for undeclared instantiated-module outputs)",
+        "  wire [WIDTH-1:0] count;",
+        "  wire done;",
+        "  // End of automatics",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "inserted line must be exactly the directive line's own 2-space indent plus this text: {:?} not found as an exact line in {}",
+            line,
+            text
+        );
+    }
+}
+
+#[test]
+fn autowire_code_after_directive_on_same_line_survives() {
+    // P2 / bat8/h01_body_trailing_text.v shape: `  /*AUTOWIRE*/ wire x;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/ wire x;\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  wire x;"),
+        "wire x; must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics wire x"),
+        "wire x; must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_split_line_is_stable_across_two_passes() {
+    // P3: P2's fixture, run verilog-auto twice -- second pass must be a
+    // no-op (the already-declared `wire done;' makes the candidate set
+    // empty on the second pass, so nothing is inserted and no further
+    // split happens).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/ wire x;\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let first = bs(&mut i);
+    verilog_auto(&mut i);
+    let second = bs(&mut i);
+    assert_eq!(first, second, "second verilog-auto pass must be a no-op");
+}
+
+#[test]
+fn autowire_split_line_survives_delete_auto() {
+    // P4: P2's fixture, verilog-auto then verilog-delete-auto -- the
+    // delete range ends right after "// End of automatics" itself
+    // (`verilog-auto--autowire-stale-end'), so the split-off `wire x;'
+    // line, which sits AFTER that point, is untouched by the delete and
+    // the buffer returns to (near) its original shape.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/ wire x;\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    delete_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(text.matches("/*AUTOWIRE*/").count(), 1, "buffer: {}", text);
+    assert_eq!(text.matches("wire x;").count(), 1, "buffer: {}", text);
+    assert!(!text.contains("Beginning of automatic"), "buffer: {}", text);
+}
+
+#[test]
+fn autooutput_in_body_after_code_on_same_line_does_not_copy_the_code() {
+    // P5: non-ANSI body placement, directive after code on its own line.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  reg r; /*AUTOOUTPUT*/\n  sub_mod u1 (.done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let expected = format!(
+        "  reg r; /*AUTOOUTPUT*/\n  // Beginning of automatic outputs (from unused autoinst outputs)\n{}\n  // End of automatics",
+        port_decl("  ", "output", Some("logic"), None, "done", "From", "u1", "sub_mod", false)
+    );
+    assert!(
+        text.contains(&expected),
+        "expected:\n{}\ngot:\n{}",
+        expected,
+        text
+    );
+    assert_eq!(
+        text.matches("reg r;").count(),
+        1,
+        "reg r; must not be duplicated onto inserted lines: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreg_directive_after_code_on_same_line_does_not_copy_the_code() {
+    // P6 (AUTOREG): built from `autoreg_basic_nonansi_emission_with_and_
+    // without_range', directive moved onto `output b;''s own line.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module dut (a, b);\n  output [3:0] a;\n  output b; /*AUTOREG*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches("output b;").count(),
+        1,
+        "output b; must not be duplicated: {}",
+        text
+    );
+    assert!(
+        text.contains("  output b; /*AUTOREG*/\n  // Beginning of automatic regs (for this module's undeclared outputs)"),
+        "buffer: {}",
+        text
+    );
+    assert!(text.contains("reg [3:0] a;"), "buffer: {}", text);
+    assert!(text.contains("reg b;"), "buffer: {}", text);
+}
+
+#[test]
+fn autotieoff_directive_after_code_on_same_line_does_not_copy_the_code() {
+    // P6 (AUTOTIEOFF): built from `autotieoff_numeric_constant_table',
+    // narrowed to one port with the directive on its own declaration line.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module dut (a);\n  output [3:0] a; /*AUTOTIEOFF*/\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches("output [3:0] a;").count(),
+        1,
+        "output [3:0] a; must not be duplicated: {}",
+        text
+    );
+    assert!(
+        text.contains("  output [3:0] a; /*AUTOTIEOFF*/\n  // Beginning of automatic tieoffs (for this module's unterminated outputs)"),
+        "buffer: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_directive_after_code_on_same_line_does_not_copy_the_code() {
+    // P6 (AUTORESET): built from `autoreset_excludes_signal_assigned_
+    // before_the_marker_in_its_own_branch' -- cnt_q's own reset-excluding
+    // assignment sits on the SAME line as the directive, and must not be
+    // duplicated onto the inserted q_o reset line.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic cnt_q, q_o;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      cnt_q <= 1'b0; /*AUTORESET*/\n    end else begin\n      cnt_q <= 1'b1;\n      q_o <= 1'b1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches("cnt_q <= 1'b0;").count(),
+        1,
+        "cnt_q <= 1'b0; must not be duplicated: {}",
+        text
+    );
+    assert!(
+        text.contains("      cnt_q <= 1'b0; /*AUTORESET*/\n      // Beginning of autoreset for uninitialized flops"),
+        "buffer: {}",
+        text
+    );
+    assert!(text.contains("q_o <= 1'h0;"), "buffer: {}", text);
+    assert!(
+        !text.contains("cnt_q <= 1'h0;"),
+        "cnt_q is excluded (assigned before the marker in its own branch): {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_directive_after_code_on_same_line_does_not_copy_the_code() {
+    // P6 (AUTOUNUSED): the directive must stay inside its `&{...}' legal
+    // host (`verilog-auto--autounused-legal-host-p'), so it is placed
+    // after `wire _unused_ok = &{1'b0,' on that line rather than after
+    // an unrelated declaration. Both `clk' and `rst_n' are never read
+    // anywhere in the module, so both must be listed; the preceding
+    // text must not be duplicated onto the inserted lines.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic rst_n,\n  output logic z_o\n);\n  wire _unused_ok = &{1'b0, /*AUTOUNUSED*/\n                      1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert_eq!(
+        text.matches("wire _unused_ok = &{1'b0,").count(),
+        1,
+        "the preceding text must not be duplicated: {}",
+        text
+    );
+    assert!(
+        text.contains(
+            "  wire _unused_ok = &{1'b0, /*AUTOUNUSED*/\n  // Beginning of automatic unused inputs"
+        ),
+        "buffer: {}",
+        text
+    );
+    let block = unused_block(&text);
+    assert!(block.contains("clk,"), "buffer: {}", text);
+    assert!(block.contains("rst_n,"), "buffer: {}", text);
+}
+
+#[test]
+fn auto_directive_alone_on_its_line_is_byte_identical_to_before() {
+    // P7: the common case (directive alone on its own line) must not
+    // move. An exact whole-buffer `assert_eq!' rather than `.contains()'
+    // on a substring -- `.contains()' would stay green even if an extra
+    // line were inserted anywhere ELSE in the buffer (for example a
+    // spurious split at a site that should be a no-op); this must go red
+    // for any such addition, not just a change inside the pinned block.
+    // Expected is built from the fixture's own text plus the exact block
+    // `autowire_declares_wire_for_undeclared_output' already pins, not
+    // from whatever the code happens to print.
+    let (mut i, _ed) = setup();
+    let fixture = "module sub_mod (\n  input  logic clk,\n  output logic [WIDTH-1:0] count,\n  output logic done\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/\n  sub_mod u1 (.clk(clk), .count(count), .done(done));\nendmodule\n";
+    insert_src(&mut i, fixture);
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let block = "\n  // Beginning of automatic wires (for undeclared instantiated-module outputs)\n  wire [WIDTH-1:0] count;\n  wire done;\n  // End of automatics";
+    let expected = fixture.replacen("/*AUTOWIRE*/\n", &format!("/*AUTOWIRE*/{}\n", block), 1);
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn auto_site_that_inserts_nothing_does_not_split_its_line() {
+    // P8: `  /*AUTOWIRE*/ wire x;' with nothing to add (no output ports
+    // on the submodule at all) -- the `when candidates' guard is false,
+    // so the split must not run either; the buffer stays byte-identical.
+    let (mut i, _ed) = setup();
+    let src = "module sub_mod (\n  input  logic clk\n);\nendmodule\n\nmodule top;\n  wire clk;\n  /*AUTOWIRE*/ wire x;\n  sub_mod u1 (.clk(clk));\nendmodule\n";
+    insert_src(&mut i, src);
+    verilog_auto(&mut i);
+    assert_eq!(
+        bs(&mut i),
+        src,
+        "an AUTOWIRE site with nothing to insert must not split its line either"
+    );
+}
+
+// ----- fix round 1: the split call at the other five sites, CRLF, and
+// two directives sharing one line (part1-review1-findings.md) ---------
+
+#[test]
+fn autooutput_body_code_after_directive_on_same_line_survives() {
+    // Item 1 (port-propagation / AUTOOUTPUT, non-ANSI body placement):
+    // `/*AUTOOUTPUT*/ reg r;' -- this site's own
+    // `verilog-auto--split-trailing-directive-text' call
+    // (`verilog-auto--expand-port-propagation-insert') was previously
+    // untested for Defect D (only Defect A -- code BEFORE the directive
+    // -- had a body-placement test, `autooutput_in_body_after_code_on_
+    // same_line_does_not_copy_the_code').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  output logic done\n);\nendmodule\n\nmodule top (/*AUTOARG*/);\n  /*AUTOOUTPUT*/ reg r;\n  sub_mod u1 (.done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  reg r;"),
+        "reg r; must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics reg r"),
+        "reg r; must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autotieoff_code_after_directive_on_same_line_survives() {
+    // Item 1 (AUTOTIEOFF): `output [3:0] a; /*AUTOTIEOFF*/ reg z;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module dut (a);\n  output [3:0] a; /*AUTOTIEOFF*/ reg z;\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  reg z;"),
+        "reg z; must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics reg z"),
+        "reg z; must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreg_code_after_directive_on_same_line_survives() {
+    // Item 1 (AUTOREG): `output b; /*AUTOREG*/ reg z;'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module dut (a, b);\n  output [3:0] a;\n  output b; /*AUTOREG*/ reg z;\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  reg z;"),
+        "reg z; must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics reg z"),
+        "reg z; must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autoreset_code_after_directive_on_same_line_survives() {
+    // Item 1 (AUTORESET): the directive alone would insert
+    // `cnt_q <= 1'h0;'; a trailing `$display' statement after it on the
+    // same line must survive rather than being swallowed.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top;\n  logic clk, rst_ni;\n  logic cnt_q;\n  always @(posedge clk or negedge rst_ni) begin\n    if (!rst_ni) begin\n      /*AUTORESET*/ $display(\"x\");\n    end else begin\n      cnt_q <= cnt_q + 1;\n    end\n  end\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "      $display(\"x\");"),
+        "the trailing statement must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics $display"),
+        "the trailing statement must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autounused_code_after_directive_on_same_line_survives() {
+    // Item 1 (AUTOUNUSED): the directive must stay inside its `&{...}'
+    // legal host (`verilog-auto--autounused-legal-host-p'), so the
+    // trailing text after it on the same line is the rest of that
+    // concatenation: `&{1'b0, /*AUTOUNUSED*/ 1'b0};'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module top (\n  input  logic clk,\n  input  logic rst_n,\n  output logic z_o\n);\n  wire _unused_ok = &{1'b0, /*AUTOUNUSED*/ 1'b0};\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  1'b0};"),
+        "the trailing `1'b0}}' must survive, outside any comment, on its own line: {}",
+        text
+    );
+    assert!(
+        !text.contains("automatics 1'b0"),
+        "1'b0}} must not be swallowed into the End-of-automatics comment: {}",
+        text
+    );
+}
+
+#[test]
+fn autowire_crlf_directive_alone_on_its_line_is_not_spuriously_split() {
+    // Item 3: CRLF line endings. A lone `\r' immediately before the
+    // newline used to count as trailing content
+    // (`string-match "[^ \t]"' saw the `\r' itself as non-whitespace),
+    // so a directive alone on its own CRLF-terminated line was
+    // spuriously split, inserting an extra line holding only the indent.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\r\n  input  logic clk,\r\n  output logic done\r\n);\r\nendmodule\r\n\r\nmodule top;\r\n  wire clk;\r\n  /*AUTOWIRE*/\r\n  sub_mod u1 (.clk(clk), .done(done));\r\nendmodule\r\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let end_idx =
+        text.find("// End of automatics").expect("block missing") + "// End of automatics".len();
+    assert_eq!(
+        &text[end_idx..end_idx + 2],
+        "\r\n",
+        "a lone \\r before the newline must not count as trailing content and trigger a spurious split (expected the directive's own original \\r\\n to follow immediately): {}",
+        text
+    );
+}
+
+#[test]
+fn two_directives_on_one_line_each_end_up_on_its_own_line() {
+    // Item 5: `  /*AUTOWIRE*/ /*AUTOREG*/' -- AUTOWIRE's insertion treats
+    // ` /*AUTOREG*/' as trailing text and splits it onto its own new
+    // line; AUTOREG is then found and expanded on that (now separate)
+    // line. Exploratory per the spec: if this comes out wrong, this test
+    // records that rather than the implementer changing product code
+    // beyond items 1-4.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (\n  input  logic clk,\n  output logic done\n);\nendmodule\n\nmodule top (a, b);\n  output [3:0] a;\n  output b;\n  wire clk;\n  /*AUTOWIRE*/ /*AUTOREG*/\n  sub_mod u1 (.clk(clk), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.lines().any(|l| l == "  /*AUTOREG*/"),
+        "AUTOREG must end up on its own line after the split: {}",
+        text
+    );
+    assert!(
+        text.contains("// Beginning of automatic wires"),
+        "AUTOWIRE's own block must be present: {}",
+        text
+    );
+    assert!(
+        text.contains("// Beginning of automatic regs"),
+        "AUTOREG's own block must be present: {}",
+        text
+    );
+    let second = {
+        verilog_auto(&mut i);
+        bs(&mut i)
+    };
+    assert_eq!(
+        text, second,
+        "a second verilog-auto pass over the already-expanded buffer must be byte-identical"
+    );
+}
+
+// ===================== M150 part 2: AUTOOUTPUT/AUTOINPUT/AUTOINOUT inside
+// a port list =====================
+//
+// Ground truth: `~/My_Projects/reticle-scratch/m150/ground-truth.md' (GNU
+// Emacs 30.2 + slang-server, both run for real). `sub_mod' is the same
+// submodule that file's own fixtures instantiate throughout.
+
+const SUB_MOD_P2: &str = "module sub_mod (clk, rst, done, dbus, wide);\n  input  clk;\n  input  rst;\n  output done;\n  inout  dbus;\n  output [7:0] wide;\nendmodule\n";
+
+#[test]
+fn autooutput_ansi_port_list_last_before_close_paren_omits_trailing_comma() {
+    // bat/a07_ansi_header.v: an explicit `input clk,' precedes the
+    // directive, which is the last thing before `)'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk,\n            /*AUTOOUTPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(
+        text.contains(&done_line),
+        "done must keep its comma (not last before `)'): {}\nexpected line: {:?}",
+        text,
+        done_line
+    );
+    assert!(
+        text.contains(&wide_line),
+        "wide is last before `)' and must have no comma: {}\nexpected line: {:?}",
+        text,
+        wide_line
+    );
+    assert!(
+        !msg.contains("ANSI header") && !msg.contains("non-ANSI"),
+        "a comma-form expansion must not trigger either refusal notice: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_middle_both_lines_keep_comma() {
+    // bat2/b02_ansi_middle.v: directive sits BETWEEN two ANSI declarations.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk,\n            /*AUTOOUTPUT*/\n            input rst\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(
+        text.contains(&wide_line),
+        "wide is followed by `input rst', not `)', so it keeps its comma too: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_first_untouched_existing_lines_stay_as_written() {
+    // bat2/b01_ansi_first.v: directive is the FIRST thing in the list.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOOUTPUT*/\n            input clk,\n            input rst\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(text.contains(&wide_line), "buffer: {}", text);
+    assert!(
+        text.contains("            input clk,\n            input rst\n"),
+        "the two hand-written declarations must be left exactly as written (no open repair -- nothing precedes the directive inside the list): {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_sameline_indent_is_column_zero() {
+    // bat2/b03_ansi_sameline.v: `module top (/*AUTOOUTPUT*/' -- the
+    // directive's own line has NO leading whitespace, so the inserted
+    // block (part 1's `verilog-auto--line-indent' rule) sits at column 0,
+    // and `module top (' itself must never be copied onto any inserted
+    // line (the old Defect A shape).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (/*AUTOOUTPUT*/\n            input clk,\n            input rst\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "", "output", None, None, "done", ",", "From", "u1", "sub_mod", false,
+    );
+    let wide_line = port_decl_term(
+        "",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(
+        text.contains(&done_line) && text.contains(&wide_line),
+        "both generated lines must sit at column 0: {}",
+        text
+    );
+    assert!(
+        !text.contains("module top (// Beginning") && !text.contains("module top (output"),
+        "`module top (' must never be copied onto an inserted line: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_open_repair_adds_comma_to_previous_decl() {
+    // bat4/d01_ansi_prev_no_comma.v: `input clk' (no comma) precedes the
+    // directive, which is last before `)'.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk\n            /*AUTOOUTPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("            input clk,\n            /*AUTOOUTPUT*/"),
+        "open repair must add a comma to `input clk' even though the NEW block's own last line ends up with none: {}",
+        text
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(
+        text.contains(&wide_line),
+        "wide is last before `)' and must have no comma: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_comment_before_close_paren_is_skipped() {
+    // bat4/d03_comment_before_close.v: a `//' comment sits between the
+    // block and `)' -- the close-repair scan must skip past it.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk,\n            /*AUTOOUTPUT*/\n            // trailing note\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(
+        text.contains(&wide_line),
+        "the `//' comment before `)' must be skipped -- wide is still effectively last, no comma: {}",
+        text
+    );
+    assert!(
+        text.contains("// trailing note"),
+        "the comment itself must survive untouched: {}",
+        text
+    );
+}
+
+#[test]
+fn autoinput_then_autooutput_in_same_ansi_list_both_get_comma_form() {
+    // bat2/b05_ansi_two_directives.v: `/*AUTOINPUT*/' then `/*AUTOOUTPUT*/'
+    // then `)' -- INPUT's own last line (rst) keeps a comma because
+    // AUTOOUTPUT's block follows it, not `)'; OUTPUT's own last line
+    // (wide) has none because `)' follows it directly.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOINPUT*/\n            /*AUTOOUTPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let clk_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "clk",
+        ",",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let rst_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "rst",
+        ",",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&clk_line), "buffer: {}", text);
+    assert!(
+        text.contains(&rst_line),
+        "rst keeps its comma -- AUTOOUTPUT's own block follows it: {}",
+        text
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(
+        text.contains(&wide_line),
+        "wide is last before `)' and must have no comma: {}",
+        text
+    );
+    assert!(msg.contains("4 ports"), "echo: {}", msg);
+}
+
+#[test]
+fn autooutput_then_autoinput_output_then_input_order_also_repairs_correctly() {
+    // bat7/g01_src.v: `/*AUTOOUTPUT*/' then `/*AUTOINPUT*/' then `)' -- the
+    // OPPOSITE textual order from the test above. OUTPUT's own last line
+    // (wide) loses its comma on OUTPUT's own pass (directly followed by
+    // `)' at that point), then GETS one back via open repair once
+    // AUTOINPUT's pass sees OUTPUT's block sitting ahead of it; INPUT's
+    // own last line (rst) has none, since `)' follows it directly.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOOUTPUT*/\n            /*AUTOINPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let clk_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "clk",
+        ",",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let rst_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "rst",
+        "",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(
+        text.contains(&wide_line),
+        "wide must end up WITH a comma via open repair, even though OUTPUT's own pass ran first and initially gave it none: {}",
+        text
+    );
+    assert!(text.contains(&clk_line), "buffer: {}", text);
+    assert!(
+        text.contains(&rst_line),
+        "rst is last before `)' and must have no comma: {}",
+        text
+    );
+}
+
+#[test]
+fn autoinout_ansi_port_list_last_before_close_paren_omits_trailing_comma() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            output done,\n            /*AUTOINOUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let dbus_line = port_decl_term(
+        "            ",
+        "inout",
+        None,
+        None,
+        "dbus",
+        "",
+        "To/From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(
+        text.contains(&dbus_line),
+        "dbus is the only AUTOINOUT candidate and sits last before `)': {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_a07_shape_is_idempotent() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk,\n            /*AUTOOUTPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let first = bs(&mut i);
+    verilog_auto(&mut i);
+    let second = bs(&mut i);
+    assert_eq!(
+        first, second,
+        "a second verilog-auto pass over the already-expanded port list must be byte-identical"
+    );
+}
+
+#[test]
+fn autoinput_then_autooutput_ansi_port_list_is_idempotent() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOINPUT*/\n            /*AUTOOUTPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let first = bs(&mut i);
+    verilog_auto(&mut i);
+    let second = bs(&mut i);
+    assert_eq!(
+        first, second,
+        "a second verilog-auto pass (INPUT-then-OUTPUT order) must be byte-identical"
+    );
+}
+
+#[test]
+fn autooutput_then_autoinput_ansi_port_list_is_idempotent() {
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOOUTPUT*/\n            /*AUTOINPUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let first = bs(&mut i);
+    verilog_auto(&mut i);
+    let second = bs(&mut i);
+    assert_eq!(
+        first, second,
+        "a second verilog-auto pass (OUTPUT-then-INPUT order) must be byte-identical"
+    );
+}
+
+#[test]
+fn autooutput_close_repair_removes_dangling_comma_when_nothing_is_inserted() {
+    // bat6/f03_noinst_rerun.v's own shape: the same shape
+    // `autooutput_ansi_port_list_open_repair_adds_comma_to_previous_decl'
+    // (P2-5/d01) produces after its own first pass -- `input clk,' left
+    // dangling by delete-auto -- but with NO instance present, so this
+    // site has nothing to insert. Close repair must still run and remove
+    // the dangling comma (ground truth: `bat6/f01' -> `bat6/f03').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            input clk,\n            /*AUTOOUTPUT*/\n            );\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("            input clk\n            /*AUTOOUTPUT*/\n            );"),
+        "the dangling comma must be removed even though nothing is inserted here: {}",
+        text
+    );
+    assert!(
+        !text.contains("Beginning of automatic"),
+        "nothing must be inserted -- no submodule instance means no candidates: {}",
+        text
+    );
+    assert!(
+        !msg.contains("non-ANSI") && !msg.contains("ANSI header"),
+        "neither refusal notice should fire here: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_already_declared_inserts_nothing() {
+    // bat3/c01_ansi_already_declared.v: `output done,'/`output [7:0]
+    // wide,'/`input clk' are written directly in the ANSI header, no
+    // automatics block -- the port-list branch must still see them as
+    // OWN ports and emit nothing.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOOUTPUT*/\n            output done,\n            output [7:0] wide,\n            input clk\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        !text.contains("Beginning of automatic"),
+        "done/wide are already declared in the header -- nothing must be inserted: {}",
+        text
+    );
+    assert!(
+        text.contains(
+            "            /*AUTOOUTPUT*/\n            output done,\n            output [7:0] wide,\n            input clk\n"
+        ),
+        "the hand-written header declarations must be left exactly as written: {}",
+        text
+    );
+    assert!(
+        !msg.contains("non-ANSI") && !msg.contains("ANSI header"),
+        "an all-ANSI list must not trigger either refusal notice: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_non_ansi_port_list_with_bare_name_is_refused_and_untouched() {
+    // fixtures/a_outp_ownline.v: directive is FIRST in a non-ANSI list
+    // that also holds a bare `clk'. GNU emits code here that slang
+    // rejects (`expected identifier'/`can't use port declaration in
+    // module with ANSI style port list') -- the right answer is refusal.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, done);\n  input  clk;\n  output done;\nendmodule\n\nmodule top (\n            /*AUTOOUTPUT*/\n            clk\n            );\n  input clk;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("            /*AUTOOUTPUT*/\n            clk\n"),
+        "the directive and the bare port name must both be left untouched: {}",
+        text
+    );
+    assert!(
+        !text.contains("Beginning of automatic"),
+        "nothing must be inserted: {}",
+        text
+    );
+    assert!(
+        msg.contains("AUTOOUTPUT/AUTOINPUT/AUTOINOUT in non-ANSI port list"),
+        "echo: {}",
+        msg
+    );
+    assert!(msg.contains("top"), "echo should name the module: {}", msg);
+}
+
+#[test]
+fn autooutput_non_ansi_port_list_sameline_with_bare_name_is_refused() {
+    // fixtures/outp_ctrl.v: `module top (/*AUTOOUTPUT*/' sameline, same
+    // non-ANSI-list-with-a-bare-name shape as the test above.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, done);\n  input  clk;\n  output done;\nendmodule\n\nmodule top (/*AUTOOUTPUT*/\n            clk\n            );\n  input clk;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("module top (/*AUTOOUTPUT*/\n            clk\n"),
+        "must be left untouched: {}",
+        text
+    );
+    assert!(
+        msg.contains("AUTOOUTPUT/AUTOINPUT/AUTOINOUT in non-ANSI port list"),
+        "echo: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_non_ansi_port_list_bare_name_last_is_refused() {
+    // bat/a16_last_in_list.v: the bare name comes BEFORE the directive
+    // this time (`clk,' then `/*AUTOOUTPUT*/' then `)').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            clk,\n            /*AUTOOUTPUT*/\n            );\n  input clk;\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    assert!(
+        text.contains("            clk,\n            /*AUTOOUTPUT*/\n            );"),
+        "must be left untouched: {}",
+        text
+    );
+    assert!(
+        msg.contains("AUTOOUTPUT/AUTOINPUT/AUTOINOUT in non-ANSI port list"),
+        "echo: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_empty_ansi_port_list_sameline_becomes_a_valid_header() {
+    // bat8/h02_empty_list_sameline.v: `module top (/*AUTOOUTPUT*/);' --
+    // the directive is the ONLY thing in the list. Part 1's line split
+    // moves `);' onto its own line, turning this into a valid ANSI
+    // header (GNU itself expands nothing here, a recorded quirk this
+    // file deliberately does not copy -- ground truth, "GNU's own quirk"
+    // section).
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, done);\n  input  clk;\n  output done;\nendmodule\n\nmodule top (/*AUTOOUTPUT*/);\n  sub_mod u1 (.clk(1'b0), .done(done));\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "", "output", None, None, "done", "", "From", "u1", "sub_mod", false,
+    );
+    assert!(
+        text.contains(&done_line),
+        "done is the sole AUTOOUTPUT candidate (the only unconnected-elsewhere submodule output), no comma: {}",
+        text
+    );
+    assert!(
+        text.contains("// End of automatics\n);"),
+        "the trailing `);' must land on its own line, right after the block: {}",
+        text
+    );
+}
+
+#[test]
+fn autooutput_non_ansi_body_style_still_uses_semicolons() {
+    // bat2/b06_nonansi_body_style.v: existing-behaviour pin -- a
+    // directive in the module BODY of a non-ANSI header must keep the
+    // `;' form untouched by any of this milestone's comma-form logic.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (clk, rst);\n  input clk;\n  input rst;\n  /*AUTOOUTPUT*/\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl(
+        "  ", "output", None, None, "done", "From", "u1", "sub_mod", false,
+    );
+    let wide_line = port_decl(
+        "  ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(text.contains(&wide_line), "buffer: {}", text);
+}
+
+// ===================== M150 part 2 fix round 1 =====================
+//
+// Ground truth: `~/My_Projects/reticle-scratch/m150/bat9/{r2_attr_before_module,
+// r3_param_nested}.v', checked against slang/GNU by the main conversation.
+
+#[test]
+fn autooutput_ansi_port_list_after_parameter_list_with_nested_parens() {
+    // bat9/r3_param_nested.v: `module top #(parameter int W = $clog2(8)) ('
+    // -- the parameter-port-list's OWN parens nest a further pair
+    // (`$clog2(8)'), so a paren-matcher that isn't careful about
+    // top-level-vs-nested could pick the wrong pair as "the" port list.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, done);\n  input  clk;\n  output done;\nendmodule\nmodule top #(parameter int W = $clog2(8)) (\n    input clk,\n    /*AUTOOUTPUT*/\n    );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "    ", "output", None, None, "done", "", "From", "u1", "sub_mod", false,
+    );
+    assert!(
+        text.contains("    /*AUTOOUTPUT*/\n    // Beginning of automatic outputs (from unused autoinst outputs)\n"),
+        "buffer: {}",
+        text
+    );
+    assert!(
+        text.contains(&done_line),
+        "done is last before `)', no comma: {}\nexpected line: {:?}",
+        text,
+        done_line
+    );
+    assert!(
+        text.contains("    // End of automatics\n    );"),
+        "buffer: {}",
+        text
+    );
+    assert!(
+        text.contains("module top #(parameter int W = $clog2(8)) (\n"),
+        "the header line itself must be unchanged: {}",
+        text
+    );
+    assert!(
+        !msg.contains("ANSI header") && !msg.contains("non-ANSI"),
+        "neither refusal notice should fire here: {}",
+        msg
+    );
+}
+
+#[test]
+fn autooutput_ansi_port_list_with_attribute_before_module() {
+    // bat9/r2_attr_before_module.v: `(* some_attr *) module top #(parameter
+    // W = 8) (' -- an attribute precedes the `module' keyword itself.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, done);\n  input  clk;\n  output done;\nendmodule\n(* some_attr *) module top #(parameter W = 8) (\n    input clk,\n    /*AUTOOUTPUT*/\n    );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    let msg = verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "    ", "output", None, None, "done", "", "From", "u1", "sub_mod", false,
+    );
+    assert!(
+        text.contains("    /*AUTOOUTPUT*/\n    // Beginning of automatic outputs (from unused autoinst outputs)\n"),
+        "buffer: {}",
+        text
+    );
+    assert!(
+        text.contains(&done_line),
+        "done is last before `)', no comma: {}\nexpected line: {:?}",
+        text,
+        done_line
+    );
+    assert!(
+        text.contains("    // End of automatics\n    );"),
+        "buffer: {}",
+        text
+    );
+    assert!(
+        text.contains("(* some_attr *) module top #(parameter W = 8) (\n"),
+        "the header line itself must be unchanged: {}",
+        text
+    );
+    assert!(
+        !msg.contains("ANSI header") && !msg.contains("non-ANSI"),
+        "neither refusal notice should fire here: {}",
+        msg
+    );
+}
+
+#[test]
+fn three_port_directives_in_one_ansi_list_only_the_last_decl_drops_its_comma() {
+    // All three port-propagation directives in one ANSI list, in
+    // AUTOINPUT/AUTOOUTPUT/AUTOINOUT order, `)' following the last one
+    // directly -- every declaration line must end with `,' except the
+    // very last (`inout dbus'), which has none.
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        &format!(
+            "{}module top (\n            /*AUTOINPUT*/\n            /*AUTOOUTPUT*/\n            /*AUTOINOUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+            SUB_MOD_P2
+        ),
+    );
+    verilog_auto(&mut i);
+    let first = bs(&mut i);
+    let clk_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "clk",
+        ",",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let rst_line = port_decl_term(
+        "            ",
+        "input",
+        None,
+        None,
+        "rst",
+        ",",
+        "To",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let dbus_line = port_decl_term(
+        "            ",
+        "inout",
+        None,
+        None,
+        "dbus",
+        "",
+        "To/From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(first.contains(&clk_line), "buffer: {}", first);
+    assert!(
+        first.contains(&rst_line),
+        "rst keeps its comma -- AUTOOUTPUT's own block follows it: {}",
+        first
+    );
+    assert!(first.contains(&done_line), "buffer: {}", first);
+    assert!(
+        first.contains(&wide_line),
+        "wide keeps its comma -- AUTOINOUT's own block follows it: {}",
+        first
+    );
+    assert!(
+        first.contains(&dbus_line),
+        "dbus is last before `)' and must have no comma: {}",
+        first
+    );
+    verilog_auto(&mut i);
+    let second = bs(&mut i);
+    assert_eq!(
+        first, second,
+        "a second verilog-auto pass over the already-expanded port list must be byte-identical"
+    );
+}
+
+#[test]
+fn first_directive_inserts_second_inserts_nothing_close_paren_follows() {
+    // `/*AUTOOUTPUT*/' then `/*AUTOINOUT*/' then `)', with a `sub_mod'
+    // variant that has NO inout port at all -- AUTOINOUT has nothing to
+    // insert, so close repair must still see past it to `)' and remove
+    // OUTPUT's own trailing comma (ground truth: close repair runs even
+    // when the site inserts nothing, `bat6/f01' -> `bat6/f03').
+    let (mut i, _ed) = setup();
+    insert_src(
+        &mut i,
+        "module sub_mod (clk, rst, done, wide);\n  input  clk;\n  input  rst;\n  output done;\n  output [7:0] wide;\nendmodule\nmodule top (\n            input clk,\n            input rst,\n            /*AUTOOUTPUT*/\n            /*AUTOINOUT*/\n            );\n  sub_mod u1 (/*AUTOINST*/);\nendmodule\n",
+    );
+    verilog_auto(&mut i);
+    let text = bs(&mut i);
+    let done_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        None,
+        "done",
+        ",",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    let wide_line = port_decl_term(
+        "            ",
+        "output",
+        None,
+        Some("[7:0]"),
+        "wide",
+        "",
+        "From",
+        "u1",
+        "sub_mod",
+        false,
+    );
+    assert!(text.contains(&done_line), "buffer: {}", text);
+    assert!(
+        text.contains(&wide_line),
+        "wide is OUTPUT's own last line -- AUTOINOUT inserts nothing, so close repair must see past it to `)' and leave no comma: {}",
+        text
+    );
+    assert!(
+        text.contains("/*AUTOINOUT*/\n            );"),
+        "AUTOINOUT inserts nothing and is followed (after only whitespace) by `);': {}",
         text
     );
 }

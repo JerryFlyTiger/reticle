@@ -241,6 +241,35 @@
 ;;   might otherwise produce one, added after an M39 review found a
 ;;   concrete way to (a hand-deleted \"// End of automatics\" line;
 ;;   `verilog-auto--autowire-stale-end's own header has the full story).
+;; - M150: the six block-style AUTO commands (AUTOOUTPUT/AUTOINPUT/AUTOINOUT,
+;;   AUTOWIRE, AUTOTIEOFF, AUTOREG, AUTORESET, AUTOUNUSED) share one insert
+;;   shape -- a Beginning/decl/End block spliced in right after the
+;;   directive comment, indented to match. Two things about the directive's
+;;   OWN source line, both measured against GNU Emacs 30.2: (1) the indent
+;;   used for every inserted line is that line's OWN leading whitespace,
+;;   never literal text that happens to sit before the directive on it
+;;   (`verilog-auto--line-indent'; before this milestone it returned the
+;;   whole line-start-to-directive span, so `wire foo; /*AUTOWIRE*/'
+;;   duplicated `wire foo; ' onto every inserted line -- see
+;;   `bat/a11_body_sameline.v' in the M150 ground truth). (2) non-whitespace
+;;   text AFTER the directive on its line -- `/*AUTOWIRE*/ wire x;' -- is
+;;   moved to its own new line right after \"// End of automatics\" rather
+;;   than left where it was (`verilog-auto--split-trailing-directive-text').
+;;   This is a DELIBERATE divergence from GNU, which leaves such text on the
+;;   directive's own line, ahead of the inserted block: this file cannot do
+;;   that in general, because inside a port list (part 2 of this milestone)
+;;   the trailing text can itself be more port syntax
+;;   (`input clk, input rst)'), and appending after end-of-line there would
+;;   place the generated block outside the list. Splitting the line instead
+;;   preserves the exact token stream in every case -- only a line break and
+;;   the generated block are added -- see `bat8/h01_body_trailing_text.v'
+;;   (a declaration after the directive, previously eaten into the End
+;;   comment: `// End of automatics wire x;') and `bat8/h02_empty_list_
+;;   sameline.v' (`);' after the directive, same failure mode). A seventh
+;;   caller, AUTOARG, also uses `verilog-auto--line-indent', on the module
+;;   declaration's own start rather than a directive comment's; its output
+;;   only changes when non-whitespace text precedes `module' on that same
+;;   line, which is not this milestone's own scenario.
 ;;
 ;; --- M125: AUTOOUTPUT/AUTOINPUT/AUTOINOUT (port propagation) -------------
 ;;
@@ -268,10 +297,46 @@
 ;;   this whole file's existing AUTOINST/AUTOWIRE/AUTOARG convention).
 ;; - ANSI-header guard (Reticle divergence from GNU, which happily emits
 ;;   Verilog-1995 BODY declarations into an ANSI header and produces code
-;;   that doesn't compile): on an ANSI header the three commands expand
-;;   to nothing and record the module name in
+;;   that doesn't compile): this now covers BODY placement only (M150
+;;   part 2 narrowed it -- see below). On an ANSI header, a directive
+;;   sitting in the module BODY (not inside the header's own port-list
+;;   parens) expands to nothing and records the module name in
 ;;   `verilog-auto--ansi-port-auto-modules', same shape as AUTOARG's own
 ;;   `verilog-auto--ansi-autoarg-modules' precedent.
+;; - M150 part 2: a directive sitting INSIDE the header's own port-list
+;;   parens is a THIRD case, decided before the ANSI-header guard above
+;;   (an ANSI port list holding `input clk' is "ANSI with ports" by that
+;;   guard's own definition, and would otherwise be refused even though
+;;   the directive sits inside the very list the guard means to
+;;   protect) -- `verilog-auto--comment-in-header-port-list-p', a plain
+;;   LEXICAL scan of the header's own text
+;;   (`verilog-auto--header-port-list-paren-range'), not a treesit node-
+;;   type check, because the node type is not something the M150 spec
+;;   trusts to survive an ERROR: after `verilog-delete-auto' a comma can
+;;   be left dangling right before the closing `)' (`input clk,' + a
+;;   bare directive comment + `)'), and pass 2 of `verilog-auto' sees
+;;   exactly that shape (`bat6/f01_d01_gnu_then_delete.v'/
+;;   `bat6/f03_noinst_rerun.v' in the M150 ground truth). Measured
+;;   against GNU Emacs 30.2 and judged semantically by
+;;   `slang-server' (`verible-verilog-syntax' is SYNTAX-only and accepts
+;;   every shape below, GNU's included):
+;;   - The list holds ONLY ANSI declarations (or only comments/
+;;     directives): GNU's comma-form applies (section below), slang
+;;     clean (`bat/a07', `bat2/b01'/`b02'/`b03'/`b05', `bat4/d01'/`d03',
+;;     `bat7/g01').
+;;   - The list holds at least one BARE non-ANSI port name (`clk', no
+;;     direction/type -- mixing that with a generated ANSI declaration
+;;     is illegal Verilog): refuse, recording the module name in the
+;;     NEW `verilog-auto--non-ansi-port-list-modules' list, same shape
+;;     as the guard above. GNU emits code here that slang rejects
+;;     (`expected identifier'/`can't use port declaration in module
+;;     with ANSI style port list' -- `bat/a14'/`a16', `bat4/d02',
+;;     `fixtures/a_outp_ownline.v'/`outp_ctrl.v').
+;;   Comma-form's own terminator/comma-repair rules are `verilog-auto--
+;;   port-decl-line's new TERM parameter plus `verilog-auto--expand-
+;;   port-propagation-insert's own COMMA-P branch -- see that
+;;   function's doc string for the close/open repair rules themselves
+;;   (GNU measured, `bat4/d01'/`d03', `bat6/f03', `bat7/g01').
 ;; - A candidate name already declared elsewhere in the enclosing module
 ;;   (Reticle divergence -- GNU emits a genuine duplicate declaration
 ;;   here, confirmed by a real run, spec section 1.5 case 21) is skipped
@@ -306,13 +371,35 @@
 ;;   AUTOINST-GENERATED connections, spec section 1.5 case 20): every
 ;;   `named_port_connection' of every instantiation on a FRESH reparse is
 ;;   a candidate, generated or hand-written alike -- the same rule
-;;   AUTOWIRE already uses, and strictly more useful (a hand-wired
+;;   AUTOWIRE uses, and strictly more useful (a hand-wired
 ;;   `.gnt_o(gnt_o)' with `gnt_o' undeclared is exactly a signal that
 ;;   wants a port). Only a BARE identifier, or a bare identifier with a
 ;;   single non-nested bit-select/part-select of the WHOLE signal
 ;;   (`rdata_o[DataWidth-1:0]'), counts -- anything else (concatenation,
 ;;   an expression, a constant) contributes nothing
 ;;   (`verilog-auto--connection-candidate-name').
+;;
+;;   M152 CORRECTION: as of M125 the sentence above ("the same rule
+;;   AUTOWIRE uses") was actually FALSE -- AUTOWIRE's own candidate
+;;   filter was still the narrower `verilog-auto--bare-identifier-p'
+;;   (bare identifiers only), so a template-generated OUTPUT connection
+;;   with its own bit/part-select (exactly `rdata_a_o(operand_a
+;;   [DataWidth-1:0])', real AUTO_TEMPLATE material) was silently
+;;   dropped by AUTOWIRE and never declared, leaving the generated
+;;   Verilog with an undeclared net, while AUTOOUTPUT/AUTOINPUT already
+;;   used this wider rule correctly.
+;;   `verilog-auto--expand-autowire-site' now calls the same
+;;   `verilog-auto--connection-candidate-name', so the sentence above is
+;;   true as written. M152 also fixed the DECLARED-RANGE side of the
+;;   same gap in BOTH directions: the range used to always come from
+;;   the submodule's own declared port width regardless of what the
+;;   connection itself selected, so even a matched connection like
+;;   `rdata_a_o' above would have compiled with the wrong width; it now
+;;   comes from the connection's own bit/part-select when it has one
+;;   (`verilog-auto--connection-own-range'), for AUTOWIRE and for
+;;   AUTOOUTPUT/AUTOINPUT/AUTOINOUT alike, falling back to the
+;;   submodule's declared range only for a bare connection (unchanged
+;;   from before M152).
 ;; - A port whose direction classifies as `'interface' (an actual
 ;;   interface-modport ANSI port, `verilog-auto--port-direction-of')
 ;;   contributes to none of the three commands, matching the existing
@@ -539,6 +626,16 @@ by AUTOINST's `[]'/`[][]' template tokens (section 2.3). Same shape as
 RETURN CONTRACT stays unchanged; this is purely an additional side
 effect at the same site.")
 (defvar verilog-auto--ansi-port-auto-modules nil)
+(defvar verilog-auto--non-ansi-port-list-modules nil
+  "M150 part 2: module names refused because a directive
+(AUTOOUTPUT/AUTOINPUT/AUTOINOUT) sits inside a non-ANSI port list that
+holds at least one bare port name (`clk', no direction/type) --
+mixing an ANSI-style generated declaration into a list like that is
+illegal Verilog (measured: slang reports `expected identifier'/`can't
+use port declaration in module with ANSI style port list' on GNU's own
+output there). Same push/member/nreverse shape as `verilog-auto--ansi-
+port-auto-modules' just above, a SEPARATE list because the two guards
+protect different things and the echo message names them separately.")
 (defvar verilog-auto--predeclared-port-names nil)
 (defvar verilog-auto--port-range-conflicts nil)
 (defvar verilog-auto--port-marker-arg-warnings nil)
@@ -999,13 +1096,55 @@ anonymous token), or nil if NODE has none or is the root."
   (save-excursion (goto-char (treesit-node-start node)) (current-column)))
 
 (defun verilog-auto--line-indent (pos)
-  "The whitespace prefix of POS's own line, from the line's start up to
-POS itself. Assumes POS is the first non-blank thing on its line --
-true of every AUTOWIRE comment this file's convention expects (GNU's
-own convention too: AUTOWIRE sits alone on its own declaration line)."
+  "The leading whitespace of POS's own line: spaces and tabs from the
+line's start up to the first non-blank character, or up to POS itself
+if POS comes first. M150: previously returned the literal text from
+line-beginning-position to POS, which -- whenever the AUTO directive
+was not the first non-blank thing on its line (code before it, e.g.
+`wire foo; /*AUTOWIRE*/', or a header like `module top
+(/*AUTOINPUT*/') -- duplicated that leading text onto every inserted
+line (measured: `wire foo;' repeated on the Beginning/decl/End lines).
+GNU's rule, measured across 8 fixtures, is the line's own
+indentation (column 2 for the `wire foo;' case; column 0 for the
+`module top (' case), never what happens to sit before the directive."
   (save-excursion
     (goto-char pos)
-    (buffer-substring (line-beginning-position) pos)))
+    (let* ((text (buffer-substring (line-beginning-position) pos))
+           (idx (string-match "[^ \t]" text)))
+      (if idx (substring text 0 idx) text))))
+
+(defun verilog-auto--split-trailing-directive-text (indent)
+  "Defect D (M150): call this immediately after inserting a generated
+AUTO block that ends in \"// End of automatics\", with POINT sitting
+right after that text and INDENT the same leading-whitespace string
+`verilog-auto--line-indent' computed for the block. If the AUTO
+directive had non-whitespace text after it on its own source line --
+`  /*AUTOWIRE*/ wire x;' or `module top (/*AUTOOUTPUT*/);' -- that
+text is now sitting immediately after the inserted block on the same
+line, and blindly leaving it there merges it into the \"// End of
+automatics\" line comment, silently eating a declaration the user
+wrote (measured, `bat8/h01_body_trailing_text.v': `wire x;' vanishes
+into `// End of automatics wire x;'). GNU instead leaves the text on
+the directive's own line, before the inserted block -- this file
+cannot copy that, because inside a port list (part 2 of this
+milestone) the trailing text can be more port syntax
+(`input clk, input rst)'), and appending after end-of-line would place
+the generated block outside the list. Decision: split the line. The
+trailing text moves to its own new line right after \"// End of
+automatics\", reindented with INDENT; the whitespace that had
+separated it from the directive is dropped. This preserves the exact
+token stream -- only a line break and the generated block are added --
+so it stays valid wherever the site itself was valid. When nothing
+follows before the newline, this is a no-op. A lone `\\r' immediately
+before the newline (a CRLF-terminated file) does not count as trailing
+content either -- treated as whitespace here, same as a space or tab,
+so a directive alone on its own CRLF-terminated line is not spuriously
+split."
+  (let* ((text (buffer-substring (point) (line-end-position)))
+         (idx (string-match "[^ \t\r]" text)))
+    (when idx
+      (delete-region (point) (+ (point) idx))
+      (insert "\n" indent))))
 
 (defun verilog-auto--filter (pred list)
   (let (acc)
@@ -1058,6 +1197,126 @@ the same as HEADER's own last child, which is the header's trailing
 HEADER itself)."
   (or (verilog-auto--find-first-of-type header "list_of_ports")
       (verilog-auto--find-first-of-type header "list_of_port_declarations")))
+
+(defun verilog-auto--header-port-list-paren-range (header)
+  "HEADER's own port-list `(' and `)' as a (OPEN . CLOSE) cons of
+buffer positions -- OPEN the position of the `(' character itself,
+CLOSE the position of the matching `)' character -- M150 part 2.
+Found by a plain LEXICAL scan of HEADER's own text
+(`verilog-auto--lex-paren-pairs', defined below, forward-referenced
+here), never by treesit node TYPE: `verilog-auto--header-port-list's
+own `list_of_port_declarations'/`list_of_ports' node type is not
+something this function trusts to survive an ERROR node. After
+`verilog-delete-auto' a comma can be left dangling right before the
+closing `)' (`input clk,' + a bare directive comment + `)'), and pass
+2 of `verilog-auto' sees exactly that shape
+(`bat6/f01_d01_gnu_then_delete.v'/`bat6/f03_noinst_rerun.v', M150
+ground truth) -- a lexical scan never depends on how tree-sitter's
+error recovery classified anything inside HEADER's own span, so it
+survives that case unchanged.
+
+HEADER's own port-list parens are its LAST top-level (not nested
+inside any other) parenthesised pair: an optional `#(parameter ...)'
+parameter-port-list, if present, is the header's only OTHER top-level
+pair, and it always comes first, textually, before the port list.
+nil if HEADER has no top-level `(' at all (`module top;')."
+  (let* ((start (treesit-node-start header))
+         (text (buffer-substring-no-properties start (treesit-node-end header)))
+         (pairs (plist-get (verilog-auto--lex-paren-pairs text) :pairs))
+         (closed (verilog-auto--filter (lambda (p) (nth 1 p)) pairs))
+         (top (verilog-auto--filter
+               (lambda (p)
+                 (not (verilog-auto--filter
+                       (lambda (q)
+                         (and (not (eq p q))
+                              (< (car q) (car p))
+                              (< (nth 1 p) (nth 1 q))))
+                       closed)))
+               closed))
+         (sorted (sort (copy-sequence top) (lambda (a b) (< (car a) (car b))))))
+    (when sorted
+      (let ((last (car (last sorted))))
+        (cons (+ start (car last)) (+ start (nth 1 last)))))))
+
+(defun verilog-auto--comment-in-header-port-list-p (header comment)
+  "Non-nil if COMMENT's own start position sits strictly between
+HEADER's own port-list `(' and `)' (`verilog-auto--header-port-list-
+paren-range') -- M150 part 2's port-list-vs-body classification, by
+POSITION rather than by which node currently encloses COMMENT (see
+that function's own doc string for why position, not node type)."
+  (let ((range (verilog-auto--header-port-list-paren-range header)))
+    (and range
+         (< (car range) (treesit-node-start comment))
+         (< (treesit-node-start comment) (cdr range)))))
+
+(defun verilog-auto--header-port-list-bare-name-p (header)
+  "Non-nil if HEADER's own port list holds at least one BARE non-ANSI
+port name (a `port' node -- `clk', no direction/type) -- M150 part
+2's refusal condition: mixing an ANSI-style generated declaration into
+a list holding a bare name is illegal Verilog (measured, slang:
+`expected identifier'/`can't use port declaration in module with ANSI
+style port list' on GNU's own output there -- ground truth `a14'/
+`a16'/`d02'). Reuses the SAME `port' node-type search
+`verilog-auto--module-own-port-names' already runs for its own
+non-ANSI branch."
+  (and (verilog-auto--find-all-of-type header "port") t))
+
+(defun verilog-auto--skip-ws-and-comments-forward (pos)
+  "The first position at or after POS that is neither whitespace nor
+part of a `//' or `/* */' comment -- M150 part 2's close-repair rule
+needs the next REAL token after a directive's own site, skipping any
+number of interleaved comments (an earlier site's own `// End of
+automatics'/`// From ...' lines included)."
+  (save-excursion
+    (goto-char pos)
+    (let ((again t))
+      (while again
+        (setq again nil)
+        (while (memq (char-after) '(?\s ?\t ?\r ?\n))
+          (forward-char 1))
+        (cond
+         ((looking-at "//") (end-of-line) (setq again t))
+         ((looking-at "/\\*")
+          (if (search-forward "*/" nil t) (setq again t) (goto-char (point-max)))))))
+    (point)))
+
+(defun verilog-auto--last-real-char-before (start pos)
+  "The buffer position of the LAST character strictly before POS
+(never reading at or past POS) that is neither whitespace nor part of
+a `//' or `/* */' comment, scanning FORWARD from START -- M150 part
+2's open-repair rule needs the previous real token before a directive,
+and scanning forward sidesteps the ambiguity of walking backward
+through an unknown mix of code and trailing comments (`output [7:0]
+wide    // From u1' -- the real last character sits mid-line, not at
+the line's own end). nil if no such character exists between START
+and POS."
+  (save-excursion
+    (goto-char start)
+    (let (last)
+      (while (< (point) pos)
+        (cond
+         ((looking-at "//")
+          (end-of-line)
+          (when (> (point) pos) (goto-char pos)))
+         ((looking-at "/\\*")
+          (unless (search-forward "*/" pos t) (goto-char pos)))
+         ((looking-at "[ \t\r\n]") (forward-char 1))
+         (t (setq last (point)) (forward-char 1))))
+      last)))
+
+(defun verilog-auto--insert-comma-preserving-comment-column (pos)
+  "Insert `,' at POS (a buffer position immediately after some real
+token -- `verilog-auto--last-real-char-before's own return value,
++1), eating one of the following spaces first when POS is followed by
+two or more spaces then a `//' comment, so the comment's own column
+does not move -- M150 part 2's open-repair rule
+(`bat4/d01_ansi_prev_no_comma.v'/`bat7/g01_src.v'). Falls back to a
+plain insert when POS isn't followed by that shape."
+  (save-excursion
+    (goto-char pos)
+    (when (looking-at "  +//")
+      (delete-char 1))
+    (insert ",")))
 
 ;; --- Module lookup (current buffer, then library directories) -----------
 
@@ -3575,8 +3834,9 @@ that's still recorded, just never silent)."
 
 (defun verilog-auto--connection-candidate-name (ctext)
   "CTEXT (a connection's own exact, already `string-trim'med text) as a
-candidate signal name for AUTOOUTPUT/AUTOINPUT/AUTOINOUT (spec section
-2.5, rule 2): CTEXT itself when it's a bare identifier
+candidate signal name for AUTOOUTPUT/AUTOINPUT/AUTOINOUT/AUTOWIRE
+(M152: this is now shared by all four -- see that milestone's header):
+CTEXT itself when it's a bare identifier
 (`verilog-auto--bare-identifier-p'), or the identifier prefix of a bare
 identifier followed by a SINGLE, non-nested bit-select/part-select of
 the WHOLE signal (`rdata_o[DataWidth-1:0]', `rdata_o[3]') -- GNU strips
@@ -3588,6 +3848,150 @@ otherwise composite expression) returns nil."
    ((string-match "\\`\\([A-Za-z_$][A-Za-z0-9_$]*\\)\\[[^][]*\\]\\'" ctext)
     (match-string 1 ctext))
    (t nil)))
+
+(defun verilog-auto--connection-own-range (ctext)
+  "If CTEXT (a connection's own exact text, `verilog-auto--connection-
+candidate-name' shaped) carries a bit-select or part-select of its own,
+the declared-range text AUTOWIRE/AUTOOUTPUT/AUTOINPUT/AUTOINOUT should
+use for it -- a part-select's own bracket text verbatim (`x[3:0]' ->
+\"[3:0]\"), a bit-select widened to a one-bit range (`x[2]' -> \"[2:2]\")
+-- both measured against real GNU (M152, `dev/gnu-auto/run.sh
+wire_narrow2.v' / `wire_bit2.v': `wire [3:0] my_narrow;' / `wire [2:2]
+my_bit;'). Nil for a bare identifier (no select at all) -- callers fall
+back to the submodule's own declared range in that case, unchanged from
+before M152.
+
+Named gap, not fixed in M152: a SOLITARY symbolic bit-select
+(`bus[i]', `i' not a plain decimal literal -- typically a genvar, not
+visible in the parent module at all) is widened to `[i:i]' here, but
+real GNU emits the bracket text verbatim, `[i]', with no widening.
+`wire_symbolic.v' (cited in an earlier draft of this comment) is NOT
+that measurement -- it has TWO connections of the name (`bus[i]' and a
+literal part-select), so it exercises `verilog-auto--union-select-
+ranges''s conflict path, not this function alone. The actual solitary
+case was measured directly against GNU 30.2 in fix round 2 (M152): one
+instance, one connection, `sub_out8 u_sub (.dout(bus[i]));' with no
+other connection of `bus' anywhere, expands to `wire [i] bus;' -- the
+bracket kept verbatim, confirming the gap this paragraph describes
+without a reproducible fixture path to cite. This function has no
+way to tell a symbolic single index from a literal one without
+reparsing the bracket text a second time, and the two disagree only in
+this one narrow shape, so it is left as -- a real, known divergence,
+not a silent one."
+  (when (string-match "\\`[A-Za-z_$][A-Za-z0-9_$]*\\[\\([^][]*\\)\\]\\'" ctext)
+    (let ((sel (match-string 1 ctext)))
+      (if (string-match-p ":" sel)
+          (concat "[" sel "]")
+        (concat "[" sel ":" sel "]")))))
+
+(defun verilog-auto--all-strings-equal-p (strings)
+  "Non-nil if every element of STRINGS (a non-empty list) `string='s the
+first one. Hand-rolled rather than `delete-dups' + `cdr' (this
+homegrown interpreter doesn't implement `delete-dups')."
+  (let ((first (car strings)) (rest (cdr strings)) (ok t))
+    (while (and ok rest)
+      (unless (string= (car rest) first) (setq ok nil))
+      (setq rest (cdr rest)))
+    ok))
+
+(defun verilog-auto--range-int-bounds (range-text)
+  "RANGE-TEXT (bracket included, `verilog-auto--connection-own-range'
+shaped, e.g. \"[7:4]\" or \"[3:3]\") with BOTH bounds plain decimal
+literals -> (HIGH . LOW) as integers, HIGH and LOW exactly as written
+(not reordered -- an ascending select's own bounds stay ascending in
+the pair). Nil for anything that isn't two plain decimal literals: a
+parameter (`[DataWidth-1:0]'), a genvar/expression (`[i]', `[i:0]'),
+or no range at all."
+  (when (and range-text
+             (string-match "\\`\\[\\([0-9]+\\):\\([0-9]+\\)\\]\\'" range-text))
+    (cons (string-to-number (match-string 1 range-text))
+          (string-to-number (match-string 2 range-text)))))
+
+(defun verilog-auto--union-select-ranges (range-texts)
+  "RANGE-TEXTS, one entry per connection that carries an explicit own
+bit/part-select (`verilog-auto--connection-own-range', bracket
+included), in first-seen order -- connections with NO select of their
+own (bare identifiers) contribute nothing here and must be filtered
+out by the caller before this is reached.
+
+With a single entry, returned verbatim: a lone ascending select is
+never renormalized (measured, `dev/gnu-auto/run.sh wire_ascending.v':
+`.dout(bus[0:3])' alone -> `wire [0:3] bus;', not `[3:0]').
+
+With two or more entries, when EVERY one parses as plain decimal
+integer bounds (`verilog-auto--range-int-bounds', HIGH . LOW exactly as
+written, never reordered), this classifies each pair as DESCENDING
+(HIGH > LOW), ASCENDING (HIGH < LOW), or direction-less (HIGH = LOW, a
+bit-select -- it joins either group without forcing one):
+
+- every pair descending, or every pair direction-less (all bit-selects)
+  -> `[MAX:MIN]' over every bound of every entry, the same shape as
+  before M152's fix round 2 and the only one measured against real GNU
+  (`verilog-signals-combine-bus') -- several `dev/gnu-auto/run.sh
+  wire_*.v' shapes: `bus[7:4]'+`bus[0]' -> `[7:0]', `bus[3:0]'+
+  `bus[7:4]' -> `[7:0]', `bus[0]'+`bus[3]' -> `[3:0]', `bus[3:0]' twice
+  -> `[3:0]', a bare connection mixed with one bit-select
+  (`.out0(bus)'+`.out1(bus[1])') -> `[1:1]' with the bare connection's
+  own (possibly much wider) submodule width completely ignored, not
+  unioned in (measured, `wire_bare_wide_and_bit.v': an 8-bit bare
+  `out0' plus `.out1(bus[9])' still produces `wire [9:9] bus;', not
+  `[9:0]').
+- every pair ascending, or ascending mixed with direction-less entries
+  -> ascending `[MIN:MAX]' over every bound of every entry -- a
+  DELIBERATE divergence from GNU's own `verilog-signals-combine-bus'
+  (fix round 2, cold review of the M152 first-round mutation testing):
+  GNU takes the max of every pair's FIRST bound and the min of every
+  pair's SECOND bound regardless of direction, which for an all-
+  ascending union produces an answer no narrower selection could have
+  produced (measured, `dev/gnu-auto/run.sh wire_asc_asc_mix.v':
+  `bus[0:3]'+`bus[4:7]' -> GNU's own `wire [4:3] bus;', backwards and
+  disjoint from both inputs) and for identical ascending selects merely
+  happens to look right (`wire_asc_identical.v': `bus[0:3]' twice ->
+  `wire [0:3] bus;', which the `[MIN:MAX]' rule below also produces).
+  This codebase instead unions the bounds the same way the descending
+  case does, just keeping the ascending direction: `bus[0:3]'+
+  `bus[4:7]' -> `[0:7]', `bus[0:3]' twice -> `[0:3]'.
+- a mix of at least one strictly ascending pair and at least one
+  strictly descending pair -> the union cannot be computed, nil, same
+  as the symbolic case below. This too deliberately diverges from GNU:
+  GNU merges them anyway by the same max-of-first/min-of-second rule
+  above and produces a range that happens to look plausible for THIS
+  shape (measured, `dev/gnu-auto/run.sh wire_asc_desc_mix.v':
+  `bus[0:3]'+`bus[7:4]' -> GNU's own `wire [7:3] bus;') but is not a
+  principled merge of an ascending and a descending selection of the
+  same bus, and the ascending-only rule above shows GNU's formula
+  cannot be trusted in general once ascending selects are involved.
+  Reticle reports this as a width conflict instead of guessing.
+
+Otherwise (a parameter, a genvar, an expression mixed with a literal,
+e.g. `bus[i]'+`bus[3:0]') the union cannot be computed and this returns
+nil -- named gap, not fixed in M152: GNU's actual behaviour there
+(measured, `wire_symbolic_mixed_part.v') is to keep the FIRST
+connection's own select text VERBATIM, undecorated (`[i]', not the
+widened `[i:i]' a solitary symbolic bit-select gets elsewhere in this
+file), plus a `, Couldn't Merge' provenance suffix this file does not
+reproduce (AUTOWIRE/AUTOOUTPUT/AUTOINPUT/AUTOINOUT carry no per-
+declaration provenance comment at all, a pre-M152 divergence). Callers
+fall back to first-seen and record a width conflict instead."
+  (cond
+   ((null range-texts) nil)
+   ((null (cdr range-texts)) (car range-texts))
+   (t
+    (let ((bounds (mapcar #'verilog-auto--range-int-bounds range-texts)))
+      (if (memq nil bounds)
+          nil
+        (let ((ascending nil) (descending nil))
+          (dolist (b bounds)
+            (cond ((< (car b) (cdr b)) (setq ascending t))
+                  ((> (car b) (cdr b)) (setq descending t))))
+          (if (and ascending descending)
+              nil
+            (let* ((all (append (mapcar #'car bounds) (mapcar #'cdr bounds)))
+                   (hi (apply #'max all))
+                   (lo (apply #'min all)))
+              (if ascending
+                  (format "[%d:%d]" lo hi)
+                (format "[%d:%d]" hi lo))))))))))
 
 (defun verilog-auto--port-propagation-candidates (module-decl)
   "Every bare-connection candidate signal for AUTOOUTPUT/AUTOINPUT/
@@ -3606,10 +4010,29 @@ CONFLICTS):
   `, ...' provenance ellipsis (spec section 1.4).
 - ORDER: NAME list, first-CONNECTION order, deduped.
 - CONFLICTS: NAME list (unordered w.r.t. ORDER, but each pushed once)
-  for which some LATER contributing connection's own param-substituted
-  range text disagreed with the FIRST one's -- the first-seen range
-  still wins in TABLE (matching AUTOWIRE's own dedup), this list exists
-  purely so the disagreement isn't silent (spec section 2.4).
+  for which RANGE could not be settled by the merge below -- the
+  first-seen range still wins in TABLE, this list exists purely so the
+  disagreement isn't silent (spec section 2.4).
+
+M152: RANGE used to be whichever contributing connection's own
+param-substituted range text was seen FIRST, with any later
+disagreement going straight to CONFLICTS. It is now computed the same
+way AUTOWIRE computes its own merged range
+(`verilog-auto--union-select-ranges', shared between the two commands
+-- measured against real GNU to follow the identical rule for both,
+`dev/gnu-auto/run.sh output_*2.v'/`input_*2.v'): every contributing
+connection that carries its OWN bit/part-select
+(`verilog-auto--connection-own-range') feeds that selection into the
+union: `[7:4]'+`[0]' -> `[7:0]', `[0]'+`[3]' -> `[3:0]', a bare
+connection mixed with one bit-select -> the bit-select's range alone,
+the bare connection's own (possibly wider) submodule width dropped
+entirely, not unioned in. A connection with NO select of its own
+contributes only its bare, param-substituted submodule range, used ONLY
+when EVERY contributing connection of the name is bare (unchanged
+mechanism from before M152, first-seen wins, a later disagreement goes
+to CONFLICTS). The union step itself falls back to CONFLICTS the same
+way AUTOWIRE's does when it can't be computed (a symbolic bound mixed
+in with a literal one).
 
 A port whose OWN direction classifies as `'interface' (an actual
 interface-modport ANSI port) contributes to none of the three commands
@@ -3647,20 +4070,41 @@ verilog-mode does."
                     (when (and cand (not (eq (nth 1 pinfo) 'interface)))
                       (let* ((dir (nth 1 pinfo))
                              (finfo (and full (assoc pname full)))
-                             (range (verilog-auto--substitute-params (or (nth 2 pinfo) "") overrides))
+                             (own-select (verilog-auto--connection-own-range ctext))
+                             (fallback (verilog-auto--substitute-params
+                                        (or (nth 2 pinfo) "") overrides))
                              (type (and finfo (nth 3 finfo)))
                              (existing (gethash cand table)))
-                        (if (not existing)
-                            (progn
-                              (puthash cand (vector (list dir) type range inst-name mod-text 1) table)
-                              (push cand order))
-                          (progn
-                            (unless (member dir (aref existing 0))
-                              (aset existing 0 (cons dir (aref existing 0))))
-                            (aset existing 5 (1+ (aref existing 5)))
-                            (let ((existing-range (or (aref existing 2) "")))
-                              (unless (or (string= range existing-range) (member cand conflicts))
-                                (push cand conflicts)))))))))))))))
+                        (unless existing
+                          (setq existing (vector (list dir) type nil inst-name mod-text 0 nil nil))
+                          (puthash cand existing table)
+                          (push cand order))
+                        (unless (member dir (aref existing 0))
+                          (aset existing 0 (cons dir (aref existing 0))))
+                        (aset existing 5 (1+ (aref existing 5)))
+                        (if own-select
+                            (aset existing 6 (cons own-select (aref existing 6)))
+                          (aset existing 7 (cons fallback (aref existing 7))))))))))))))
+    ;; M152: settle each candidate's own RANGE (slot 2) now that every
+    ;; contributing connection has been collected -- see this function's
+    ;; own docstring for the merge rule and `verilog-auto--union-select-
+    ;; ranges' for which shapes are computable.
+    (dolist (cand order)
+      (let* ((v (gethash cand table))
+             (selects (nreverse (aref v 6)))
+             (bares (nreverse (aref v 7))))
+        (aset v 2
+              (cond
+               (selects
+                (let ((union (verilog-auto--union-select-ranges selects)))
+                  (if union
+                      union
+                    (push cand conflicts)
+                    (car selects))))
+               (t
+                (unless (verilog-auto--all-strings-equal-p bares)
+                  (push cand conflicts))
+                (car bares))))))
     (list table (nreverse order) (nreverse conflicts))))
 
 (defun verilog-auto--port-propagation-select (kind table order)
@@ -3735,13 +4179,16 @@ contributed it. nil if LIST is empty."
       (when (or (null best-pos) (< (car e) best-pos))
         (setq best-pos (car e) best-text (cdr e))))))
 
-(defun verilog-auto--port-decl-line (indent kind entry name)
+(defun verilog-auto--port-decl-line (indent kind entry name &optional term)
   "One declaration line's own full text, INDENT included (spec section
-2.1's layout: INDENT DECL-KEYWORD [TYPE] [RANGE] NAME; padded to
+2.1's layout: INDENT DECL-KEYWORD [TYPE] [RANGE] NAME TERM; padded to
 `verilog-auto-inst-column' then the `// From/To ... of ...' provenance
 comment). ENTRY is TABLE's own vector for NAME
 (`verilog-auto--port-propagation-candidates'); KIND selects DECL-KEYWORD
-and the provenance VERB from `verilog-auto--port-kind-specs'."
+and the provenance VERB from `verilog-auto--port-kind-specs'. TERM is
+the line's own terminator string, default `\";\"' (module-body style)
+-- M150 part 2 passes `\",\"' or `\"\"' for the comma-form used inside a
+port list (see `verilog-auto--expand-port-propagation-insert')."
   (let* ((spec (assoc kind verilog-auto--port-kind-specs))
          (decl-kw (nth 3 spec))
          (verb (nth 4 spec))
@@ -3753,15 +4200,48 @@ and the provenance VERB from `verilog-auto--port-kind-specs'."
          (body (concat decl-kw " "
                        (if type (concat type " ") "")
                        (if (and range (> (length range) 0)) (concat range " ") "")
-                       name ";"))
+                       name (or term ";")))
          (comment (format "// %s %s of %s%s" verb inst mod (if (> count 1) ", ..." ""))))
     (concat indent (verilog-auto--pad-to-column body verilog-auto-inst-column (length indent)) comment)))
 
-(defun verilog-auto--expand-port-propagation-insert (kind comment header module-decl table order arg)
+(defun verilog-auto--expand-port-propagation-insert (kind comment header module-decl table order arg comma-p)
   "Insert KIND's own declaration block right after COMMENT, if ORDER's
 selected, filtered, sorted names is non-empty (spec section 1.6: an
 empty candidate set inserts nothing at all -- not even bare Begin/End
-markers). Returns the number of declarations inserted."
+markers). Returns the number of declarations inserted.
+
+COMMA-P (M150 part 2) is non-nil when COMMENT sits inside HEADER's own
+port-list parens (`verilog-auto--comment-in-header-port-list-p'):
+declarations then terminate with `,' (GNU comma-form, ground truth
+section 3/`part2-decisions.md') instead of `;', and the comma-repair
+rules run around the inserted block, all decided by a plain lexical
+scan of HEADER's own text so they keep working on an ERROR-containing
+tree (`verilog-auto--header-port-list-paren-range's own doc string):
+
+- CLOSE-NEEDED: if the next real token after COMMENT (skipping
+  whitespace/comments, `verilog-auto--skip-ws-and-comments-forward')
+  is `)', the LAST emitted declaration gets no comma (so the item that
+  ends up adjacent to `)' never has a trailing comma) -- and this
+  still applies even when nothing is inserted at all: a comma left
+  dangling right before `)' by a PREVIOUS declaration (delete-auto's
+  own leftover, `bat6/f03_noinst_rerun.v') is removed.
+- OPEN REPAIR: whenever something IS about to be inserted, the real
+  token immediately before COMMENT (`verilog-auto--last-real-char-
+  before', scanning from the port list's own `(') gets a `,' appended
+  unless it already ends in `(' or `,' -- needed regardless of
+  CLOSE-NEEDED (`bat4/d01_ansi_prev_no_comma.v': the previous token
+  gets a comma even though the new block's own last line ends up with
+  none, because it now sits ahead of inserted content, not directly
+  before `)').
+
+Edit ORDERING matters for treesit-node-start/end validity on the STALE
+COMMENT node once this function starts mutating the buffer: every
+value derived from COMMENT itself (INDENT, the insertion point) is
+read before ANY edit happens; the block insertion (the rightmost edit)
+happens first; open repair's own edit point (a plain integer,
+`(1+ PREV)', computed from the pre-edit buffer) is strictly to the
+LEFT of the block-insertion point and is therefore still numerically
+valid afterward -- so it can safely run second."
   (let* ((own (verilog-auto--module-own-port-names module-decl header))
          (declared (verilog-auto--declared-names module-decl))
          (selected (verilog-auto--port-propagation-select kind table order))
@@ -3780,17 +4260,36 @@ markers). Returns the number of declarations inserted."
                nil)
               (t (verilog-auto--port-marker-signal-passes-p name arg))))
            selected))
-         (sorted (sort (copy-sequence filtered) #'string<)))
+         (sorted (sort (copy-sequence filtered) #'string<))
+         (comment-start (treesit-node-start comment))
+         (comment-end (treesit-node-end comment))
+         (close-needed
+          (and comma-p
+               (eq (char-after (verilog-auto--skip-ws-and-comments-forward comment-end)) ?\))))
+         (range (and comma-p (verilog-auto--header-port-list-paren-range header)))
+         (open (and range (1+ (car range))))
+         (prev (and open (verilog-auto--last-real-char-before open comment-start))))
     (when sorted
-      (let ((indent (verilog-auto--line-indent (treesit-node-start comment))))
-        (goto-char (treesit-node-end comment))
+      (let ((indent (verilog-auto--line-indent comment-start))
+            (n (length sorted)) (i 0))
+        (goto-char comment-end)
         (insert
          "\n" indent begin-comment
          (mapconcat
           (lambda (name)
-            (concat "\n" (verilog-auto--port-decl-line indent kind (gethash name table) name)))
+            (setq i (1+ i))
+            (let ((term (cond ((not comma-p) ";")
+                               ((and close-needed (= i n)) "")
+                               (t ","))))
+              (concat "\n" (verilog-auto--port-decl-line indent kind (gethash name table) name term))))
           sorted "")
-         "\n" indent "// End of automatics")))
+         "\n" indent "// End of automatics")
+        (verilog-auto--split-trailing-directive-text indent))
+      (when (and comma-p prev (not (memq (char-after prev) '(?\( ?\,))))
+        (verilog-auto--insert-comma-preserving-comment-column (1+ prev))))
+    (when (and comma-p (not sorted) close-needed prev (eq (char-after prev) ?\,))
+      (goto-char prev)
+      (delete-char 1))
     (length sorted)))
 
 (defun verilog-auto--expand-port-propagation-site (kind comment)
@@ -3804,17 +4303,36 @@ bare `verilog-auto--ansi-header-p' -- a port-less ANSI header (`module
 top;') declares no ports inline at all, so there is nothing for this
 site to be redundant with; GNU (measured, M134 recon) expands it
 exactly like a non-ANSI header. Only a header that actually carries an
-inline port list has \"nothing left to add\"."
+inline port list has \"nothing left to add\".
+
+M150 part 2: the port-list-vs-body decision (`verilog-auto--comment-
+in-header-port-list-p') runs BEFORE the M134 guard above, not after --
+an ANSI port list holding `input clk' IS \"ANSI with ports\" by that
+guard's own definition, and would otherwise be refused even when
+COMMENT sits inside the very list the guard means to protect. A
+directive inside the port list is either GNU's comma-form (COMMA-P,
+`verilog-auto--expand-port-propagation-insert') or, when the list
+holds a bare non-ANSI port name, a THIRD refusal distinct from the
+M134 one, recorded in `verilog-auto--non-ansi-port-list-modules'
+instead (see that variable's own doc string for why GNU's own output
+there is invalid Verilog)."
   (let* ((keyword (nth 1 (assoc kind verilog-auto--port-kind-specs)))
          (module-decl (verilog-auto--enclosing-of-types
                        comment '("module_declaration" "interface_declaration")))
-         (header (verilog-auto--header-node module-decl)))
-    (if (verilog-auto--ansi-header-with-ports-p header)
-        (progn
-          (let ((nm (verilog-auto--module-name module-decl)))
-            (unless (member nm verilog-auto--ansi-port-auto-modules)
-              (push nm verilog-auto--ansi-port-auto-modules)))
-          0)
+         (header (verilog-auto--header-node module-decl))
+         (in-port-list (verilog-auto--comment-in-header-port-list-p header comment)))
+    (cond
+     ((and in-port-list (verilog-auto--header-port-list-bare-name-p header))
+      (let ((nm (verilog-auto--module-name module-decl)))
+        (unless (member nm verilog-auto--non-ansi-port-list-modules)
+          (push nm verilog-auto--non-ansi-port-list-modules)))
+      0)
+     ((and (not in-port-list) (verilog-auto--ansi-header-with-ports-p header))
+      (let ((nm (verilog-auto--module-name module-decl)))
+        (unless (member nm verilog-auto--ansi-port-auto-modules)
+          (push nm verilog-auto--ansi-port-auto-modules)))
+      0)
+     (t
       (let* ((arg (verilog-auto--port-marker-arg comment keyword))
              (result (verilog-auto--port-propagation-candidates module-decl))
              (table (nth 0 result)) (order (nth 1 result)) (conflicts (nth 2 result))
@@ -3827,7 +4345,8 @@ inline port list has \"nothing left to add\"."
                       (format "%s(...) in module %s: malformed regexp argument, treated as no filter"
                               keyword (verilog-auto--module-name module-decl)))
                 verilog-auto--port-marker-arg-warnings))
-        (verilog-auto--expand-port-propagation-insert kind comment header module-decl table order arg)))))
+        (verilog-auto--expand-port-propagation-insert
+         kind comment header module-decl table order arg in-port-list))))))
 
 (defun verilog-auto--expand-all-port-propagation (kind)
   "Expand every KIND ('output/'input/'inout) AUTOOUTPUT/AUTOINPUT/
@@ -4005,13 +4524,48 @@ grammar's exact nested shape for `bus[3:0]' or `{a,b}'."
 (defun verilog-auto--expand-autowire-site (comment)
   "Expand one /*AUTOWIRE*/ site. Returns the number of wire
 declarations inserted (0 if the candidate set is empty -- no
-Beginning/End markers are inserted in that case, GNU style)."
+Beginning/End markers are inserted in that case, GNU style).
+
+M152: the candidate filter used to be `verilog-auto--bare-identifier-
+p', which silently dropped a connection like `rdata_a_o(operand_a
+[DataWidth-1:0])' (a template-generated part-select on an OUTPUT
+connection) -- the declared width never got emitted and the generated
+Verilog didn't compile. It now shares `verilog-auto--connection-
+candidate-name' with AUTOOUTPUT/AUTOINPUT/AUTOINOUT (a bare identifier,
+or a bare identifier with one non-nested trailing bit/part-select), and
+takes the declared range from the CONNECTION's own select
+(`verilog-auto--connection-own-range') when it has one, falling back to
+the submodule's declared range only for a BARE connection (unchanged
+from before M152). Several connections of the SAME candidate name, each
+carrying its own bit/part-select, merge into one `[MAX:MIN]' range the
+way GNU does (`verilog-auto--union-select-ranges'; that function's own
+header lists exactly which shapes were measured and which are a named
+gap). A bare connection contributes NO range at all to that merge, only
+membership -- an explicit select on ANY connection of the name wins
+outright over the submodule's own declared width for a bare one
+(measured, that function's header).
+
+When the merge across selects can't be computed (a symbolic bound mixed
+in, or ascending and descending selects of one name mixed), or when
+every connection of the name is bare and their fallback ranges
+disagree, the first-seen range is kept and the name is reported rather
+than guessed at. For a symbolic bound or disagreeing bare ranges the
+result is legal Verilog, if possibly narrower than GNU's own answer.
+For mixed directions it is NOT: one declaration cannot match both, so a
+later connection is a reversed select (slang: `range-select-reversed',
+severity 1). There is no legal single declaration to emit in that case;
+the report is what keeps it from being silent. The name is pushed into `verilog-auto--port-range-conflicts' -- the
+same list AUTOOUTPUT/AUTOINPUT/AUTOINOUT report through
+(`verilog-auto--port-propagation-candidates'), so the echoed count and
+`first:' name cover both commands together, not two independent
+tallies."
   (let* ((module-decl (verilog-auto--enclosing-of-types
                        comment '("module_declaration" "interface_declaration")))
          (declared (verilog-auto--declared-names module-decl))
          (insts (verilog-auto--find-all-of-type module-decl "module_instantiation"))
-         (seen (make-hash-table :test 'equal))
-         (candidates nil))
+         (pos (treesit-node-start comment))
+         (table (make-hash-table :test 'equal))
+         (order nil))
     (dolist (mi insts)
       (let* ((type-name (treesit-node-text
                           (treesit-node-child-by-field-name mi "instance_type")))
@@ -4038,31 +4592,59 @@ Beginning/End markers are inserted in that case, GNU style)."
             (let* ((pname (verilog-auto--connection-port-name conn))
                    (cnode (and pname (treesit-node-child-by-field-name conn "connection")))
                    (ctext (and cnode (string-trim (treesit-node-text cnode))))
-                   (pinfo (and pname (assoc pname ports))))
-              (when (and pinfo
-                         ctext
-                         (eq (nth 1 pinfo) 'output)
-                         (verilog-auto--bare-identifier-p ctext)
-                         (not (member ctext declared))
-                         (not (gethash ctext seen)))
-                (puthash ctext t seen)
-                (push (list ctext (verilog-auto--substitute-params (or (nth 2 pinfo) "") overrides))
-                      candidates)))))))
-    (setq candidates (nreverse candidates))
-    (when candidates
+                   (pinfo (and pname (assoc pname ports)))
+                   (cand (and pinfo ctext (eq (nth 1 pinfo) 'output)
+                              (verilog-auto--connection-candidate-name ctext))))
+              (when (and cand (not (member cand declared)))
+                (let ((own-select (verilog-auto--connection-own-range ctext))
+                      (fallback (verilog-auto--substitute-params
+                                 (or (nth 2 pinfo) "") overrides))
+                      (existing (gethash cand table)))
+                  (unless existing
+                    (setq existing (vector nil nil))
+                    (puthash cand existing table)
+                    (push cand order))
+                  (if own-select
+                      (aset existing 0 (cons own-select (aref existing 0)))
+                    (aset existing 1 (cons fallback (aref existing 1)))))))))))
+    (setq order (nreverse order))
+    (when order
+      (let ((conflicts nil))
+        (maphash
+         (lambda (_cand v)
+           (let* ((selects (nreverse (aref v 0)))
+                  (bares (nreverse (aref v 1))))
+             (aset v 0
+                   (cond
+                    (selects
+                     (let ((union (verilog-auto--union-select-ranges selects)))
+                       (if union
+                           union
+                         (push _cand conflicts)
+                         (car selects))))
+                    (t
+                     (unless (verilog-auto--all-strings-equal-p bares)
+                       (push _cand conflicts))
+                     (car bares))))))
+         table)
+        (dolist (c conflicts)
+          (unless (verilog-auto--notice-contains-p verilog-auto--port-range-conflicts c)
+            (push (cons pos c) verilog-auto--port-range-conflicts))))
       (let ((indent (verilog-auto--line-indent (treesit-node-start comment))))
         (goto-char (treesit-node-end comment))
         (insert
          "\n" indent "// Beginning of automatic wires (for undeclared instantiated-module outputs)"
          (mapconcat
-          (lambda (c)
-            (concat "\n" indent
-                    (if (string-empty-p (nth 1 c))
-                        (format "wire %s;" (nth 0 c))
-                      (format "wire %s %s;" (nth 1 c) (nth 0 c)))))
-          candidates "")
-         "\n" indent "// End of automatics")))
-    (length candidates)))
+          (lambda (name)
+            (let ((range (aref (gethash name table) 0)))
+              (concat "\n" indent
+                      (if (or (null range) (string-empty-p range))
+                          (format "wire %s;" name)
+                        (format "wire %s %s;" range name)))))
+          order "")
+         "\n" indent "// End of automatics")
+        (verilog-auto--split-trailing-directive-text indent)))
+    (length order)))
 
 (defun verilog-auto--first-autowire-per-module (comments)
   "COMMENTS (block_comment nodes, /*AUTOWIRE*/, in left-to-right
@@ -4210,7 +4792,8 @@ file)."
                 (concat "\n" (verilog-auto--tieoff-decl-line
                               indent decl-kw (nth 3 r) (nth 1 r) (nth 0 r) (nth 2 r))))
               resolved "")
-             "\n" indent "// End of automatics")))
+             "\n" indent "// End of automatics")
+            (verilog-auto--split-trailing-directive-text indent)))
         (length resolved)))))
 
 (defun verilog-auto--expand-all-autotieoff ()
@@ -4285,7 +4868,8 @@ with AUTOREG's own job of adding `reg'/`logic' to undeclared outputs."
                               (if (> (length range) 0) (concat " " range) "")
                               " " nm ";")))
                   candidates "")
-                 "\n" indent "// End of automatics")))
+                 "\n" indent "// End of automatics")
+                (verilog-auto--split-trailing-directive-text indent)))
             (length candidates)))))))
 
 (defun verilog-auto--expand-all-autoreg ()
@@ -4738,7 +5322,8 @@ assignment is not IN the marker's own branch at all)."
                   (lambda (r)
                     (concat "\n" (verilog-auto--reset-decl-line indent (nth 1 r) (nth 0 r) (nth 2 r))))
                   resolved "")
-                 "\n" indent "// End of automatics")))
+                 "\n" indent "// End of automatics")
+                (verilog-auto--split-trailing-directive-text indent)))
             (length resolved)))))))
 
 (defun verilog-auto--expand-all-autoreset ()
@@ -5678,7 +6263,8 @@ initializer (`assign x = &{1'b0, /*AUTOUNUSED*/ 1'b0};'/`wire x = &{...};'), exp
             (insert
              "\n" indent "// Beginning of automatic unused inputs"
              (mapconcat (lambda (nm) (concat "\n" indent nm ",")) unread "")
-             "\n" indent "// End of automatics")))
+             "\n" indent "// End of automatics")
+            (verilog-auto--split-trailing-directive-text indent)))
         (length unread))))))
 
 (defun verilog-auto--expand-all-autounused ()
@@ -6760,6 +7346,7 @@ second time. The whole command is one undo group."
           (verilog-auto--missing-modules nil)
           (verilog-auto--ansi-autoarg-modules nil)
           (verilog-auto--ansi-port-auto-modules nil)
+          (verilog-auto--non-ansi-port-list-modules nil)
           (verilog-auto--multi-autowire-modules nil)
           (verilog-auto--template-parse-warnings nil)
           (verilog-auto--predeclared-port-names nil)
@@ -6791,6 +7378,7 @@ second time. The whole command is one undo group."
       (setq verilog-auto--missing-modules (nreverse verilog-auto--missing-modules))
       (setq verilog-auto--ansi-autoarg-modules (nreverse verilog-auto--ansi-autoarg-modules))
       (setq verilog-auto--ansi-port-auto-modules (nreverse verilog-auto--ansi-port-auto-modules))
+      (setq verilog-auto--non-ansi-port-list-modules (nreverse verilog-auto--non-ansi-port-list-modules))
       (setq verilog-auto--multi-autowire-modules (nreverse verilog-auto--multi-autowire-modules))
       (setq verilog-auto--template-parse-warnings (nreverse verilog-auto--template-parse-warnings))
       (setq verilog-auto--ansi-autoreg-modules (nreverse verilog-auto--ansi-autoreg-modules))
@@ -6897,6 +7485,18 @@ second time. The whole command is one undo group."
                           (car verilog-auto--ansi-port-auto-modules)
                           (if (> (length verilog-auto--ansi-port-auto-modules) 1)
                               (format " (%d total)" (length verilog-auto--ansi-port-auto-modules))
+                            ""))
+                "")
+              ;; M150 part 2: same shape, a DIFFERENT refusal (a
+              ;; directive inside a non-ANSI port list that holds a
+              ;; bare port name, not a body placement in an ANSI
+              ;; header) -- see `verilog-auto--non-ansi-port-list-
+              ;; modules's own doc string.
+              (if verilog-auto--non-ansi-port-list-modules
+                  (format "; AUTOOUTPUT/AUTOINPUT/AUTOINOUT in non-ANSI port list (module %s)%s"
+                          (car verilog-auto--non-ansi-port-list-modules)
+                          (if (> (length verilog-auto--non-ansi-port-list-modules) 1)
+                              (format " (%d total)" (length verilog-auto--non-ansi-port-list-modules))
                             ""))
                 "")
               (if verilog-auto--predeclared-port-names

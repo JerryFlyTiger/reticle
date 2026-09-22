@@ -501,17 +501,22 @@ fn user_can_register_a_custom_interpreter_mode_alist_entry() {
 
 // --- 3. background highlighting end-to-end for a sample of the new languages ----
 
-/// Pump ticks (10ms apart, max 2s) until `pred` returns "t". Mirrors
-/// highlight_tests.rs's helper of the same name.
+/// Pump ticks until `pred` returns "t", bounded by a 30s hang-guard
+/// deadline rather than a fixed loop count (M151; see
+/// `highlight_tests.rs`'s helper of the same name for the full
+/// rationale).
 fn tick_until(interp: &mut Interp, pred: &str) -> bool {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         core::idle_tick(interp, std::time::Duration::ZERO);
         if run(interp, pred) == "t" {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    false
 }
 
 const COUNT_HL: &str = "(let ((n 0))

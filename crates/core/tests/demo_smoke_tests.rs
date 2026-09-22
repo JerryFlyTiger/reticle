@@ -151,7 +151,7 @@ fn walk_files(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<Strin
 
 #[test]
 fn every_file_under_demo_opens_in_its_expected_major_mode() {
-    const TABLE: [(&str, &str); 39] = [
+    const TABLE: [(&str, &str); 40] = [
         ("README.md", "fundamental-mode"),
         ("docs/design-notes.org", "org-mode"),
         ("editor/init-example.el", "emacs-lisp-mode"),
@@ -167,6 +167,7 @@ fn every_file_under_demo_opens_in_its_expected_major_mode() {
         ("rtl/bus/axi4_lite_if.sv", "verilog-mode"),
         ("rtl/core/alu.sv", "verilog-mode"),
         ("rtl/core/clk_gate.sv", "verilog-mode"),
+        ("rtl/core/exec_unit.sv", "verilog-mode"),
         ("rtl/core/regfile.sv", "verilog-mode"),
         ("rtl/core/status_regs_stub.sv", "verilog-mode"),
         ("rtl/include/soc_defs.svh", "verilog-mode"),
@@ -787,6 +788,103 @@ fn demo_rtl_sram_dual_channel_autoinst_matches_editor_output() {
     );
 }
 
+/// M153: `rtl/core/exec_unit.sv` is the showcase file for `/*AUTOINPUT*/`
+/// and `/*AUTOOUTPUT*/` sitting INSIDE an ANSI port list (M150), which had
+/// no exercise anywhere under `demo/' before this milestone. Same pinning
+/// discipline as the two tests above, plus an assertion that the two
+/// "Beginning of automatic" banners actually land inside the header's
+/// port-list parentheses -- this test is about port-list AUTOs
+/// specifically, not just AUTOs somewhere in the file.
+#[test]
+fn demo_rtl_exec_unit_port_list_auto_matches_editor_output() {
+    if !verible_verilog_format_available() {
+        let opted_out = matches!(
+            std::env::var(SKIP_ENV_VERIBLE_FORMAT).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        if opted_out {
+            eprintln!(
+                "skipping (opted out via {}): verible-verilog-format is not \
+                 available, demo_rtl_exec_unit_port_list_auto_matches_editor_output was not run",
+                SKIP_ENV_VERIBLE_FORMAT
+            );
+            return;
+        }
+        panic!(
+            "verible-verilog-format is not available -- \
+             demo_rtl_exec_unit_port_list_auto_matches_editor_output was not run. \
+             Failing by default so a missing dependency cannot silently \
+             pass as a green gate. Install Verible \
+             (https://github.com/chipsalliance/verible), or set {}=1 to \
+             deliberately skip on a machine that genuinely lacks it.",
+            SKIP_ENV_VERIBLE_FORMAT
+        );
+    }
+
+    let (mut i, _ed) = setup();
+    let path = demo_root().join("rtl/core/exec_unit.sv");
+    let path_str = path.to_str().unwrap();
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+
+    ok(&mut i, &format!("(find-file-internal {:?})", path_str));
+    ok(&mut i, "(verilog-delete-auto)");
+    ok(&mut i, "(verilog-auto)");
+    ok(&mut i, "(format-buffer)");
+
+    let regenerated = buffer_string(&mut i);
+    assert_eq!(
+        regenerated, on_disk,
+        "demo/rtl/core/exec_unit.sv on disk must be byte-identical \
+        to what (verilog-delete-auto), (verilog-auto), then (format-buffer) \
+        regenerate -- i.e. exactly the generate-then-save pipeline a real user gets"
+    );
+
+    // This file's whole point is AUTOINPUT/AUTOOUTPUT generating ports
+    // INSIDE the ANSI port list, not just anywhere in the file -- pin
+    // that both banners sit before the header's closing `);'.
+    //
+    // Honest scope (M153 review): this runs only after the byte-for-byte
+    // assert above has passed, so a product regression that moves the
+    // banners is always caught THERE first. What this assertion adds is
+    // protection of the fixture itself: if the on-disk file were ever
+    // regenerated with the banners outside the list, the byte check would
+    // happily pin that, and this one would not. No product-code mutation
+    // can reach it first; `dev/mutations/m153.py' says so.
+    let header_close = regenerated
+        .find(");\n")
+        .expect("module header must close with `);'");
+    let autoinput_banner = regenerated
+        .find("// Beginning of automatic inputs")
+        .expect("AUTOINPUT banner must be present");
+    let autooutput_banner = regenerated
+        .find("// Beginning of automatic outputs")
+        .expect("AUTOOUTPUT banner must be present");
+    assert!(
+        autoinput_banner < header_close,
+        "AUTOINPUT banner at byte {} must sit inside the port list, \
+        which closes at byte {}: {}",
+        autoinput_banner,
+        header_close,
+        regenerated
+    );
+    assert!(
+        autooutput_banner < header_close,
+        "AUTOOUTPUT banner at byte {} must sit inside the port list, \
+        which closes at byte {}: {}",
+        autooutput_banner,
+        header_close,
+        regenerated
+    );
+
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes_after,
+        on_disk.as_bytes(),
+        "this test must never write back to demo/rtl/core/exec_unit.sv on disk"
+    );
+}
+
 // ============================================================
 // 6. M73: every demo/ Verilog file's own on-disk indent width is what
 //    `indent--detect-width' (indent.el:650, a pure scanner -- read-only,
@@ -817,7 +915,7 @@ fn demo_rtl_sram_dual_channel_autoinst_matches_editor_output() {
 #[test]
 fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
     let root = demo_root();
-    let verilog_files: [(&str, Option<i64>); 22] = [
+    let verilog_files: [(&str, Option<i64>); 23] = [
         ("rtl-verilog2001/fifo_gray_top.v", Some(2)),
         ("rtl-verilog2001/fifo_gray_top_tb.v", Some(2)),
         ("rtl-verilog2001/fifo_sync.v", Some(2)),
@@ -828,6 +926,7 @@ fn demo_rtl_verilog_files_detect_two_space_width_except_the_undersampled_svh() {
         ("rtl/bus/axi4_lite_if.sv", Some(2)),
         ("rtl/core/alu.sv", Some(2)),
         ("rtl/core/clk_gate.sv", Some(2)),
+        ("rtl/core/exec_unit.sv", Some(2)),
         ("rtl/core/regfile.sv", Some(2)),
         ("rtl/core/status_regs_stub.sv", Some(2)),
         // Only 2 lines of this 28-line file are indented at all (a
