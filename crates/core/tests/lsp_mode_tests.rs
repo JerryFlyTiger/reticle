@@ -4841,3 +4841,485 @@ fn a_lone_secondary_in_an_empty_primary_slot_answers_the_five_but_not_formatting
          its own improvement onto a method it left alone"
     );
 }
+
+#[test]
+fn next_diagnostic_reaches_a_lone_secondarys_diagnostic_in_an_empty_primary_slot() {
+    // M154 B1: `next-diagnostic'/`lsp--buffer-diagnostic-positions' now
+    // gate on `lsp--any-live-client', not `lsp--live-buffer-client'
+    // (the primary alone) -- the same Z2 lone-secondary-in-an-empty-
+    // primary-slot state the test above pins for M95's five methods.
+    // Before M154, `next-diagnostic' read the primary alone, got nil,
+    // and refused even though the secondary's diagnostic was already
+    // being painted on screen (M99 already unioned it for `lsp--
+    // decorate-buffer', but the caller-side gate here still refused).
+    let mut i = setup();
+    let dir = scratch_dir("m154_b1_lone_secondary_next_diagnostic");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, "line0\nline1\nline2\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--secondary (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    // No primary at all -- the primary slot is genuinely empty
+    // (`lsp--buffer-client' nil), matching the Z2 self-heal state.
+    ok(&mut i, "(setq-local lsp--buffer-client nil)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--secondary))",
+    );
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--secondary)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string "[{\"range\":{\"start\":{\"line\":1,\"character\":0}},\"message\":\"secondary diag\"}]"))))"#,
+    );
+
+    ok(&mut i, "(goto-char (point-min))");
+    assert_eq!(
+        run(&mut i, "(next-diagnostic)"),
+        "\"secondary diag\"",
+        "a lone secondary in an empty primary slot must answer next-diagnostic -- \
+         an improvement over the pre-M154 refusal, not a regression"
+    );
+    assert_eq!(run(&mut i, "(line-number-at-pos)"), "2");
+}
+
+#[test]
+fn diagnostics_at_point_sees_a_lone_secondarys_diagnostics() {
+    // M154 B1: `lsp--diagnostics-at-point' now reads `lsp--any-live-
+    // client', not the raw `lsp--buffer-client', so a lone secondary in
+    // an empty primary slot is visible here too -- which also feeds
+    // `lsp-code-action-at-point''s own diagnostic-context params for
+    // that same state (see `code_action_answers_from_a_lone_secondary_
+    // in_an_empty_primary_slot' in `lsp_action_tests.rs').
+    let mut i = setup();
+    let dir = scratch_dir("m154_b1_lone_secondary_diagnostics_at_point");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, "hello world\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--secondary (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client nil)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--secondary))",
+    );
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--secondary)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"message\":\"secondary diag\"}]"))))"#,
+    );
+
+    ok(&mut i, "(goto-char 3)"); // inside "hello"
+    assert_eq!(
+        run(&mut i, "(length (lsp--diagnostics-at-point))"),
+        "1",
+        "a lone secondary in an empty primary slot must be visible to \
+         lsp--diagnostics-at-point"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"message\" (car (lsp--diagnostics-at-point)))"
+        ),
+        "\"secondary diag\""
+    );
+}
+
+#[test]
+fn diagnostics_at_point_ignores_a_dead_primary_with_no_secondary() {
+    // F3 (M154 review fix round): `lsp--diagnostics-at-point' reads
+    // `lsp--any-live-client' (M154 B1), which is nil when the only
+    // attached client is a dead PRIMARY and there is no secondary at
+    // all -- so this function now returns nil rather than the dead
+    // server's own stale last-published diagnostics, matching
+    // `lsp--buffer-diagnostic-positions''s own documented behaviour in
+    // the same state. Uses a real `lsp-connect'-produced client (like
+    // `a_dead_secondary_falls_back_to_the_primary' above) so
+    // `lsp--client-conn-live-p' can actually observe it as dead, rather
+    // than trusting a stub `:conn nil' client.
+    let mut i = setup();
+    let dir = scratch_dir("m154_f3_dead_primary_no_secondary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, "hello world\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(&mut i, "(setq test--primary (lsp-connect \"cat\"))");
+    ok(&mut i, "(setq-local lsp--buffer-client test--primary)");
+    ok(
+        &mut i,
+        "(setq-local lsp--buffer-clients (list test--primary))",
+    );
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--primary)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"message\":\"stale diag\"}]"))))"#,
+    );
+    ok(&mut i, "(goto-char 3)"); // inside "hello"
+
+    // Sanity: while alive, the primary's diagnostic is visible.
+    assert_eq!(
+        run(&mut i, "(length (lsp--diagnostics-at-point))"),
+        "1",
+        "sanity: a live lone primary must answer"
+    );
+
+    ok(&mut i, "(lsp-kill (lsp--client-conn test--primary))");
+
+    assert_eq!(
+        run(&mut i, "(lsp--diagnostics-at-point)"),
+        "nil",
+        "a dead primary with no secondary must not report its stale diagnostics"
+    );
+}
+
+// ============================================================
+// M154 C1/C2: `lsp-show-diagnostic-at-point' / `lsp-goto-related-location'
+// ============================================================
+
+#[test]
+fn show_diagnostic_at_point_lists_severity_source_code_and_related_locations() {
+    let mut i = setup();
+    let dir = scratch_dir("m154_c1_show_diag");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.sv");
+    std::fs::write(&file, "module a; endmodule\n").unwrap();
+    let other = dir.join("other.sv");
+    std::fs::write(&other, "module other; endmodule\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        &format!(
+            r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}},\"severity\":1,\"source\":\"slang\",\"code\":\"E42\",\"message\":\"redefinition of 'a'\",\"relatedInformation\":[{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":4,\"character\":2}}}}}},\"message\":\"previous definition here\"}}]}}]"))))"#,
+            other.to_str().unwrap()
+        ),
+    );
+    ok(&mut i, "(goto-char 3)"); // inside the [0,5) range
+
+    ok(&mut i, "(lsp-show-diagnostic-at-point)");
+    assert_eq!(run(&mut i, "(buffer-name)"), "\"*LSP Diagnostic*\"");
+    let text = run(&mut i, "(buffer-string)");
+    assert!(
+        text.contains("error [slang] E42: redefinition of 'a'"),
+        "{}",
+        text
+    );
+    assert!(
+        text.contains("\u{21b3} other.sv:5:3: previous definition here"),
+        "expected a related-location line naming other.sv at 1-based line \
+         5, character 3: {}",
+        text
+    );
+}
+
+#[test]
+fn show_diagnostic_at_point_buffer_quits_with_q() {
+    // F2 (M154 review fix round): `lsp-show-diagnostic-at-point' set
+    // `help-mode' on the `*LSP Diagnostic*' buffer but never installed
+    // `describe-bindings''s own local quit keymap (`q' -> `help-quit',
+    // `j'/`k'/`G'), so a real user pressing `q' there fell through to
+    // whatever `q' means globally instead of returning them to their
+    // source buffer. Fixed by sharing `help--install-quit-map'
+    // (simple.el) with `describe-bindings'.
+    let mut i = setup();
+    let dir = scratch_dir("m154_f2_show_diag_quit_map");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.sv");
+    std::fs::write(&file, "module a; endmodule\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"message\":\"m\"}]"))))"#,
+    );
+    ok(&mut i, "(goto-char 3)");
+
+    ok(&mut i, "(lsp-show-diagnostic-at-point)");
+    assert_eq!(run(&mut i, "(buffer-name)"), "\"*LSP Diagnostic*\"");
+    assert_eq!(
+        run(&mut i, "(lookup-key (list ?q))"),
+        "(command help-quit local)",
+        "the *LSP Diagnostic* buffer must have describe-bindings's own \
+         local q -> help-quit binding, not fall through to a global one"
+    );
+}
+
+#[test]
+fn show_diagnostic_at_point_omits_absent_source_and_code() {
+    let mut i = setup();
+    let dir = scratch_dir("m154_c1_show_diag_no_source_code");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.sv");
+    std::fs::write(&file, "module a; endmodule\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"severity\":2,\"message\":\"plain warning\"}]"))))"#,
+    );
+    ok(&mut i, "(goto-char 3)");
+
+    ok(&mut i, "(lsp-show-diagnostic-at-point)");
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        "\"warning: plain warning\"",
+        "no source/code means no brackets and no stray space, and no \
+         relatedInformation means no extra lines"
+    );
+}
+
+#[test]
+fn goto_related_location_jumps_to_the_related_file_line_and_column_and_pushes_a_marker() {
+    let mut i = setup();
+    let dir = scratch_dir("m154_c2_goto_related");
+    std::fs::create_dir_all(&dir).unwrap();
+    let origin_file = dir.join("origin.sv");
+    let target_file = dir.join("target.sv");
+    std::fs::write(&origin_file, "module a; endmodule\n").unwrap();
+    std::fs::write(&target_file, "line0\nline1\nline2\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file {:?})", origin_file.to_str().unwrap()),
+    );
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        &format!(
+            r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}},\"message\":\"m\",\"relatedInformation\":[{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":1,\"character\":2}}}}}},\"message\":\"here\"}}]}}]"))))"#,
+            target_file.to_str().unwrap()
+        ),
+    );
+    ok(&mut i, "(goto-char 3)");
+    ok(&mut i, "(forward-char 2)"); // move off point 3, to sanity-check origin capture
+    assert_eq!(run(&mut i, "(point)"), "5");
+
+    ok(&mut i, "(goto-char 3)");
+    ok(&mut i, "(lsp-goto-related-location)");
+    assert_eq!(
+        run(&mut i, "(buffer-file-name)"),
+        format!("{:?}", target_file.to_str().unwrap())
+    );
+    // line 1, character 2, 0-based -> "line1"'s 3rd character ('n').
+    assert_eq!(run(&mut i, "(line-number-at-pos)"), "2");
+    assert_eq!(
+        run(&mut i, "(buffer-substring (point) (1+ (point)))"),
+        "\"n\""
+    );
+
+    ok(&mut i, "(lsp-pop-definition-stack)");
+    assert_eq!(
+        run(&mut i, "(buffer-file-name)"),
+        format!("{:?}", origin_file.to_str().unwrap())
+    );
+    assert_eq!(run(&mut i, "(point)"), "3");
+}
+
+#[test]
+fn goto_related_location_with_two_entries_opens_a_picker() {
+    let mut i = setup();
+    let dir = scratch_dir("m154_c2_goto_related_picker");
+    std::fs::create_dir_all(&dir).unwrap();
+    let origin_file = dir.join("origin.sv");
+    let target_a = dir.join("target_a.sv");
+    let target_b = dir.join("target_b.sv");
+    std::fs::write(&origin_file, "module a; endmodule\n").unwrap();
+    std::fs::write(&target_a, "aaaa\n").unwrap();
+    std::fs::write(&target_b, "bbbb\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file {:?})", origin_file.to_str().unwrap()),
+    );
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        &format!(
+            r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}},\"message\":\"m\",\"relatedInformation\":[{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}}}}}},\"message\":\"a here\"}},{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}}}}}},\"message\":\"b here\"}}]}}]"))))"#,
+            target_a.to_str().unwrap(),
+            target_b.to_str().unwrap()
+        ),
+    );
+    ok(&mut i, "(goto-char 3)");
+
+    ok(&mut i, "(setq test--cr-collection nil)");
+    ok(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (setq test--cr-collection collection)
+                 (funcall callback (car collection))))",
+    );
+    ok(&mut i, "(lsp-goto-related-location)");
+    assert_eq!(
+        run(&mut i, "(length test--cr-collection)"),
+        "2",
+        "two relatedInformation entries must offer a two-entry picker"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-file-name)"),
+        format!("{:?}", target_a.to_str().unwrap()),
+        "the picker's callback chose the first collection entry, which \
+         must be the FIRST relatedInformation entry (target_a)"
+    );
+}
+
+#[test]
+fn goto_related_location_with_no_related_information_only_messages() {
+    let mut i = setup();
+    let dir = scratch_dir("m154_c2_goto_related_none");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.sv");
+    std::fs::write(&file, "module a; endmodule\n").unwrap();
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"message\":\"m\"}]"))))"#,
+    );
+    ok(&mut i, "(goto-char 3)");
+
+    capture_messages(&mut i);
+    ok(&mut i, "(lsp-goto-related-location)");
+    let messages = run(&mut i, "test--messages");
+    assert!(messages.contains("No related locations"), "{}", messages);
+}
+
+#[test]
+fn goto_related_location_with_identical_labels_jumps_to_the_one_chosen() {
+    // F1 (M154 review fix round): `lsp-goto-related-location''s picker
+    // alist had no collision handling, so `(cdr (assoc label alist))'
+    // always returned the FIRST of two entries sharing a label, no
+    // matter which one the user actually picked. Two entries render the
+    // SAME label when their location's display path (basename only,
+    // both targets sit outside the nil `client' root here), line,
+    // character and message are all identical -- which happens for real
+    // when two different files share a basename (e.g. two `dup.sv'
+    // under different subdirectories). Stubs the picker to choose the
+    // SECOND label and asserts the jump landed in target_b, not
+    // target_a.
+    let mut i = setup();
+    let dir = scratch_dir("m154_f1_goto_related_dup_labels");
+    let dir_a = dir.join("a_dup");
+    let dir_b = dir.join("b_dup");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let origin_file = dir.join("origin.sv");
+    let target_a = dir_a.join("dup.sv");
+    let target_b = dir_b.join("dup.sv");
+    std::fs::write(&origin_file, "module a; endmodule\n").unwrap();
+    std::fs::write(&target_a, "l0\nAAAA\nl2\n").unwrap();
+    std::fs::write(&target_b, "l0\nBBBB\nl2\n").unwrap();
+    ok(
+        &mut i,
+        &format!("(find-file {:?})", origin_file.to_str().unwrap()),
+    );
+
+    ok(
+        &mut i,
+        "(setq test--client (make-lsp--client :conn nil :command \"slang\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-client test--client)");
+    ok(
+        &mut i,
+        &format!(
+            r#"(setf (lsp--client-diagnostics test--client)
+               (list (cons (lsp--path-to-uri (buffer-file-name))
+                           (json-parse-string
+                            "[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}},\"message\":\"m\",\"relatedInformation\":[{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":1,\"character\":0}}}}}},\"message\":\"here\"}},{{\"location\":{{\"uri\":\"file://{}\",\"range\":{{\"start\":{{\"line\":1,\"character\":0}}}}}},\"message\":\"here\"}}]}}]"))))"#,
+            target_a.to_str().unwrap(),
+            target_b.to_str().unwrap()
+        ),
+    );
+    ok(&mut i, "(goto-char 3)");
+
+    ok(&mut i, "(setq test--cr-collection nil)");
+    ok(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (setq test--cr-collection collection)
+                 (funcall callback (nth 1 collection))))",
+    );
+    ok(&mut i, "(lsp-goto-related-location)");
+
+    assert_eq!(
+        run(&mut i, "(length test--cr-collection)"),
+        "2",
+        "two identically-labeled entries must still offer a two-entry picker"
+    );
+    // The length alone stays 2 without the fix (two `equal' strings); the
+    // labels themselves must differ, or `assoc' can only ever reach the first.
+    assert_eq!(
+        run(
+            &mut i,
+            "(equal (nth 0 test--cr-collection) (nth 1 test--cr-collection))"
+        ),
+        "nil",
+        "identical rendered labels must be disambiguated in the picker"
+    );
+    assert_eq!(
+        run(&mut i, "(buffer-file-name)"),
+        format!("{:?}", target_b.to_str().unwrap()),
+        "choosing the SECOND label must jump to the SECOND relatedInformation \
+         entry's file (target_b), not the first (target_a)"
+    );
+    assert_eq!(run(&mut i, "(line-number-at-pos)"), "2");
+}

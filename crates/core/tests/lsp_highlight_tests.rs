@@ -1488,3 +1488,150 @@ fn diagnostics_for_uri_merge_branch_orders_by_client_then_publish_order() {
          publish order, then secondary's in its publish order"
     );
 }
+
+// ============================================================
+// M154 C3: `lsp--decorate-buffer''s inline-row message gets one line per
+// `relatedInformation' entry. Neither this file nor
+// `inline_diagnostics_tests.rs' previously captured what `lsp--decorate-
+// buffer' actually HANDS to `lsp--set-buffer-diagnostics' (that file only
+// ever calls the builtin directly with hand-built data, bypassing `lsp--
+// decorate-buffer' entirely) -- this section adds that wire by `fset'ing
+// `lsp--set-buffer-diagnostics' itself to a capturing lambda, same
+// discipline as `capture_messages' does for `message', then driving a
+// real publish through `lsp--dispatch' so `lsp--decorate-buffer' is the
+// one building the GUTTER list this captures.
+// ============================================================
+
+fn install_test_publish_related_helper(interp: &mut Interp) {
+    ok(
+        interp,
+        r#"(defun test--publish-related (client uri line msg related-uri related-line related-msg)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         (format "[{\"range\":{\"start\":{\"line\":%d,\"character\":0},\"end\":{\"line\":%d,\"character\":1}},\"message\":\"%s\",\"relatedInformation\":[{\"location\":{\"uri\":\"%s\",\"range\":{\"start\":{\"line\":%d,\"character\":2}}},\"message\":\"%s\"}]}]"
+                                 line line msg related-uri related-line related-msg))
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+}
+
+fn capture_set_buffer_diagnostics(interp: &mut Interp) {
+    ok(interp, "(setq test--gutter 'lsp154-c3-unset)");
+    ok(
+        interp,
+        "(fset 'lsp--set-buffer-diagnostics
+               (lambda (buf gutter) (setq test--gutter gutter) nil))",
+    );
+}
+
+#[test]
+fn inline_row_message_carries_one_line_per_related_location() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("m154_c3_inline_related");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_related_helper(&mut i);
+    capture_set_buffer_diagnostics(&mut i);
+
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+
+    ok(
+        &mut i,
+        "(test--publish-related only (lsp--path-to-uri (buffer-file-name)) \
+         1 \"base\" \"file:///tmp/m154-c3/other.sv\" 4 \"previous here\")",
+    );
+
+    assert_eq!(
+        run(&mut i, "(nth 0 (car test--gutter))"),
+        "1",
+        "the LINE half of the (LINE . (SEVERITY . MESSAGE)) triple must be \
+         untouched by C3"
+    );
+    assert_eq!(
+        run(&mut i, "(cdr (cdr (car test--gutter)))"),
+        "\"base\\n\u{21b3} other.sv:5: previous here\"",
+        "the MESSAGE half must carry the base message, a newline, then one \
+         `\u{21b3} <basename>:<line+1>: <related message>' line"
+    );
+}
+
+#[test]
+fn inline_row_message_is_unchanged_without_related_information() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("m154_c3_inline_no_related");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    install_test_publish_helper(&mut i);
+    capture_set_buffer_diagnostics(&mut i);
+
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+
+    ok(
+        &mut i,
+        "(test--publish only (lsp--path-to-uri (buffer-file-name)) \"plain\" 1)",
+    );
+
+    assert_eq!(
+        run(&mut i, "(cdr (cdr (car test--gutter)))"),
+        "\"plain\"",
+        "no relatedInformation must leave the message exactly as before \
+         C3 -- no trailing newline, no arrow"
+    );
+}
+
+/// F4 (M154 review fix round): before the fix, `(gethash \"uri\"
+/// nil)` -- reached when a `relatedInformation` entry has no
+/// `location` at all -- signals `Wrong type argument: hash-table-p,
+/// nil` in this interpreter (unlike GNU's forgiving nil-table read;
+/// confirmed directly with a batch `--eval` against
+/// `target/debug/reticle` before writing this test: `(gethash "x"
+/// nil)` and `(gethash "x" 5)` both error rather than return nil), so
+/// `lsp--related-information-inline-lines' would crash the whole
+/// publish/paint instead of skipping the one malformed entry.
+#[test]
+fn inline_row_survives_a_malformed_related_information_entry() {
+    let (mut i, _ed) = setup();
+    let (_scratch, file) = write_three_line_scratch("m154_f4_inline_malformed_related");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    capture_set_buffer_diagnostics(&mut i);
+
+    ok(&mut i, "(setq only (make-lsp--client :conn nil))");
+    ok(&mut i, "(setq-local lsp--buffer-client only)");
+
+    ok(
+        &mut i,
+        r#"(defun test--publish-malformed-related (client uri)
+             (let ((h (make-hash-table)) (p (make-hash-table)))
+               (puthash "uri" uri p)
+               (puthash "diagnostics"
+                        (json-parse-string
+                         "[{\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":1}},\"message\":\"base\",\"relatedInformation\":[{\"location\":{\"uri\":\"file:///tmp/m154-f4/other.sv\",\"range\":{\"start\":{\"line\":4,\"character\":2}}},\"message\":\"previous here\"},{\"message\":\"no location at all\"}]}]")
+                        p)
+               (puthash "method" "textDocument/publishDiagnostics" h)
+               (puthash "params" p h)
+               (lsp--dispatch client h)))"#,
+    );
+
+    // The call below must not signal -- `ok' itself would surface an
+    // interpreter error as a test failure if it did.
+    ok(
+        &mut i,
+        "(test--publish-malformed-related only (lsp--path-to-uri (buffer-file-name)))",
+    );
+
+    assert_eq!(
+        run(&mut i, "(nth 0 (car test--gutter))"),
+        "1",
+        "the LINE half must still be captured despite the malformed second entry"
+    );
+    assert_eq!(
+        run(&mut i, "(cdr (cdr (car test--gutter)))"),
+        "\"base\\n\u{21b3} other.sv:5: previous here\"",
+        "the well-formed entry's row must still be appended; the malformed \
+         entry contributes nothing"
+    );
+}

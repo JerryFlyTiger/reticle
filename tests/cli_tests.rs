@@ -1,5 +1,5 @@
 //! Tests for the CLI facade added in M78: `--help`, `--version`, and their
-//! consistency with `doc/reticle.1`.
+//! consistency with `docs/reticle.1`.
 //!
 //! These tests only ever invoke the binary with `--help`, `--version`, `-h`,
 //! `-v`, `-V`, `--eval`, or an unknown flag — all paths that necessarily
@@ -123,8 +123,8 @@ fn first_of_help_or_version_wins() {
 
 #[test]
 fn man_page_documents_every_flag() {
-    let man_path = concat!(env!("CARGO_MANIFEST_DIR"), "/doc/reticle.1");
-    let raw = std::fs::read_to_string(man_path).expect("doc/reticle.1 should exist");
+    let man_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/reticle.1");
+    let raw = std::fs::read_to_string(man_path).expect("docs/reticle.1 should exist");
     // roff escapes hyphens as `\-` for proper minus-sign rendering (required
     // by the milestone spec for NAME/option flags); undo that escaping
     // before substring-matching plain option tokens like `--tui`.
@@ -143,18 +143,18 @@ fn man_page_documents_every_flag() {
 // staying in sync with a `Cargo.toml` version bump except this test.
 #[test]
 fn man_page_th_version_matches_cargo_version() {
-    let man_path = concat!(env!("CARGO_MANIFEST_DIR"), "/doc/reticle.1");
-    let contents = std::fs::read_to_string(man_path).expect("doc/reticle.1 should exist");
+    let man_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/reticle.1");
+    let contents = std::fs::read_to_string(man_path).expect("docs/reticle.1 should exist");
     // Tail review: a bare `contents.contains(VERSION)` would also pass if the
     // version string merely happened to appear somewhere else in the page, so
     // pin it to the `.TH` line itself.
     let th_line = contents
         .lines()
         .find(|l| l.starts_with(".TH "))
-        .expect("doc/reticle.1 should have a .TH line");
+        .expect("docs/reticle.1 should have a .TH line");
     assert!(
         th_line.contains(env!("CARGO_PKG_VERSION")),
-        "doc/reticle.1's .TH line does not carry the current crate version {}; line was: {}",
+        "docs/reticle.1's .TH line does not carry the current crate version {}; line was: {}",
         env!("CARGO_PKG_VERSION"),
         th_line
     );

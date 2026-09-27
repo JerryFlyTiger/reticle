@@ -156,6 +156,58 @@ fn capture_request_async(interp: &mut Interp) {
     );
 }
 
+/// Like `capture_request_async`, but for M154's multi-client fan-out
+/// tests: every call is APPENDED (not overwritten) to
+/// `test--captured-calls`, a list of (CLIENT METHOD PARAMS CALLBACK)
+/// lists in call order -- `capture_request_async`'s single `test--
+/// captured` slot can only ever hold the latest call, which loses every
+/// earlier client's own callback once a second client is asked.
+fn capture_request_async_multi(interp: &mut Interp) {
+    ok(interp, "(setq test--captured-calls nil)");
+    ok(
+        interp,
+        "(fset 'lsp-request-async
+               (lambda (client method params callback)
+                 (setq test--captured-calls
+                       (append test--captured-calls
+                               (list (list client method params callback))))
+                 99))",
+    );
+}
+
+/// Two-client variant of `setup_client_buffer` (M154): FILE opened, a
+/// real PRIMARY `lsp--client` struct (`:conn nil`, command PRIMARY-CMD)
+/// as `lsp--buffer-client`, and a real SECONDARY struct (`:conn nil`,
+/// command SECONDARY-CMD) added to `lsp--buffer-clients`. Neither has
+/// `capabilities` set, so both are SUPPORTED by default under M46's
+/// asymmetric-trust rule -- a test that wants to exercise the "declares
+/// no code action provider" skip overrides one client's capabilities
+/// afterward via `setf`. `lsp--sync-buffer-now` stubbed the same way as
+/// `setup_client_buffer`.
+fn setup_two_client_buffer(
+    interp: &mut Interp,
+    file: &std::path::Path,
+    primary_cmd: &str,
+    secondary_cmd: &str,
+) {
+    ok(interp, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        interp,
+        &format!("(setq client (make-lsp--client :conn nil :command {primary_cmd:?}))"),
+    );
+    ok(interp, "(setq-local lsp--buffer-client client)");
+    ok(
+        interp,
+        &format!("(setq secondary (make-lsp--client :conn nil :command {secondary_cmd:?}))"),
+    );
+    ok(interp, "(setq-local lsp--buffer-clients (list secondary))");
+    ok(interp, "(setq test--synced nil)");
+    ok(
+        interp,
+        "(fset 'lsp--sync-buffer-now (lambda () (setq test--synced t)))",
+    );
+}
+
 fn capture_messages(interp: &mut Interp) {
     ok(interp, "(setq test--messages nil)");
     ok(
@@ -285,6 +337,11 @@ fn diagnostics_at_point_returns_every_diagnostic_covering_an_overlapping_point_i
 #[test]
 fn code_action_alist_disambiguates_repeated_titles_and_each_resolves_to_its_own_action() {
     let (mut i, _ed) = setup();
+    // M154: `lsp--code-action-alist` now takes a list of (CLIENT . ACTION)
+    // pairs, not bare actions -- a single shared CLIENT here keeps this
+    // test's contributing-client count at 1, so no `[basename]` suffix is
+    // added and the original title-collision-only assertions still apply.
+    ok(&mut i, "(setq client (make-lsp--client :conn nil))");
     ok(
         &mut i,
         "(setq a1 (make-hash-table)) (puthash \"title\" \"Fix\" a1) (puthash \"id\" 1 a1)",
@@ -297,26 +354,38 @@ fn code_action_alist_disambiguates_repeated_titles_and_each_resolves_to_its_own_
         &mut i,
         "(setq a3 (make-hash-table)) (puthash \"title\" \"Reformat\" a3) (puthash \"id\" 3 a3)",
     );
-    ok(&mut i, "(setq actions (list a1 a2 a3))");
-    ok(&mut i, "(setq alist (lsp--code-action-alist actions))");
+    ok(
+        &mut i,
+        "(setq pairs (list (cons client a1) (cons client a2) (cons client a3)))",
+    );
+    ok(&mut i, "(setq alist (lsp--code-action-alist pairs))");
 
     assert_eq!(
         run(&mut i, "(mapcar #'car alist)"),
         "(\"Fix (1)\" \"Fix (2)\" \"Reformat\")"
     );
-    // Each disambiguated display resolves back to the ACTION it came
-    // from (checked via the "id" field baked into each fixture), not
-    // just the first "Fix".
+    // Each disambiguated display resolves back to the (CLIENT . ACTION)
+    // pair it came from (checked via the "id" field baked into each
+    // fixture's ACTION half), not just the first "Fix".
     assert_eq!(
-        run(&mut i, "(gethash \"id\" (cdr (assoc \"Fix (1)\" alist)))"),
+        run(
+            &mut i,
+            "(gethash \"id\" (cdr (cdr (assoc \"Fix (1)\" alist))))"
+        ),
         "1"
     );
     assert_eq!(
-        run(&mut i, "(gethash \"id\" (cdr (assoc \"Fix (2)\" alist)))"),
+        run(
+            &mut i,
+            "(gethash \"id\" (cdr (cdr (assoc \"Fix (2)\" alist))))"
+        ),
         "2"
     );
     assert_eq!(
-        run(&mut i, "(gethash \"id\" (cdr (assoc \"Reformat\" alist)))"),
+        run(
+            &mut i,
+            "(gethash \"id\" (cdr (cdr (assoc \"Reformat\" alist))))"
+        ),
         "3"
     );
 }
@@ -556,8 +625,473 @@ fn code_action_multiple_usable_actions_open_a_picker_and_apply_the_pick() {
     assert_eq!(run(&mut i, "(car test--messages)"), "\"Shout\"");
 }
 
+// ============================================================
+// M154 A1/A2/A3/A4: the fan-out to every capable client, merging
+// replies, `command` execution.
+// ============================================================
+
 #[test]
-fn code_action_elements_without_edit_are_skipped_and_counted() {
+fn code_action_asks_every_client_that_declares_the_capability() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_two_clients_both");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+
+    assert_eq!(run(&mut i, "(length test--captured-calls)"), "2");
+    assert_eq!(
+        run(&mut i, "(eq (nth 0 (nth 0 test--captured-calls)) client)"),
+        "t",
+        "the primary must be asked first"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (nth 0 test--captured-calls))"),
+        "\"textDocument/codeAction\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (nth 0 (nth 1 test--captured-calls)) secondary)"
+        ),
+        "t",
+        "the secondary must be asked too"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (nth 1 test--captured-calls))"),
+        "\"textDocument/codeAction\""
+    );
+}
+
+#[test]
+fn code_action_skips_a_client_that_declares_no_code_action_provider() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_two_clients_skip");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+    // Secondary's capabilities are a real hash-table that simply never
+    // mentions "codeActionProvider" -- an ABSENT key, not a present-but-
+    // falsy value (`lsp--capability-supported-p`'s own docstring
+    // explains why those two are different signals, and why only ABSENT
+    // means unsupported).
+    ok(
+        &mut i,
+        "(setf (lsp--client-capabilities secondary)
+               (let ((h (make-hash-table))) (puthash \"hoverProvider\" t h) h))",
+    );
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+
+    assert_eq!(run(&mut i, "(length test--captured-calls)"), "1");
+    assert_eq!(
+        run(&mut i, "(eq (nth 0 (nth 0 test--captured-calls)) client)"),
+        "t",
+        "only the primary should have been asked"
+    );
+}
+
+#[test]
+fn code_action_merges_both_replies_into_one_picker_with_server_suffixes() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_two_clients_merge");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+    ok(&mut i, "(setq test--cr-args nil)");
+    ok(
+        &mut i,
+        "(fset 'completing-read
+               (lambda (prompt collection callback require-match &optional initial)
+                 (setq test--cr-args (list prompt collection require-match))
+                 (funcall callback (car collection))))",
+    );
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"title\":\"Fix\",\"edit\":{{\"changes\":{{{uri}:[\
+           {{\"newText\":\"Hello\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}}}}\
+         ]}}}}}}]"
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string {reply:?}))"),
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 (nth 1 test--captured-calls)) (json-parse-string {reply:?}))"),
+    );
+
+    assert_eq!(
+        run(&mut i, "(nth 1 test--cr-args)"),
+        "(\"Fix [cat]\" \"Fix [sh]\")",
+        "identical titles from two servers must stay distinguishable, primary first"
+    );
+}
+
+#[test]
+fn code_action_opens_nothing_until_every_client_has_replied() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_two_clients_wait");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    assert_eq!(run(&mut i, "(length test--captured-calls)"), "2");
+
+    // Only the FIRST (primary) client replies.
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string \"[]\"))",
+    );
+    assert_eq!(
+        run(&mut i, "test--messages"),
+        "nil",
+        "must not decide anything until every client has replied"
+    );
+
+    // The SECOND (and last) client replies.
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 1 test--captured-calls)) (json-parse-string \"[]\"))",
+    );
+    assert_eq!(
+        run(&mut i, "(car test--messages)"),
+        "\"No code actions here\""
+    );
+}
+
+#[test]
+fn code_action_command_only_element_is_sent_as_execute_command_to_its_own_client() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_command_only");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string \"[]\"))",
+    );
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 1 test--captured-calls))
+                  (json-parse-string \"[{\\\"title\\\":\\\"Fix\\\",\\\"command\\\":\\\"slang.addDefine\\\",\\\"arguments\\\":[\\\"W\\\"]}]\"))",
+    );
+
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        "\"hello world\\n\"",
+        "no edit exists to apply"
+    );
+    assert_eq!(
+        run(&mut i, "(length test--captured-calls)"),
+        "3",
+        "a third request -- the executeCommand -- must have gone out"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (nth 0 (nth 2 test--captured-calls)) secondary)"
+        ),
+        "t",
+        "the executeCommand must go to the client that offered the action, not the primary"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (nth 2 test--captured-calls))"),
+        "\"workspace/executeCommand\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"command\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "\"slang.addDefine\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"arguments\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "[\"W\"]"
+    );
+}
+
+#[test]
+fn code_action_with_edit_and_nested_command_applies_the_edit_then_sends_the_command() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_edit_and_command");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"title\":\"Fix\",\
+           \"edit\":{{\"changes\":{{{uri}:[\
+             {{\"newText\":\"Hello\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}}}}\
+           ]}}}},\
+           \"command\":{{\"title\":\"Fix\",\"command\":\"verible.fix\",\"arguments\":[1,2]}}}}]"
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string {reply:?}))"),
+    );
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 1 test--captured-calls)) (json-parse-string \"[]\"))",
+    );
+
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"Hello world\\n\"");
+    assert_eq!(run(&mut i, "(length test--captured-calls)"), "3");
+    assert_eq!(
+        run(&mut i, "(eq (nth 0 (nth 2 test--captured-calls)) client)"),
+        "t",
+        "the nested command must go back to the SAME client that returned it"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (nth 2 test--captured-calls))"),
+        "\"workspace/executeCommand\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"command\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "\"verible.fix\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"arguments\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "[1 2]"
+    );
+}
+
+/// F5 (M154 review fix round): `lsp--apply-code-action`'s stale-edit
+/// branch (buffer changed since the request) also unconditionally
+/// sends the action's `command' via `lsp--code-action-send-command' --
+/// see the function's own M154 A4 docstring paragraph -- but no test
+/// covered that branch's command-sending half; only the edit-half
+/// staleness behaviour was pinned. Combines
+/// `code_action_with_edit_and_nested_command_applies_the_edit_then_
+/// sends_the_command''s edit+nested-command reply shape with
+/// `code_action_discards_a_stale_reply_if_the_buffer_changed_since_
+/// the_request''s typing-between-request-and-reply technique.
+#[test]
+fn code_action_stale_edit_is_dropped_but_its_command_is_still_sent() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_stale_edit_command_sent");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    ok(&mut i, "(goto-char (point-max))");
+    ok(&mut i, "(insert \"// typed while waiting\\n\")");
+    let buffer_after_typing = run(&mut i, "(buffer-string)");
+
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"title\":\"Fix\",\
+           \"edit\":{{\"changes\":{{{uri}:[\
+             {{\"newText\":\"Hello\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}}}}\
+           ]}}}},\
+           \"command\":{{\"title\":\"Fix\",\"command\":\"verible.fix\",\"arguments\":[1,2]}}}}]"
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string {reply:?}))"),
+    );
+    ok(
+        &mut i,
+        "(funcall (nth 3 (nth 1 test--captured-calls)) (json-parse-string \"[]\"))",
+    );
+
+    assert_eq!(
+        run(&mut i, "(buffer-string)"),
+        buffer_after_typing,
+        "the edit must NOT be applied -- the buffer changed since the request"
+    );
+    assert!(
+        run(&mut i, "(car test--messages)").contains("stale")
+            || run(&mut i, "(car test--messages)").contains("changed"),
+        "got {:?}",
+        run(&mut i, "test--messages")
+    );
+    assert_eq!(
+        run(&mut i, "(length test--captured-calls)"),
+        "3",
+        "a third request -- the executeCommand -- must still go out even \
+         though the edit was dropped as stale"
+    );
+    assert_eq!(
+        run(&mut i, "(eq (nth 0 (nth 2 test--captured-calls)) client)"),
+        "t",
+        "the command must go to the client that offered the action (the \
+         primary here)"
+    );
+    assert_eq!(
+        run(&mut i, "(nth 1 (nth 2 test--captured-calls))"),
+        "\"workspace/executeCommand\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"command\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "\"verible.fix\""
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(gethash \"arguments\" (nth 2 (nth 2 test--captured-calls)))"
+        ),
+        "[1 2]"
+    );
+}
+
+/// Real `lsp-request-async`/`lsp--request` run for real here (only
+/// `lsp-send` is stubbed, same technique as `lsp_async_tests.rs`'s
+/// server-request tests) so the id an assertion checks against is the
+/// one `lsp-code-action-at-point'/`lsp--apply-code-action` actually
+/// allocated and sent, not a fabricated one -- `:conn nil` clients tolerate
+/// this fine (`lsp--client-conn-live-p`'s asymmetric trust; `lsp-send`
+/// never runs for real, so `conn` is never dereferenced).
+#[test]
+fn code_action_reports_a_server_error_from_execute_command() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_exec_error");
+    setup_two_client_buffer(&mut i, &file, "cat", "sh");
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    ok(&mut i, "(setq lsp--test-sent nil)");
+    ok(
+        &mut i,
+        "(defun lsp-send (conn msg) (push msg lsp--test-sent) t)",
+    );
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    // Two real `textDocument/codeAction` requests went out -- `push`
+    // means the most recently sent (the secondary, asked second) is
+    // `(car lsp--test-sent)`.
+    assert_eq!(run(&mut i, "(length lsp--test-sent)"), "2");
+    let secondary_id = run(&mut i, "(gethash \"id\" (nth 0 lsp--test-sent))");
+    let primary_id = run(&mut i, "(gethash \"id\" (nth 1 lsp--test-sent))");
+
+    // Primary answers with no actions.
+    ok(
+        &mut i,
+        &format!(
+            "(lsp--dispatch client (json-parse-string \
+             \"{{\\\"id\\\":{primary_id},\\\"result\\\":[]}}\"))"
+        ),
+    );
+    // Secondary answers with one command-only action -- the executable
+    // shape M154 A3/A4 exist for.
+    ok(
+        &mut i,
+        &format!(
+            "(lsp--dispatch secondary (json-parse-string \
+             \"{{\\\"id\\\":{secondary_id},\\\"result\\\":[{{\\\"title\\\":\\\"AddDefine\\\",\\\"command\\\":\\\"slang.addDefine\\\"}}]}}\"))"
+        ),
+    );
+
+    // That single usable action auto-applied -- no edit, so a real
+    // `workspace/executeCommand` went to the secondary, the THIRD (and
+    // now most recent) sent message.
+    assert_eq!(run(&mut i, "(length lsp--test-sent)"), "3");
+    let exec_id = run(&mut i, "(gethash \"id\" (nth 0 lsp--test-sent))");
+    assert_eq!(
+        run(&mut i, "(gethash \"method\" (nth 0 lsp--test-sent))"),
+        "\"workspace/executeCommand\""
+    );
+
+    // The server answers that request with a JSON-RPC error --
+    // `lsp--dispatch` announces it via `message` unconditionally, before
+    // it even looks for a matching callback (see the file header's M46
+    // note), so `lsp-code-action-at-point`/`lsp--apply-code-action`
+    // needed no error-handling code of their own for M154 A4's "report
+    // a server error" clause.
+    ok(
+        &mut i,
+        &format!(
+            "(lsp--dispatch secondary (json-parse-string \
+             \"{{\\\"id\\\":{exec_id},\\\"error\\\":{{\\\"code\\\":-1,\\\"message\\\":\\\"boom\\\"}}}}\"))"
+        ),
+    );
+
+    assert_eq!(run(&mut i, "(car test--messages)"), "\"lsp: boom\"");
+}
+
+#[test]
+fn code_action_answers_from_a_lone_secondary_in_an_empty_primary_slot() {
+    let (mut i, _ed) = setup();
+    let file = write_hello_world_scratch("ca_lone_secondary");
+    ok(&mut i, &format!("(find-file {:?})", file.to_str().unwrap()));
+    ok(
+        &mut i,
+        "(setq secondary (make-lsp--client :conn nil :command \"sh\"))",
+    );
+    ok(&mut i, "(setq-local lsp--buffer-clients (list secondary))");
+    // Deliberately NO `lsp--buffer-client` at all -- the M94 Z2 lone-
+    // secondary-in-an-empty-primary-slot state.
+    ok(&mut i, "(setq test--synced nil)");
+    ok(
+        &mut i,
+        "(fset 'lsp--sync-buffer-now (lambda () (setq test--synced t)))",
+    );
+    ok(&mut i, "(goto-char 1)");
+    capture_messages(&mut i);
+    capture_request_async_multi(&mut i);
+
+    ok(&mut i, "(lsp-code-action-at-point)");
+    assert_eq!(
+        run(&mut i, "(length test--captured-calls)"),
+        "1",
+        "the lone secondary must have been asked, not refused"
+    );
+    assert_eq!(
+        run(
+            &mut i,
+            "(eq (nth 0 (nth 0 test--captured-calls)) secondary)"
+        ),
+        "t"
+    );
+
+    let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
+    let reply = format!(
+        "[{{\"title\":\"Capitalize\",\"edit\":{{\"changes\":{{{uri}:[\
+           {{\"newText\":\"Hello\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}}}}\
+         ]}}}}}}]"
+    );
+    ok(
+        &mut i,
+        &format!("(funcall (nth 3 (nth 0 test--captured-calls)) (json-parse-string {reply:?}))"),
+    );
+    assert_eq!(run(&mut i, "(buffer-string)"), "\"Hello world\\n\"");
+}
+
+#[test]
+fn code_action_elements_without_edit_or_command_are_skipped_and_counted() {
+    // Before M154, ANY command-only element was skipped here -- A3 widened
+    // `lsp--code-action-usable` to also accept a `command`, so the skipped
+    // element in this fixture now has neither `edit` nor `command` at all;
+    // `code_action_command_only_element_is_sent_as_execute_command_to_its_
+    // own_client` covers the now-usable command-only shape.
     let (mut i, _ed) = setup();
     let file = write_hello_world_scratch("ca_skip_edit");
     setup_client_buffer(&mut i, &file);
@@ -567,9 +1101,10 @@ fn code_action_elements_without_edit_are_skipped_and_counted() {
 
     ok(&mut i, "(lsp-code-action-at-point)");
     let uri = run(&mut i, "(lsp--path-to-uri (buffer-file-name))");
-    // A command-only element (no "edit") ahead of the one usable action.
+    // An element with neither "edit" nor "command" ahead of the one usable
+    // action.
     let reply = format!(
-        "[{{\"title\":\"Run fixer\",\"command\":{{\"title\":\"Run fixer\",\"command\":\"verible.fix\"}}}},\
+        "[{{\"title\":\"Run fixer\",\"kind\":\"quickfix\"}},\
           {{\"title\":\"Capitalize\",\"edit\":{{\"changes\":{{{uri}:[\
             {{\"newText\":\"Hello\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":5}}}}}}\
           ]}}}}}}]"
@@ -589,7 +1124,10 @@ fn code_action_elements_without_edit_are_skipped_and_counted() {
 }
 
 #[test]
-fn code_action_no_applicable_actions_when_every_element_lacks_an_edit() {
+fn code_action_no_applicable_actions_when_every_element_lacks_an_edit_and_a_command() {
+    // Same M154 A3 swap as the test above: the only element here now has
+    // neither `edit` nor `command`, so it stays unusable under the new,
+    // wider rule too.
     let (mut i, _ed) = setup();
     let file = write_hello_world_scratch("ca_all_commands");
     setup_client_buffer(&mut i, &file);
@@ -601,7 +1139,7 @@ fn code_action_no_applicable_actions_when_every_element_lacks_an_edit() {
     ok(
         &mut i,
         "(funcall (nth 3 test--captured)
-                  (json-parse-string \"[{\\\"title\\\":\\\"Run fixer\\\",\\\"command\\\":{\\\"command\\\":\\\"x\\\"}}]\"))",
+                  (json-parse-string \"[{\\\"title\\\":\\\"Run fixer\\\",\\\"kind\\\":\\\"quickfix\\\"}]\"))",
     );
 
     assert!(
@@ -1129,6 +1667,23 @@ fn c_c_l_prefix_bindings_reach_every_m48_and_earlier_lsp_command() {
         ("C-c l s", "lsp-goto-symbol-by-name"),
         ("C-c l n", "lsp-next-symbol"),
         ("C-c l p", "lsp-previous-symbol"),
+    ] {
+        ok(&mut i, "(setq test--ran nil)");
+        ok(
+            &mut i,
+            &format!("(fset '{fname} (lambda (&rest _) (interactive) (setq test--ran t)))"),
+        );
+        feed_keys(&mut i, &ed, keys).unwrap_or_else(|e| panic!("feed_keys {keys:?}: {e}"));
+        assert_eq!(run(&mut i, "test--ran"), "t", "{keys} must reach {fname}");
+    }
+}
+
+#[test]
+fn c_c_l_d_and_shift_d_reach_the_m154_diagnostic_detail_commands() {
+    let (mut i, ed) = setup();
+    for (keys, fname) in [
+        ("C-c l d", "lsp-show-diagnostic-at-point"),
+        ("C-c l D", "lsp-goto-related-location"),
     ] {
         ok(&mut i, "(setq test--ran nil)");
         ok(

@@ -474,6 +474,26 @@ parameter."
                      "*scratch*")))
       (switch-to-buffer-internal target))))
 
+(defun help--install-quit-map ()
+  "Install this file's `*Help*'-style local keymap (M154 F2 extraction:
+`q' -> `help-quit', `j'/`k' -> `next-line'/`previous-line', `G' ->
+`end-of-buffer') into the CURRENT buffer via `use-local-map'. Shared by
+`describe-bindings' below and `lsp-show-diagnostic-at-point' (lsp.el,
+M154 C1), which reuses this same help-mode/quit-map convention for its
+own `*LSP Diagnostic*' buffer rather than copying the five lines that
+build MAP. Callers are still responsible for `major-mode-internal-set
+'help-mode' and `quit-source' themselves -- this only ever installs the
+keymap."
+  (let ((map (make-sparse-keymap)))
+    (define-key map "q" 'help-quit)
+    ;; M130: `gg' is deliberately not bound anywhere in this
+    ;; milestone -- see dired.el's header note for the mechanical
+    ;; reason (`g' collision risk in `Keymap::define-sequence').
+    (define-key map "j" 'next-line)
+    (define-key map "k" 'previous-line)
+    (define-key map "G" 'end-of-buffer)
+    (use-local-map map)))
+
 (defun help-quit ()
   "Leave `*Help*', returning to wherever `describe-bindings' was called
 from (see `quit-source-return'). Kept as its own command name (rather
@@ -579,15 +599,7 @@ See this file's M67 header note for what this does NOT cover."
       (pop-to-buffer "*Help*")
       (setq-local quit-source source)
       (major-mode-internal-set 'help-mode)
-      (let ((map (make-sparse-keymap)))
-        (define-key map "q" 'help-quit)
-        ;; M130: `gg' is deliberately not bound anywhere in this
-        ;; milestone -- see dired.el's header note for the mechanical
-        ;; reason (`g' collision risk in `Keymap::define-sequence').
-        (define-key map "j" 'next-line)
-        (define-key map "k" 'previous-line)
-        (define-key map "G" 'end-of-buffer)
-        (use-local-map map))
+      (help--install-quit-map)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert text)
@@ -896,6 +908,14 @@ worth flagging.")
 (global-set-key "C-c l H" 'lsp-highlight-clear)
 (global-set-key "C-c l N" 'lsp-next-highlight)
 (global-set-key "C-c l P" 'lsp-previous-highlight)
+
+;; M154 C1/C2: `relatedInformation' detail and jump -- lowercase `d' for
+;; the detail BUFFER (parallel to `C-c l h' for hover, another "show
+;; something in a buffer/echo area" command), shifted `D' for the JUMP
+;; (parallel to how `C-c l N'/`C-c l P' shift for the highlight-
+;; navigation pair above).
+(global-set-key "C-c l d" 'lsp-show-diagnostic-at-point)
+(global-set-key "C-c l D" 'lsp-goto-related-location)
 
 (global-set-key "C-x 2" 'split-window-below)
 (global-set-key "C-x 3" 'split-window-right)

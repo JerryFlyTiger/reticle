@@ -45,9 +45,9 @@ A complete Elisp implementation with three execution tiers:
 
 | Tier | What it is | Tight integer loop | Recursive `fib` |
 | --- | --- | --- | --- |
-| Tree-walking evaluator | Default. Full language semantics. | baseline | baseline |
-| Bytecode compiler + VM | Opt in with `(byte-compile 'sym)`. | ~8x | 1.0x |
-| Native JIT (Cranelift) | Opt in with `(native-compile 'sym)`. | ~575x | 1.0x |
+| Tree-walking evaluator | Where every function starts. Full language semantics. | baseline | baseline |
+| Bytecode compiler + VM | Automatic after 64 calls to a named function, or `(byte-compile 'sym)`. The shipped standard library is compiled at startup. | ~8x | 1.0x |
+| Native JIT (Cranelift) | Tried once after 1,024 bytecode calls, or `(native-compile 'sym)`. | ~575x | 1.0x |
 
 Measure it yourself -- `dev/bench-tiers.el` is what produced those numbers
 (eight runs on one machine spanned 8.01x-8.20x and 573x-577x, hence the
@@ -229,10 +229,10 @@ The binary lands at `target/release/reticle`. Copy it somewhere on your
 install -m 755 target/release/reticle ~/.local/bin/
 ```
 
-A man page is provided at `doc/reticle.1`:
+A man page is provided at `docs/reticle.1`:
 
 ```sh
-install -m 644 doc/reticle.1 ~/.local/share/man/man1/
+install -m 644 docs/reticle.1 ~/.local/share/man/man1/
 man reticle
 ```
 
@@ -336,6 +336,86 @@ be invoked by hand.
 
 ---
 
+## Quick start: a tour on the demo SoC
+
+The fastest way to see what the editor does is to open the SystemVerilog SoC
+that ships in `demo/rtl/` and walk through the features below. Keys are shown
+in Emacs notation (`C-` is Control, `M-` is Meta/Option). The vim layer is on
+by default: `i` enters insert state, `ESC` returns to normal state, and Emacs
+chords that vim does not use -- `C-c ...`, `M-.`, `M-x` -- still work from
+normal state because unbound keys fall through to the global keymap. Every
+command is also reachable by name through `M-x`.
+
+```sh
+cargo build --release
+./target/release/reticle demo/rtl/top/soc_top.sv
+```
+
+### 1. Navigate a multi-file design
+
+| Key | Command | What happens |
+| --- | --- | --- |
+| `M-.` | jump to definition | On a module instantiation, opens the file that declares the module -- found through `verible.filelist` and a directory search, even with no language server. Elsewhere, asks the LSP server. |
+| `M-,` | jump back | Returns to where the last `M-.` started. |
+| `M-?` | references | Lists every use of the symbol under the cursor (LSP). |
+| `C-h .` | hover | Shows the server's documentation popup for the symbol. |
+| `C-c l s` | go to symbol | Jump to a module, port or signal in the file by name. |
+| `C-x d` | Dired | Browse the `pkg/ core/ mem/ bus/ top/` tree. |
+
+### 2. Let the port lists write themselves
+
+Put a `/*AUTOINST*/` comment inside an instantiation, `/*AUTOWIRE*/` in the
+parent module body, or `/*AUTOARG*/` in a Verilog-1995 port list, then:
+
+| Key | Command | What happens |
+| --- | --- | --- |
+| `C-c C-a` | `verilog-auto` | Reads the instantiated module's ports and writes one `.port(port)` line per port, the connecting wire declarations with their widths, or the port list. |
+| `C-c C-k` | `verilog-delete-auto` | Removes the generated text again, leaving just the markers. |
+
+Set `(setq verilog-auto-on-save t)` in your init file to expand on every save.
+
+### 3. Search the whole project
+
+| Key | Command | What happens |
+| --- | --- | --- |
+| `C-c s s` | `search-project` | Literal search across the project; hits stream into a `*search*` buffer while the search is still running. |
+| `C-c s r` | `search-project-regexp` | The same, with a regular expression. |
+| `/` (in `*search*`) | filter | Narrow the results as you type. Space-separated words match in any order. |
+| `n` / `p` / `RET` | navigate | Move between hits, open the hit at point. |
+| `M-.` (in `*search*`) | module jump | Jump straight to the declaration of a module named in a hit. |
+| `C-x C-q` (in `*search*`) | edit results | Make the result lines editable, change them in place, then `C-c C-c` writes every edit back to its file (`C-c C-k` discards). |
+
+### 4. Diagnostics, formatting and refactoring
+
+With `verible-verilog-ls` on your `PATH`, the language server starts on its own
+when a Verilog file opens. Diagnostics appear as squiggles and gutter marks,
+and their count shows in the mode line.
+
+| Key | Command | What happens |
+| --- | --- | --- |
+| `C-c l d` | show diagnostic | Full text of the diagnostic at point. |
+| `C-c l a` | code action | Apply the server's suggested fix. |
+| `C-c l r` | rename | Rename a symbol everywhere the server knows about. |
+| `C-c f f` | `format-buffer` | Reformat the buffer (`verible-verilog-format` for Verilog). |
+| `C-c f r` | `format-region` | Reformat only the selection. |
+| `C-=` / `C--` | expand / contract region | Grow or shrink the selection one syntax node at a time. |
+
+### 5. Build, simulate, jump to errors
+
+`M-x compile` runs any shell command -- a lint script, a simulator, `make` --
+into a `*compilation*` buffer. `M-g n` jumps to the next error in the source,
+and `n` / `p` / `RET` walk the errors inside that buffer. `M-!` runs a one-shot
+shell command, and `M-x eshell` opens a shell inside the editor.
+
+### 6. Make it yours
+
+Everything above is Elisp you can read and redefine. Try `M-x load-theme`
+(Dracula, Xcode, VS Code or light), `M-x set-font`, and `C-h k` followed by any
+key to see which command it runs. Then start an init file -- see
+[Configuration](#configuration).
+
+---
+
 ## Configuration
 
 Your init file is **`~/.reticle/init.el`**. Its directory is added to
@@ -417,11 +497,11 @@ implementation of an interactive command, search for its registered name under
 
 ## Project status
 
-86 milestones completed as of 2026-09-01, each with a written design record
+154 milestones completed as of 2026-09-23, each with a written design record
 kept with the project.
 
-The test suite is 1,655 tests across 83 test binaries, weighted toward
-integration tests rather than unit tests (26 further tests are marked
+The test suite is 2,946 tests across 103 test targets, weighted toward
+integration tests rather than unit tests (further tests are marked
 `#[ignore]` by design -- they depend on external language servers or measure
 performance). There are no doc-tests: the code carries doc comments but no
 runnable examples in them. Every change must pass three gates
@@ -455,8 +535,9 @@ matter to someone evaluating the editor.
   not load. Modules cannot be unloaded.
 - Reference cycles held entirely through external objects (some keymap and
   overlay graphs) can leak.
-- JIT-compiled code is not interruptible. This is accepted because the
-  qualifying subset cannot loop forever.
+- JIT-compiled code is not interruptible. The qualifying subset is pure
+  integer code, but it does include loops, so a non-terminating integer loop
+  that has been promoted to native code will hang the editor.
 - `push` / `pop` work on plain variable places only. Use `setf` for accessor
   places.
 

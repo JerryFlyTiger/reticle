@@ -640,12 +640,20 @@ A second attached client's diagnostics are still STORED on its own
 `lsp--client-diagnostics' either way (`lsp--merge-diagnostics' never
 consults this variable, only `lsp--decorate-buffer' does) -- only
 DECORATION is gated, so `next-diagnostic'/`previous-diagnostic'/
-`lsp--diagnostics-at-point' could still reach a non-decorating
-client's diagnostics explicitly in a future extension. As of M94 v1
-they do NOT: all three read only `lsp--buffer-client''s (the
-primary's) diagnostics, so a secondary's publishes are stored but not
-navigable -- an accepted scope limit, not an oversight. Not consulted
-by anything except `lsp--diagnostics-authoritative-client'.
+`lsp--diagnostics-at-point' can still reach a non-decorating client's
+diagnostics. As of M99 they DO: all three read `lsp--diagnostics-for-
+uri''s union (the same one `lsp--decorate-buffer' paints from) rather
+than only `lsp--buffer-client''s (the primary's) own diagnostics, so a
+secondary's publishes are both stored and navigable even when this
+variable leaves decoration to the primary alone. M154 B1 closed the
+last piece of this: the three navigation entry points (plus
+`lsp--buffer-diagnostic-positions') now gate on `lsp--any-live-client'
+instead of the primary alone, so a lone secondary sitting in an empty
+primary slot (no decoration authority question even arises there --
+`lsp--diagnostics-authoritative-client' already treats a dead primary
+as \"authority unestablished\", not \"nothing may decorate\", see
+below) can navigate its own diagnostics too. Not consulted by anything
+except `lsp--diagnostics-authoritative-client'.
 
 M94 review AA5: this variable is a STUB, not live configuration -- it
 is `defvar'd here and read by `lsp--diagnostics-authoritative-client',
@@ -831,6 +839,76 @@ this milestone isn't scoped to make."
                     (setq i (1+ i)))))))
           (nreverse out))))))
 
+(defun lsp--related-information-location (entry)
+  "(URI LINE CHARACTER) from ENTRY's `location.range.start' when ENTRY
+is a well-formed `DiagnosticRelatedInformation' hash-table (`location'
+a hash-table, its `uri' a string, its `range' a hash-table, that
+range's `start' a hash-table with integer `line'/`character'); nil for
+anything else -- M154 F4's shared malformed-entry guard for
+`lsp--related-information-inline-lines', `lsp--related-location-line'
+and `lsp--related-locations-at-point', all three of which walk a
+`relatedInformation' vector that arrives straight off the wire with no
+schema validation. This interpreter's `gethash' signals a wrong-type-
+argument error on a non-hash-table SECOND argument (unlike GNU's own
+forgiving nil-table read -- confirmed here by running `(gethash \"x\"
+nil)' and `(gethash \"x\" 5)', both of which error rather than return
+nil), so an unguarded chain of `gethash' calls would crash painting on
+one malformed entry even when the rest of the diagnostic -- and every
+other entry in the same vector -- is perfectly well-formed.
+
+Known gap (M154 tail review, documented rather than fixed -- the same
+one `lsp--reference-entry' carries): `line'/`character' are checked
+with `integerp', which is nil for a Float, and a JSON number written
+with a decimal point (`{\"line\": 5.0}') parses to a Float. A server
+that serializes positions that way (non-conformant -- the LSP spec
+types them `uinteger' -- and not observed against verible-verilog-ls
+or slang-server) would have that related location silently dropped:
+one missing line, not a crash."
+  (and (hash-table-p entry)
+       (let ((loc (gethash "location" entry)))
+         (and (hash-table-p loc)
+              (let ((uri (gethash "uri" loc))
+                    (range (gethash "range" loc)))
+                (and (stringp uri)
+                     (hash-table-p range)
+                     (let ((start (gethash "start" range)))
+                       (and (hash-table-p start)
+                            (let ((line (gethash "line" start))
+                                  (character (gethash "character" start)))
+                              (and (integerp line) (integerp character)
+                                   (list uri line character)))))))))))
+
+(defun lsp--related-information-inline-lines (related)
+  "One `↳ <basename>:<line+1>: <message>' string per entry of
+RELATED (a diagnostic's own `relatedInformation' field -- a JSON-array-
+shaped vector, or nil/absent) -- M154 C3's inline-row format, appended
+to `lsp--decorate-buffer''s own message string. Deliberately terser
+than `lsp--related-location-line' (M154 C1/C2's format, a root-relative
+path AND the character column): the inline row is squeezed through
+M87 stage 3's existing 3-line-per-diagnostic cap
+(`redisplay.rs', untouched by this milestone), so keeping it short
+matters here in a way it doesn't for `lsp-show-diagnostic-at-point',
+which shows the full detail in its own buffer with no such cap. Walks
+RELATED by index rather than `dolist' -- see
+`lsp--verilog-vector-member-string-p''s own docstring for why this
+codebase's `dolist' can't walk a JSON-array-shaped vector directly.
+nil/empty RELATED yields nil (no lines)."
+  (when (and related (> (length related) 0))
+    (let ((n (length related)) (i 0) out)
+      (while (< i n)
+        (let* ((entry (aref related i))
+               (fields (lsp--related-information-location entry)))
+          ;; M154 F4: a malformed ENTRY (bad/missing `location'/`uri'/
+          ;; `range'/`start') is skipped, not painted and not signalled.
+          (when fields
+            (push (format "↳ %s:%d: %s"
+                          (file-name-nondirectory (lsp--uri-to-path (nth 0 fields)))
+                          (1+ (nth 1 fields))
+                          (gethash "message" entry))
+                  out)))
+        (setq i (1+ i)))
+      (nreverse out))))
+
 (defun lsp--decorate-buffer (client uri diags)
   "M16: turn published diagnostics into wavy underlines + gutter data
 for the buffer visiting URI, if any. Old decorations are replaced.
@@ -877,7 +955,20 @@ this function runs, so `lsp--diagnostics-for-uri' sees it."
                        (to (lsp--pos-at (gethash "line" end)
                                         (gethash "character" end)))
                        (ov (make-overlay from (if (> to from) to (1+ from))))
-                       (msg (or (gethash "message" d) "")))
+                       (related (lsp--related-information-inline-lines
+                                 (gethash "relatedInformation" d)))
+                       (msg (let ((base (or (gethash "message" d) "")))
+                              ;; M154 C3: `relatedInformation' entries appended
+                              ;; to the message string itself -- the Rust type
+                              ;; `lsp--set-buffer-diagnostics' hands to
+                              ;; `redisplay.rs' stays `(usize, u8, String)', so
+                              ;; a diagnostic that HAS related locations reaches
+                              ;; the inline row exactly the same way one
+                              ;; without any always has: a longer String,
+                              ;; subject to M87 stage 3's existing 3-line cap.
+                              (if related
+                                  (concat base "\n" (mapconcat #'identity related "\n"))
+                                base))))
                   (overlay-put ov 'lsp-diag t)
                   (overlay-put ov 'face
                                (list ':underline
@@ -1200,13 +1291,23 @@ Only ever takes effect against a server that itself declares
 deliberately NOT gated through `lsp--capability-supported-p''s usual
 permissive \"absent means assume supported\" policy.")
 
-(defun lsp--verilog-slang-command-p (command)
-  "Non-nil if COMMAND (an `lsp--client-command' string, or nil) names a
-slang binary -- same discipline as this file's own
-`lsp--verible-command-p': a substring match on COMMAND's own basename
-(`file-name-nondirectory'), so a full path still matches. nil COMMAND
-means \"don't know\", treated as NOT slang."
-  (and command (string-match-p "slang" (file-name-nondirectory command)) t))
+(defun lsp--verilog-build-file-client-p (client)
+  "Non-nil if CLIENT is the buffer's build-file-capable Verilog client
+-- M154 D1: replaces the old `lsp--verilog-slang-command-p', which
+found \"the slang client\" by a substring match (`slang') on CLIENT's
+own `lsp--client-command' basename. That name check made a PROXY (a
+server named anything else -- e.g. `darkfield-lsp', which spawns a real
+slang-server underneath and forwards everything, see this milestone's
+own header note) invisible to `lsp-verilog-show-include-directories'
+even though its `initialize' reply still declares `slang.setBuildFile'
+just like slang-server's own does. What actually matters is the
+CAPABILITY, not what the binary happens to be called -- exactly the
+same test `lsp--verilog-maybe-push-include-directories' already uses to
+decide whether to push a build file in the first place, so this is a
+thin wrapper around that same predicate rather than a second, possibly-
+diverging implementation of the same check. Its only caller is
+`lsp-verilog-show-include-directories'."
+  (lsp--verilog-server-declares-set-build-file-p client))
 
 (defun lsp--verilog-user-configured-slang-p (root)
   "Non-nil if ROOT or the user's home directory already carries a
@@ -1535,7 +1636,7 @@ ever fires from `lsp-connect'/`lsp--autostart-begin' at connect time."
   (interactive "P")
   (let ((client (let (found)
                   (dolist (c (lsp--effective-buffer-clients) found)
-                    (when (lsp--verilog-slang-command-p (lsp--client-command c))
+                    (when (lsp--verilog-build-file-client-p c)
                       (setq found c))))))
     (cond
      ((not client)
@@ -2324,8 +2425,19 @@ M99: reads the same union `lsp--diagnostics-for-uri' reads for painting
 -- previously this only ever considered `lsp--buffer-client''s own
 diagnostics, so a diagnostic drawn on screen from a secondary client
 could be invisible to this function (and hence to `lsp-code-action-at-
-point', which calls this) even though the squiggle was right there."
-  (let ((client lsp--buffer-client)
+point', which calls this) even though the squiggle was right there.
+
+M154 B1: CLIENT is `lsp--any-live-client', not the raw `lsp--buffer-
+client' -- a lone secondary in an empty primary slot now sees its own
+diagnostics here too. A consequence of the same change: when the ONLY
+attached client is a dead primary with no live secondary,
+`lsp--any-live-client' returns nil and this function returns nil too
+(no diagnostics, rather than the dead primary's own stale last-known
+diagnostics it used to return before M154) -- matching
+`lsp--buffer-diagnostic-positions', which is deliberate for the same
+reason its own docstring gives: a dead server shouldn't report stale
+diagnostics as current."
+  (let ((client (lsp--any-live-client))
         (file (buffer-file-name))
         (pos (point))
         (out nil))
@@ -2362,45 +2474,123 @@ is non-nil, otherwise a zero-width range at point."
       (puthash "end" (lsp--position (car lc) (cdr lc)) r)
       r)))
 
+(defun lsp--code-action-command (action)
+  "The (COMMAND . ARGUMENTS) to send via `workspace/executeCommand' for
+ACTION (M154 A3/A4), or nil if ACTION carries neither shape. ACTION's
+own `command' key holds either a bare STRING -- ACTION is itself a
+top-level `Command' element, `{title, command, arguments?}' -- or a
+nested hash-table -- ACTION is a `CodeAction' whose own `command' field
+is a `Command'. Either way this returns the (STRING . ARGUMENTS-vector-
+or-nil) pair `lsp--apply-code-action' sends; nil when ACTION's `command'
+key is absent or neither shape."
+  (let ((c (gethash "command" action)))
+    (cond
+     ((stringp c) (cons c (gethash "arguments" action)))
+     ((hash-table-p c) (cons (gethash "command" c) (gethash "arguments" c)))
+     (t nil))))
+
 (defun lsp--code-action-usable (result)
   "Split RESULT (a `textDocument/codeAction' reply, expected a vector of
 `CodeAction'/`Command' elements) into (USABLE . SKIPPED): USABLE is the
 list, in RESULT's own order, of elements that are hash-tables carrying
-an `edit' -- the only shape M48 v1 applies (see the file header for
-why a `Command'-only element, or a `CodeAction' with no `edit' at all,
-is not); SKIPPED is how many elements were not usable, for the
+either an `edit' hash-table OR a `command' (M154 A3 widened this from
+M48 v1's edit-only rule -- see `lsp--code-action-command' for the two
+shapes a `command' can take; `lsp--apply-code-action' is what actually
+executes it). SKIPPED is how many elements were neither, for the
 caller's final message."
   (let ((usable nil) (skipped 0) (n (if (vectorp result) (length result) 0)))
     (dotimes (idx n)
       (let ((action (aref result idx)))
-        (if (and (hash-table-p action) (hash-table-p (gethash "edit" action)))
+        (if (and (hash-table-p action)
+                 (or (hash-table-p (gethash "edit" action))
+                     (lsp--code-action-command action)))
             (push action usable)
           (setq skipped (1+ skipped)))))
     (cons (nreverse usable) skipped)))
 
-(defun lsp--code-action-alist (actions)
-  "Build a (DISPLAY . ACTION) alist from ACTIONS (a list of usable
-`CodeAction' hash-tables, from `lsp--code-action-usable'), M48's
-`lsp-code-action-at-point' picker input. Same disambiguation discipline
-as `lsp--symbol-alist' (M47) and for the identical reason: a
-\" (N)\" suffix appended to DISPLAY on `title' collisions, so every entry maps
-back to exactly one ACTION -- without it, `completing-read''s
-REQUIRE-MATCH would still let the user pick a title, but `assoc' below
-could only ever return the first of several actions sharing one."
-  (let ((counts (make-hash-table :test 'equal))
-        (seen (make-hash-table :test 'equal))
+(defun lsp--code-action-clients ()
+  "Every live client attached to the current buffer that declares
+`codeActionProvider' (M154 A1), in the order `lsp-code-action-at-point'
+should ask them: the PRIMARY first if it is itself live and capable,
+then every other live, capable client in `lsp--effective-buffer-
+clients' -- that list is most-recently-attached-first, NOT primary-
+first (see `lsp--capable-client''s own docstring for why), so the
+primary is walked separately first, same discipline as
+`lsp--capable-client'/`lsp--preferred-role-client'. Returns nil if no
+attached client declares the capability.
+
+This also answers the lone-secondary-in-an-empty-primary-slot state for
+code actions (M94's Z2 self-heal state): with no live primary, the scan
+below still finds a live, capable secondary, where the pre-M154
+`lsp-code-action-at-point' read `lsp--buffer-client' directly and
+always refused there."
+  (let ((primary (lsp--live-buffer-client))
         (out nil))
-    (dolist (action actions)
-      (let ((title (gethash "title" action)))
-        (puthash title (1+ (gethash title counts 0)) counts)))
-    (dolist (action actions)
-      (let* ((title (gethash "title" action))
-             (display title))
-        (when (> (gethash title counts) 1)
-          (let ((n (1+ (gethash title seen 0))))
-            (puthash title n seen)
-            (setq display (format "%s (%d)" title n))))
-        (push (cons display action) out)))
+    (when (and primary (lsp--capability-supported-p primary "codeActionProvider"))
+      (push primary out))
+    (dolist (client (lsp--effective-buffer-clients))
+      (when (and (not (eq client primary))
+                 (lsp--client-conn-live-p client)
+                 (lsp--capability-supported-p client "codeActionProvider"))
+        (push client out)))
+    (nreverse out)))
+
+(defun lsp--code-action-alist (pairs)
+  "Build a (DISPLAY . (CLIENT . ACTION)) alist from PAIRS (a list of
+(CLIENT . ACTION) conses -- CLIENT the `lsp--client' that returned
+ACTION, a usable `CodeAction'/`Command' hash-table, from
+`lsp--code-action-usable'), M48/M154's `lsp-code-action-at-point'
+picker input.
+
+M154 A3: when PAIRS came from more than one DISTINCT client, every
+DISPLAY gets a ` [<basename of that client's command>]' suffix
+(`file-name-nondirectory' of `lsp--client-command', same convention as
+this file's own `lsp--verible-command-p') so two servers offering identically-
+titled actions stay distinguishable at the picker. With exactly one
+contributing client, no suffix at all -- a single-server buffer's
+titles read exactly as they did before this milestone (existing single-
+client tests' expected titles are unchanged).
+
+Independently of that, the SAME disambiguation discipline as
+`lsp--symbol-alist' (M47) still applies on top of whatever label the
+paragraph above produced: a \" (N)\" suffix is appended to any label
+that still collides with another, so every entry maps back to exactly
+one PAIR -- without it, `completing-read''s REQUIRE-MATCH would still
+let the user pick a label, but `assoc' below could only ever return the
+first of several actions sharing one."
+  (let* ((distinct-clients
+          (let (seen)
+            (dolist (pair pairs (nreverse seen))
+              (unless (memq (car pair) seen)
+                (push (car pair) seen)))))
+         (multi (> (length distinct-clients) 1))
+         (labeled
+          (mapcar
+           (lambda (pair)
+             (let* ((client (car pair))
+                    (action (cdr pair))
+                    (title (gethash "title" action)))
+               (cons (if multi
+                         (format "%s [%s]" title
+                                 (file-name-nondirectory
+                                  (or (lsp--client-command client) "")))
+                       title)
+                     pair)))
+           pairs))
+         (counts (make-hash-table :test 'equal))
+         (seen (make-hash-table :test 'equal))
+         (out nil))
+    (dolist (entry labeled)
+      (puthash (car entry) (1+ (gethash (car entry) counts 0)) counts))
+    (dolist (entry labeled)
+      (let* ((label (car entry))
+             (pair (cdr entry))
+             (display label))
+        (when (> (gethash label counts) 1)
+          (let ((n (1+ (gethash label seen 0))))
+            (puthash label n seen)
+            (setq display (format "%s (%d)" label n))))
+        (push (cons display pair) out)))
     (nreverse out)))
 
 (defun lsp--workspace-edit-other-uris (edit this-uri)
@@ -2448,68 +2638,150 @@ both are nil/zero -- the common case, nothing to report."
       (push (format "%d edit(s) in other file(s) skipped" (length other)) parts))
     (if parts (concat " (" (string-join (nreverse parts) "; ") ")") "")))
 
-(defun lsp--apply-code-action (action tick skipped)
-  "Apply ACTION's `edit' (a `WorkspaceEdit') to the current buffer via
-`lsp--apply-workspace-edit-for-buffer', reporting what happened via
-`message' -- always, unlike `lsp-format-buffer''s success case, since a
-code action's own title is worth echoing back to confirm which one ran.
+(defun lsp--code-action-send-command (client cmd)
+  "Send `workspace/executeCommand' to CLIENT for CMD (a (COMMAND .
+ARGUMENTS) cons from `lsp--code-action-command', M154 A4). The reply is
+ignored on success; a JSON-RPC error reply is already `message'd by
+`lsp--dispatch' itself, unconditionally, before it even looks for a
+matching callback (see the file header's M46 note) -- so nothing extra
+is needed here for that half."
+  (let ((params (make-hash-table)))
+    (puthash "command" (car cmd) params)
+    (when (cdr cmd) (puthash "arguments" (cdr cmd) params))
+    (lsp-request-async client "workspace/executeCommand" params
+                        (lambda (result) result))))
+
+(defun lsp--apply-code-action (pair tick skipped)
+  "Apply PAIR's (a (CLIENT . ACTION) cons, M154 A4 -- CLIENT is the
+client that produced ACTION, needed because `workspace/executeCommand'
+below must go back to the SAME server that offered the action, not
+necessarily the buffer's primary) `edit' (a `WorkspaceEdit') to the
+current buffer via `lsp--apply-workspace-edit-for-buffer', reporting
+what happened via `message' -- always, unlike `lsp-format-buffer''s
+success case, since a code action's own title is worth echoing back to
+confirm which one ran.
 
 M48 write-command staleness discipline (same as `lsp-format-buffer',
 see its docstring): if `buffer-modified-tick' no longer equals TICK
 \(captured right after `lsp--sync-buffer-now', before the request was
-sent), the edit is DROPPED with a `message' instead of applied -- the
+sent), the EDIT is DROPPED with a `message' instead of applied -- the
 user kept typing while the server was still computing, so the edit
 describes a snapshot that no longer matches the live buffer. Checked
 HERE, immediately before applying, rather than at the top of the
 response callback: with a picker involved, an arbitrary amount of
 additional typing can happen between the reply landing and the user
 finishing their pick, so the check must be the last thing before the
-write, not the first thing after the reply."
-  (if (/= (buffer-modified-tick) tick)
-      (message "lsp: buffer changed since code action request, discarding stale edit")
-    (let* ((edit (gethash "edit" action))
-           (title (gethash "title" action))
-           (this-uri (lsp--path-to-uri (buffer-file-name)))
-           (other (lsp--workspace-edit-other-uris edit this-uri))
-           (n (lsp--apply-workspace-edit-for-buffer edit))
-           (suffix (lsp--code-action-skip-suffix skipped other)))
-      (if n
-          (message "%s%s" title suffix)
-        (message "lsp: %s: nothing to apply here%s" title suffix)))))
+write, not the first thing after the reply.
+
+M154 A4: this staleness check guards ONLY the edit half -- a `command'
+\(`lsp--code-action-command') is sent via `lsp--code-action-send-command'
+unconditionally, even when the edit was just dropped as stale, since
+there is no local edit for stale typing to invalidate."
+  (let* ((action (cdr pair))
+         (client (car pair))
+         (title (gethash "title" action))
+         (cmd (lsp--code-action-command action)))
+    (if (/= (buffer-modified-tick) tick)
+        (progn
+          (message "lsp: buffer changed since code action request, discarding stale edit")
+          (when cmd (lsp--code-action-send-command client cmd)))
+      (let* ((edit (gethash "edit" action))
+             (this-uri (lsp--path-to-uri (buffer-file-name)))
+             (other (lsp--workspace-edit-other-uris edit this-uri))
+             (n (lsp--apply-workspace-edit-for-buffer edit))
+             (suffix (lsp--code-action-skip-suffix skipped other)))
+        (when cmd (lsp--code-action-send-command client cmd))
+        (if n
+            (message "%s%s" title suffix)
+          (message "lsp: %s: nothing to apply here%s" title suffix))))))
+
+(defun lsp--code-action-finish (clients replies buf tick)
+  "Once every client `lsp-code-action-at-point' asked (M154 A2 --
+CLIENTS, `lsp--code-action-clients''s own order, primary first) has
+replied (REPLIES, an alist of (CLIENT . RESULT) built up by each
+callback as its own reply lands -- a `nil'/absent-result or empty-
+vector reply counts as a reply, same as any other), merge every reply's
+usable elements -- in CLIENTS order, so the picker lists the primary's
+actions ahead of a secondary's -- into one picker/apply step, the
+multi-client counterpart of what the single-client `lsp-code-action-
+at-point' used to do directly against one RESULT.
+
+BUF/TICK are the same staleness pair the single-client path always
+used: the `(eq (current-buffer) buf)' check happens HERE, once, now
+that the LAST reply has landed -- an earlier reply landing while the
+buffer was still current says nothing about whether it still is once
+every client has answered, so this check cannot run per-reply.
+`lsp--apply-code-action' checks TICK again right before writing, for
+the same reason `lsp-goto-symbol-by-name''s own second staleness check
+exists: an arbitrary amount of additional typing (or, with a picker,
+time spent choosing) can happen after this check passes.
+
+The \"no actions\" message keeps the M48 v1 distinction: \"No code
+actions here\" when NO client returned any element at all; \"No
+applicable code actions here\" (with a skip-count suffix) when at least
+one client returned elements but none, across all clients, were
+usable."
+  (when (eq (current-buffer) buf)
+    (let ((usable nil) (skipped 0) (any-elements nil))
+      (dolist (client clients)
+        (let ((result (cdr (assq client replies))))
+          (when (and (vectorp result) (> (length result) 0))
+            (setq any-elements t)
+            (let ((split (lsp--code-action-usable result)))
+              (dolist (action (car split))
+                (push (cons client action) usable))
+              (setq skipped (+ skipped (cdr split)))))))
+      (setq usable (nreverse usable))
+      (cond
+       ((not usable)
+        (if any-elements
+            (message "No applicable code actions here%s"
+                     (lsp--code-action-skip-suffix skipped nil))
+          (message "No code actions here")))
+       ((= (length usable) 1)
+        (lsp--apply-code-action (car usable) tick skipped))
+       (t
+        (let ((alist (lsp--code-action-alist usable)))
+          (with-completing-read
+           (title "Code action: " (mapcar #'car alist) t)
+           ;; Second staleness check: see this function's own docstring.
+           (when (eq (current-buffer) buf)
+             (lsp--apply-code-action
+              (cdr (assoc title alist)) tick skipped)))))))))
 
 (defun lsp-code-action-at-point ()
   "Send `textDocument/codeAction' for the diagnostic(s) at point (via
 `lsp--diagnostics-at-point'; a zero-width range at point if there are
-none) and apply the resulting edit -- see the file header for the full
-M48 v1 scope (no `Command' execution, no `codeAction/resolve', only the
-current buffer's own uri out of a multi-file `edit').
+none) to EVERY client that declares the capability (M154 A1/A2,
+`lsp--code-action-clients') and apply the resulting edit and/or run the
+resulting command -- see the file header for the remaining v1 scope
+(no `codeAction/resolve', only the current buffer's own uri out of a
+multi-file `edit', no `documentChanges').
 
-Exactly one applicable action (an element with an `edit') applies it
-immediately; more than one opens a `with-completing-read' picker keyed
-by title (M47's `with-completing-read', same disambiguation/staleness
-shape as `lsp-goto-symbol-by-name' -- see `lsp--code-action-alist' and
-this function's own second staleness check below); none messages
-\"No code actions here\" (an empty/absent reply) or \"No applicable
-code actions here\" (a non-empty reply where every element lacked an
-`edit').
+Exactly one applicable action across every reply (an element with an
+`edit' or a `command', M154 A3) applies it immediately; more than one
+opens a `with-completing-read' picker keyed by title, suffixed with the
+producing server's basename when more than one client contributed
+(M47's `with-completing-read', same disambiguation/staleness shape as
+`lsp-goto-symbol-by-name' -- see `lsp--code-action-alist' and
+`lsp--code-action-finish''s own second staleness check); none messages
+\"No code actions here\" (every reply empty/absent) or \"No applicable
+code actions here\" (at least one non-empty reply where every element
+was unusable).
 
 Async (`lsp-request-async', same reason as every M46-forward
 interactive LSP command -- see the file header's M46 note; M65 bounded
 `lsp--await' itself, but a several-second freeze on every keystroke-
 adjacent command is still worth avoiding, so the async path stays the
-rule here). Same buffer-identity/`buffer-modified-
-tick' write discipline as `lsp-format-buffer': TICK is captured right
-after `lsp--sync-buffer-now', and checked again -- inside
-`lsp--apply-code-action', immediately before applying, not at the top
-of this callback -- since a picker can introduce an arbitrary
-additional delay after the reply lands (identical to
-`lsp-goto-symbol-by-name''s own second staleness check, for the same
-reason: the FIRST `(eq (current-buffer) buf)' below only guards
-opening the picker)."
+rule here) -- ONE `lsp-request-async' call per client (M154 A2), sharing
+a single pending counter so the picker/apply step in
+`lsp--code-action-finish' runs only once every client has replied.
+TICK is captured right after `lsp--sync-buffer-now', and checked again
+inside `lsp--apply-code-action', immediately before applying."
   (interactive)
-  (let ((client (lsp--live-buffer-client)))
+  (let ((clients (lsp--code-action-clients)))
     (cond
-     ((not client)
+     ((not clients)
       (message "No LSP server connected in this buffer (M-x lsp first)"))
      ((not (buffer-file-name))
       (message "Buffer is not visiting a file"))
@@ -2518,33 +2790,20 @@ opening the picker)."
       (let* ((diags (lsp--diagnostics-at-point))
              (p (lsp--text-document-only-params))
              (buf (current-buffer))
-             (tick (buffer-modified-tick)))
+             (tick (buffer-modified-tick))
+             (pending (length clients))
+             (replies (mapcar (lambda (c) (cons c 'lsp--code-action-pending))
+                               clients)))
         (puthash "range" (lsp--code-action-range diags) p)
         (puthash "context" (lsp--code-action-context diags) p)
-        (lsp-request-async
-         client "textDocument/codeAction" p
-         (lambda (result)
-           (when (eq (current-buffer) buf)
-             (if (not (and (vectorp result) (> (length result) 0)))
-                 (message "No code actions here")
-               (let* ((split (lsp--code-action-usable result))
-                      (usable (car split))
-                      (skipped (cdr split)))
-                 (cond
-                  ((not usable)
-                   (message "No applicable code actions here%s"
-                            (lsp--code-action-skip-suffix skipped nil)))
-                  ((= (length usable) 1)
-                   (lsp--apply-code-action (car usable) tick skipped))
-                  (t
-                   (let ((alist (lsp--code-action-alist usable)))
-                     (with-completing-read
-                      (title "Code action: " (mapcar #'car alist) t)
-                      ;; Second staleness check: see this function's own
-                      ;; docstring.
-                      (when (eq (current-buffer) buf)
-                        (lsp--apply-code-action
-                         (cdr (assoc title alist)) tick skipped))))))))))))))))
+        (dolist (client clients)
+          (lsp-request-async
+           client "textDocument/codeAction" p
+           (lambda (result)
+             (setcdr (assq client replies) result)
+             (setq pending (1- pending))
+             (when (= pending 0)
+               (lsp--code-action-finish clients replies buf tick))))))))))
 
 (defun lsp-rename ()
   "Read a new name (`with-read-string', M47) and send
@@ -4506,6 +4765,36 @@ with stand-ins on purpose."
           (progn (setq-local lsp--buffer-client nil) nil)
         lsp--buffer-client))))
 
+(defun lsp--any-live-client ()
+  "The current buffer's live PRIMARY (`lsp--live-buffer-client'), if
+there is one, else the first live client in `lsp--effective-buffer-
+clients' (M154 B1). nil if the buffer has no live attached client at
+all.
+
+Used by `next-diagnostic'/`previous-diagnostic'/`lsp--buffer-
+diagnostic-positions'/`lsp--diagnostics-at-point' so a lone secondary
+sitting in an EMPTY primary slot -- the state M94's Z2 self-heal
+produces, the primary dies and a client whose own `command' doesn't
+match the mode's primary table entry joins `lsp--buffer-clients'
+without ever taking the now-empty slot -- can still answer diagnostics
+navigation. M99 already made `lsp--diagnostics-for-uri' itself union
+every attached client's diagnostics regardless of which CLIENT it was
+handed; this function closes the other half of that gap, the CALLER-
+side gate that still refused outright whenever `lsp--live-buffer-
+client' alone (i.e. the primary alone) was nil, even though a live,
+capable secondary was attached and its diagnostics were already being
+painted on screen by `lsp--decorate-buffer'.
+
+Behaviour with a live primary is byte-for-byte unchanged: the primary
+is always preferred first here, exactly as `lsp--live-buffer-client'
+alone used to decide, so a buffer whose sole attached client already
+occupies the primary slot never sees any difference."
+  (or (lsp--live-buffer-client)
+      (let (found)
+        (dolist (client (lsp--effective-buffer-clients) found)
+          (when (and (not found) (lsp--client-conn-live-p client))
+            (setq found client))))))
+
 (defun lsp--capable-client (key)
   "This buffer's PRIMARY (`lsp--buffer-client'), if it's LIVE and
 supports KEY (a JSON key string, via `lsp--capability-supported-p' --
@@ -4652,10 +4941,13 @@ regression, and it is kept rather than special-cased away. But it is
 NOT the same behaviour, and any docstring or comment that claims a
 single attached client is unconditionally indistinguishable from
 before M95 is wrong; the accurate claim is conditioned on that client
-occupying the primary slot. `lsp-code-action-at-point' and
-`lsp-format-buffer'/`lsp-format-region' are UNCHANGED by any of this --
-they still read `lsp--buffer-client' directly, so they still refuse in
-exactly that lone-secondary-in-an-empty-primary-slot state."
+occupying the primary slot. `lsp-format-buffer'/`lsp-format-region' are
+UNCHANGED by any of this -- they still read `lsp--buffer-client'
+directly, so they still refuse in exactly that lone-secondary-in-an-
+empty-primary-slot state. `lsp-code-action-at-point' is NO LONGER on
+this list as of M154: it now asks every capable client via
+`lsp--code-action-clients', which answers the lone-secondary state
+directly instead of refusing."
   (let ((primary (lsp--live-buffer-client)))
     (or (and (eq (cdr (assoc method lsp-request-preferred-role-alist)) 'secondary)
              (let (found)
@@ -6398,24 +6690,263 @@ remembers the buffer alongside each marker instead, and this is how
         (switch-to-buffer buf)
         (goto-char (marker-position marker))))))
 
+;; --- M154 C1/C2: diagnostic detail buffer + related-location jump -------
+
+(defun lsp--diagnostic-severity-word (sev)
+  "Severity word for a `DiagnosticSeverity' integer (1 error, 2 warning,
+3 information, 4 hint, per the LSP spec's own numbering) -- M154 C1's
+`lsp-show-diagnostic-at-point'. \"diagnostic\" for anything else,
+including nil/absent (a server is not required to send `severity' at
+all) -- unlike `lsp--decorate-buffer''s own severity handling, which
+defaults an absent/`:null' severity to 1 (error) for the SQUIGGLE
+color, C1 is showing the diagnostic's own fields back to the user
+verbatim, so guessing a specific severity here would misreport what the
+server actually said."
+  (cond ((eql sev 1) "error")
+        ((eql sev 2) "warning")
+        ((eql sev 3) "info")
+        ((eql sev 4) "hint")
+        (t "diagnostic")))
+
+(defun lsp--related-location-display-path (path client)
+  "PATH (an already-`lsp--uri-to-path'-converted filesystem path)
+formatted relative to CLIENT's own project root when PATH sits under
+it, else just PATH's basename (`file-name-nondirectory') -- M154 C1/C2's
+shared display convention, so a `relatedInformation' entry in a large
+project doesn't force the reader to parse a long absolute path, while a
+location genuinely outside the root (a system header, say, or CLIENT
+itself nil/rootless) still shows something identifying rather than
+nothing at all."
+  (let ((root (and client (lsp--client-p client) (lsp--client-root client))))
+    (if (and root (string-prefix-p (file-name-as-directory root) path))
+        (substring path (length (file-name-as-directory root)))
+      (file-name-nondirectory path))))
+
+(defun lsp--related-location-line (client entry)
+  "One display line for `relatedInformation' ENTRY (a
+`DiagnosticRelatedInformation' hash-table: `{location: {uri, range},
+message}') -- shared by `lsp-show-diagnostic-at-point' (M154 C1, where
+it's indented under its diagnostic) and `lsp-goto-related-location'
+(M154 C2, where it's a picker label): `↳
+<path>:<line+1>:<character+1>: <message>', PATH via
+`lsp--related-location-display-path' against CLIENT. 1-based line/
+character for display, matching every other 1-based position this
+editor shows a human (the mode line's own line/column indicator); the
+jump itself (`lsp--goto-related-location-1') uses the raw 0-based LSP
+values.
+
+M154 F4: nil for a malformed ENTRY (`lsp--related-information-location'
+returns nil) instead of signalling. `lsp--related-locations-at-point'
+already filters these out before ENTRY ever reaches here or the picker
+built on top of it, so this is defense in depth, not the only guard."
+  (let ((fields (lsp--related-information-location entry)))
+    (when fields
+      (let ((path (lsp--related-location-display-path
+                    (lsp--uri-to-path (nth 0 fields)) client)))
+        (format "↳ %s:%d:%d: %s" path (1+ (nth 1 fields)) (1+ (nth 2 fields))
+                (gethash "message" entry))))))
+
+(defun lsp-show-diagnostic-at-point ()
+  "Show every diagnostic covering point (`lsp--diagnostics-at-point',
+M154 C1) in a `*LSP Diagnostic*' buffer: one block per diagnostic --
+`<severity word> [<source>] <code>: <message>' (an absent `source' or
+`code' is OMITTED outright, never rendered as an empty `[]' or a stray
+space -- `lsp--diagnostic-severity-word' supplies the first word) --
+followed by one indented `relatedInformation' line per entry
+(`lsp--related-location-line', shared with `lsp-goto-related-location').
+No diagnostics at point -> `message'.
+
+Reuses the `*Help*'-style temp-buffer pattern `describe-bindings'
+(simple.el) uses (`pop-to-buffer' + `major-mode-internal-set' + a
+read-only, unmodified buffer) -- NOT a pattern belonging to
+`lsp-verilog-show-include-directories': that command, despite this
+milestone's own spec naming it as the precedent to reuse, in fact never
+creates a buffer at all and only ever calls `message'; `describe-
+bindings' is the actual temp-buffer/help precedent already in this
+file's neighborhood."
+  (interactive)
+  (let ((diags (lsp--diagnostics-at-point))
+        (client (lsp--any-live-client)))
+    (if (not diags)
+        (message "No diagnostics at point")
+      (let ((text
+             (mapconcat
+              (lambda (d)
+                (let* ((sev (gethash "severity" d))
+                       (sev (if (eq sev :null) nil sev))
+                       (source (gethash "source" d))
+                       (code (gethash "code" d))
+                       (related (lsp--related-location-detail-lines
+                                 client (gethash "relatedInformation" d)))
+                       (header (concat (lsp--diagnostic-severity-word sev)
+                                       (if source (format " [%s]" source) "")
+                                       (if code (format " %s" code) "")
+                                       ": " (or (gethash "message" d) ""))))
+                  (if related
+                      (concat header "\n" (mapconcat #'identity related "\n"))
+                    header)))
+              diags "\n\n")))
+        (pop-to-buffer "*LSP Diagnostic*")
+        (major-mode-internal-set 'help-mode)
+        (help--install-quit-map)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert text)
+          (goto-char (point-min)))
+        (set-buffer-modified-p nil)
+        (set-buffer-read-only t)))))
+
+(defun lsp--related-location-detail-lines (client related)
+  "Every entry of RELATED (a diagnostic's own `relatedInformation'
+vector, or nil) rendered via `lsp--related-location-line' against
+CLIENT, each prefixed with two spaces of indentation -- `lsp-show-
+diagnostic-at-point''s (M154 C1) own per-block detail, as opposed to
+`lsp--related-information-inline-lines' (M154 C3), the terser form fed
+to the inline diagnostic row. nil/empty RELATED yields nil.
+
+M154 F4: a malformed entry (`lsp--related-location-line' returns nil
+for it) is skipped rather than concatenated in as a literal \"  nil\"
+line or signalling in `concat'."
+  (when (and related (> (length related) 0))
+    (let ((n (length related)) (i 0) out)
+      (while (< i n)
+        (let ((line (lsp--related-location-line client (aref related i))))
+          (when line (push (concat "  " line) out)))
+        (setq i (1+ i)))
+      (nreverse out))))
+
+(defun lsp--related-locations-at-point ()
+  "Every `relatedInformation' entry (M154 C2) across every diagnostic
+`lsp--diagnostics-at-point' returns, flattened into one list, in
+diagnostic order and then entry order. `relatedInformation' itself
+arrives as a JSON-array-shaped vector (see `lsp--verilog-vector-member-
+string-p''s own docstring for why this codebase's `dolist' can't walk
+it directly), so this walks by index the same way `lsp--decorate-
+buffer''s own related-information handling does.
+
+M154 F4: an entry `lsp--related-information-location' rejects as
+malformed is skipped here too, so it never reaches
+`lsp--goto-related-location-1' (whose own `gethash' chain has no
+guard) or the picker built on top of this list."
+  (let (out)
+    (dolist (d (lsp--diagnostics-at-point) (nreverse out))
+      (let ((related (gethash "relatedInformation" d)))
+        (when (and related (> (length related) 0))
+          (let ((n (length related)) (i 0))
+            (while (< i n)
+              (let ((entry (aref related i)))
+                (when (lsp--related-information-location entry)
+                  (push entry out)))
+              (setq i (1+ i)))))))))
+
+(defun lsp--goto-related-location-1 (entry client)
+  "Body of `lsp-goto-related-location' (M154 C2) once ENTRY (a
+`DiagnosticRelatedInformation' hash-table) is chosen: push the origin
+onto `lsp--marker-stack' FIRST (`lsp--make-definition-marker' +
+`lsp-push-definition-marker', exactly like `lsp-definition-at-point'),
+then `find-file' + jump to ENTRY's own location.
+
+Unlike `lsp-definition-at-point' (whose own landing is `forward-line'
+only -- the server's `character' is parsed by `lsp--definition-location'
+but then simply discarded, a pre-existing gap that command's own file
+header does not track as fixable here), this jumps to the CHARACTER too
+via `lsp--pos-at-utf16': a `relatedInformation' entry's whole point here
+is to also name a column, and `lsp-show-diagnostic-at-point' (M154 C1)
+already displays it, so silently dropping it while claiming to jump to
+it would be worse than leaving it alone. CLIENT is only used by nothing
+here (kept for signature symmetry with the rest of this file's `M154
+C1/C2' functions) -- the jump itself needs no client at all, only the
+URI already embedded in ENTRY."
+  (let* ((origin (lsp--make-definition-marker))
+         (loc (gethash "location" entry))
+         (uri (gethash "uri" loc))
+         (range (gethash "range" loc))
+         (start (gethash "start" range))
+         (line (gethash "line" start))
+         (character (gethash "character" start)))
+    (lsp-push-definition-marker origin)
+    (find-file (lsp--uri-to-path uri))
+    (goto-char (lsp--pos-at-utf16 line character))))
+
+(defun lsp--related-location-alist (client entries)
+  "Build a (LABEL . ENTRY) alist from ENTRIES (a list of
+`relatedInformation' hash-tables, `lsp--related-locations-at-point''s
+own return value), `lsp-goto-related-location''s (M154 C2) picker
+input. LABEL is `lsp--related-location-line''s two-space-indented line
+against CLIENT, same as before this fix -- but two distinct entries
+(different files, or the same file at different lines) can render the
+SAME label (identical message, identical display path -- e.g. two
+`relatedInformation' entries both reading `↳ foo.sv:3: previous
+definition here' from two different diagnostics), and `assoc' below can
+only ever return the first of several matching LABELs. So this applies
+the exact same \" (N)\" disambiguation convention `lsp--symbol-alist'
+(M47) and `lsp--code-action-alist' (M154 A3) already use in this file:
+a label that collides gets a numbered suffix appended, so every entry
+in the returned alist maps back to exactly one ENTRY."
+  (let ((labeled (mapcar (lambda (e)
+                            (cons (concat "  " (lsp--related-location-line client e)) e))
+                          entries))
+        (counts (make-hash-table :test 'equal))
+        (seen (make-hash-table :test 'equal))
+        (out nil))
+    (dolist (entry labeled)
+      (puthash (car entry) (1+ (gethash (car entry) counts 0)) counts))
+    (dolist (entry labeled)
+      (let* ((label (car entry))
+             (e (cdr entry))
+             (display label))
+        (when (> (gethash label counts) 1)
+          (let ((n (1+ (gethash label seen 0))))
+            (puthash label n seen)
+            (setq display (format "%s (%d)" label n))))
+        (push (cons display e) out)))
+    (nreverse out)))
+
+(defun lsp-goto-related-location ()
+  "Jump to a `relatedInformation' location of a diagnostic at point
+(M154 C2): none -> `message'; exactly one -> jump immediately
+(`lsp--goto-related-location-1'); several -> a `with-completing-read'
+picker (M47's macro, same disambiguation/staleness shape used
+throughout this file) labeled with `lsp-show-diagnostic-at-point''s own
+per-entry line format (`lsp--related-location-line', two-space
+indented to match), disambiguated by `lsp--related-location-alist' when
+two entries render the same label."
+  (interactive)
+  (let ((entries (lsp--related-locations-at-point))
+        (client (lsp--any-live-client)))
+    (cond
+     ((not entries)
+      (message "No related locations here"))
+     ((= (length entries) 1)
+      (lsp--goto-related-location-1 (car entries) client))
+     (t
+      (let ((alist (lsp--related-location-alist client entries)))
+        (with-completing-read
+         (label "Related location: " (mapcar #'car alist) t)
+         (lsp--goto-related-location-1 (cdr (assoc label alist)) client)))))))
+
 ;; --- Diagnostic navigation: M-g n / M-g p ---
 
 (defun lsp--buffer-diagnostic-positions ()
   "Ascending list of (POS . DIAG) for every diagnostic last published
 for the current buffer, or nil if there's no LIVE connected client
-(`lsp--live-buffer-client', not the raw `lsp--buffer-client' -- a dead
-server shouldn't report stale diagnostics as current) or none have
+(`lsp--any-live-client', M154 -- not the raw `lsp--buffer-client' -- a
+dead server shouldn't report stale diagnostics as current) or none have
 arrived yet. Callers that need to tell those two nil cases apart
 (`next-diagnostic', `previous-diagnostic') check
-`lsp--live-buffer-client' themselves first rather than trying to infer
+`lsp--any-live-client' themselves first rather than trying to infer
 which case this was from a nil return alone.
 
 M99: DIAG ranges over `lsp--diagnostics-for-uri''s union, same as
 `lsp--decorate-buffer' paints and `lsp--diagnostics-at-point' considers
 -- previously this only walked `lsp--buffer-client''s own diagnostics,
 so `next-diagnostic'/`previous-diagnostic' could fail to reach a
-squiggle that was visibly drawn on screen from a secondary client."
-  (let ((client (lsp--live-buffer-client))
+squiggle that was visibly drawn on screen from a secondary client.
+
+M154 B1: CLIENT is now `lsp--any-live-client' rather than
+`lsp--live-buffer-client' -- a lone secondary in an empty primary slot
+now answers here too, not just when the union itself is read."
+  (let ((client (lsp--any-live-client))
         (file (buffer-file-name)))
     (when (and client file)
       (let ((out nil))
@@ -6437,9 +6968,13 @@ the other 12 LSP commands if this buffer has no live client at all
 (M63 -- distinguishing \"no connection\" from \"connected but clean\"
 matters for RTL: seeing \"No diagnostics\" with no server attached
 reads as \"your code has no problems\", which is simply false), or
-\"No diagnostics\" if a client is live but none have been published."
+\"No diagnostics\" if a client is live but none have been published.
+
+M154 B1: the \"no server\" gate is `lsp--any-live-client', not
+`lsp--live-buffer-client' alone -- a lone secondary in an empty primary
+slot now answers here instead of being told no server is connected."
   (interactive)
-  (if (not (lsp--live-buffer-client))
+  (if (not (lsp--any-live-client))
       (message "No LSP server connected in this buffer (M-x lsp first)")
     (let ((positions (lsp--buffer-diagnostic-positions)))
       (if (not positions)
@@ -6454,9 +6989,9 @@ reads as \"your code has no problems\", which is simply false), or
   "Jump to the nearest diagnostic before point in the current buffer,
 wrapping to the last one if point is at or before the first. Same
 \"no client\" vs. \"no diagnostics\" distinction as `next-diagnostic' --
-see its doc."
+see its doc, including the M154 B1 `lsp--any-live-client' gate."
   (interactive)
-  (if (not (lsp--live-buffer-client))
+  (if (not (lsp--any-live-client))
       (message "No LSP server connected in this buffer (M-x lsp first)")
     (lsp--previous-diagnostic-1)))
 

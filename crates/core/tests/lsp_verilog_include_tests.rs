@@ -42,6 +42,20 @@ fn ok(interp: &mut Interp, src: &str) -> String {
     r
 }
 
+/// An elisp expression string for `make-lsp--client' `:capabilities'
+/// declaring `slang.setBuildFile' in `executeCommandProvider.commands' --
+/// the exact shape `lsp--verilog-server-declares-set-build-file-p'
+/// (and, since M154 D1, `lsp--verilog-build-file-client-p') requires.
+/// Same construction as `stub_await_declares_set_build_file''s own
+/// inline hash-table building, factored out for the tests that need the
+/// finished hash-table rather than an `lsp--await' stub.
+fn build_file_caps() -> &'static str {
+    "(let ((caps (make-hash-table)) (ecp (make-hash-table)))
+       (puthash \"commands\" (vector \"slang.setBuildFile\") ecp)
+       (puthash \"executeCommandProvider\" ecp caps)
+       caps)"
+}
+
 /// A scratch directory that deletes itself on drop -- same shape as
 /// `lsp_mode_tests.rs''s own `Scratch' (each test file brings its own
 /// helpers; there is no shared fixture in this codebase).
@@ -1077,19 +1091,28 @@ fn maybe_push_a_build_file_write_failure_does_not_kill_the_connection() {
 
 #[test]
 fn show_include_directories_success_message_names_the_build_file_and_directories() {
+    // M154 D1: the client-finding dolist inside `lsp-verilog-show-
+    // include-directories' now decides by capability
+    // (`lsp--verilog-build-file-client-p'), not by a `slang' substring
+    // in the command name -- this fixture's `:capabilities' is new,
+    // otherwise the client would simply never be found any more.
     let mut i = setup();
     ok(&mut i, "(get-buffer-create \"m133-show-success\")");
     ok(&mut i, "(set-buffer \"m133-show-success\")");
     ok(
         &mut i,
-        "(setq-local lsp--buffer-client
+        &format!(
+            "(setq-local lsp--buffer-client
                (make-lsp--client
                 :command \"slang-server\"
                 :root \"/proj\"
+                :capabilities {}
                 :verilog-include-info
                 (list (cons :sent t)
                       (cons :build-file \"/home/x/.reticle/lsp/incdirs-proj.f\")
                       (cons :directories (list \"/proj/include\" \"/proj/other\")))))",
+            build_file_caps()
+        ),
     );
     capture_messages(&mut i);
     ok(&mut i, "(lsp-verilog-show-include-directories)");
@@ -1106,17 +1129,23 @@ fn show_include_directories_success_message_names_the_build_file_and_directories
 
 #[test]
 fn show_include_directories_reports_the_reason_when_nothing_was_sent() {
+    // M154 D1: see the sibling `_success_message_' test's own comment --
+    // same reason this fixture now needs `:capabilities'.
     let mut i = setup();
     ok(&mut i, "(get-buffer-create \"m133-show-reason\")");
     ok(&mut i, "(set-buffer \"m133-show-reason\")");
     ok(
         &mut i,
-        "(setq-local lsp--buffer-client
+        &format!(
+            "(setq-local lsp--buffer-client
                (make-lsp--client
                 :command \"slang-server\"
+                :capabilities {}
                 :verilog-include-info
                 (list (cons :sent nil)
                       (cons :reason \"no include directories found\"))))",
+            build_file_caps()
+        ),
     );
     capture_messages(&mut i);
     ok(&mut i, "(lsp-verilog-show-include-directories)");
@@ -1149,47 +1178,69 @@ fn show_include_directories_reports_when_no_slang_client_is_attached() {
 }
 
 #[test]
-fn show_include_directories_finds_the_slang_client_among_several_attached() {
-    // Pins the client-selection `dolist' itself: a NON-slang primary is
-    // attached, and the slang client only shows up in
-    // `lsp--buffer-clients' (the secondary-clients list) -- deleting or
-    // breaking the dolist's scan would either find the wrong client or
-    // none at all.
+fn show_include_directories_finds_the_client_by_capability() {
+    // M154 D1: pins the client-selection `dolist' AFTER the rename from
+    // `lsp--verilog-slang-command-p' (substring-on-name) to
+    // `lsp--verilog-build-file-client-p' (capability-on-CLIENT) --
+    // deliberately using command names that carry no "slang" substring
+    // at all (`cat' for the non-capable primary, `darkfield-lsp' -- this
+    // milestone's own proxy name, see the file header -- for the
+    // capable secondary) so the test cannot pass by accident via the
+    // OLD name-matching behavior. The primary is attached FIRST and
+    // does not declare `slang.setBuildFile' at all (no `:capabilities'
+    // set, same as a plain, non-Verilog client); only the secondary
+    // declares it. Before D1 this exact scenario -- a differently-named
+    // primary was pinned in this test's earlier form -- was found by
+    // its `slang' substring; now nothing here has that substring, and
+    // the capability alone must still find the secondary.
     let mut i = setup();
     ok(&mut i, "(get-buffer-create \"m133-show-multi\")");
     ok(&mut i, "(set-buffer \"m133-show-multi\")");
     ok(
         &mut i,
-        "(setq-local lsp--buffer-client (make-lsp--client :command \"verible-verilog-ls\"))",
+        "(setq-local lsp--buffer-client (make-lsp--client :command \"cat\"))",
     );
     ok(
         &mut i,
-        "(setq-local lsp--buffer-clients
+        &format!(
+            "(setq-local lsp--buffer-clients
                (list (make-lsp--client
-                      :command \"slang-server\"
+                      :command \"darkfield-lsp\"
+                      :capabilities {}
                       :verilog-include-info
-                      (list (cons :sent nil)
-                            (cons :reason \"server does not declare slang.setBuildFile\")))))",
+                      (list (cons :sent t)
+                            (cons :build-file \"/home/x/.reticle/lsp/incdirs-df.f\")
+                            (cons :directories (list \"/proj/include\"))))))",
+            build_file_caps()
+        ),
     );
     capture_messages(&mut i);
     ok(&mut i, "(lsp-verilog-show-include-directories)");
     let messages = run(&mut i, "test--messages");
     assert!(
-        messages.contains("server does not declare slang.setBuildFile"),
-        "expected the SLANG client's own reason, not the verible \
-         client's (which has no verilog-include-info at all): {}",
+        messages.contains("incdirs-df.f"),
+        "expected the `darkfield-lsp' secondary's own recorded build \
+         file, found purely by its declared capability (its command \
+         name has no `slang' substring at all): {}",
         messages
     );
 }
 
 #[test]
 fn show_include_directories_prefix_arg_clears_the_cache() {
+    // M154 D1: see `show_include_directories_finds_the_client_by_
+    // capability''s own comment -- `:capabilities' is now required for
+    // the client to be found at all.
     let mut i = setup();
     ok(&mut i, "(get-buffer-create \"m133-show-force\")");
     ok(&mut i, "(set-buffer \"m133-show-force\")");
     ok(
         &mut i,
-        "(setq-local lsp--buffer-client (make-lsp--client :command \"slang-server\" :root \"/proj-force\"))",
+        &format!(
+            "(setq-local lsp--buffer-client (make-lsp--client :command \"slang-server\" \
+             :root \"/proj-force\" :capabilities {}))",
+            build_file_caps()
+        ),
     );
     ok(
         &mut i,
@@ -1214,27 +1265,43 @@ fn show_include_directories_prefix_arg_clears_the_cache() {
 }
 
 #[test]
-fn slang_command_p_matches_a_substring_of_the_basename_only() {
+fn build_file_client_is_decided_by_the_set_build_file_capability_not_the_command_name() {
+    // M154 D1: `lsp--verilog-slang-command-p' (a substring match on the
+    // COMMAND's own basename) is replaced by
+    // `lsp--verilog-build-file-client-p', which decides purely from the
+    // capability CLIENT itself declared -- so a proxy named anything at
+    // all (`darkfield-lsp', say) is found exactly as readily as
+    // `slang-server' is, and a client named `slang-server' that does NOT
+    // declare the capability is correctly NOT found.
     let mut i = setup();
+    ok(
+        &mut i,
+        &format!(
+            "(setq test--proxy (make-lsp--client :command \"darkfield-lsp\" :capabilities {}))",
+            build_file_caps()
+        ),
+    );
+    assert_eq!(
+        run(&mut i, "(lsp--verilog-build-file-client-p test--proxy)"),
+        "t",
+        "a client named `darkfield-lsp' that DOES declare \
+         slang.setBuildFile must be found"
+    );
+
+    ok(
+        &mut i,
+        "(setq test--unrelated-name (make-lsp--client :command \"slang-server\"))",
+    );
     assert_eq!(
         run(
             &mut i,
-            "(lsp--verilog-slang-command-p \"/usr/local/bin/slang-server\")"
+            "(lsp--verilog-build-file-client-p test--unrelated-name)"
         ),
-        "t"
+        "nil",
+        "a client literally named `slang-server' that declares NO \
+         executeCommandProvider.commands at all must NOT be found -- \
+         only the capability decides now, never the name"
     );
-    assert_eq!(
-        run(&mut i, "(lsp--verilog-slang-command-p \"slang-server\")"),
-        "t"
-    );
-    assert_eq!(
-        run(
-            &mut i,
-            "(lsp--verilog-slang-command-p \"verible-verilog-ls\")"
-        ),
-        "nil"
-    );
-    assert_eq!(run(&mut i, "(lsp--verilog-slang-command-p nil)"), "nil");
 }
 
 #[test]

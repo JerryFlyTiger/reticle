@@ -96,7 +96,7 @@ MUTATIONS = [
     },
     {
         "label": "M7 man page removes the -h short alias (reviewer's original M8, unobservable before the fix)",
-        "file": "doc/reticle.1",
+        "file": "docs/reticle.1",
         "old": ".B \\-h, \\-\\-help",
         "new": ".B \\-\\-help",
         "test": "man_page_documents_every_flag",
@@ -137,7 +137,7 @@ MUTATIONS = [
     },
     {
         "label": "M10 the man page's .TH version number drifts",
-        "file": "doc/reticle.1",
+        "file": "docs/reticle.1",
         "old": '.TH RETICLE 1 "2026-08-27" "reticle 0.1.0" "User Commands"',
         "new": '.TH RETICLE 1 "2026-08-27" "reticle 0.9.9" "User Commands"',
         "test": "man_page_th_version_matches_cargo_version",
